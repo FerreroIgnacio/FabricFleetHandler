@@ -4,6 +4,8 @@
   "package": "net.mapmcbot.mixin",
   "compatibilityLevel": "JAVA_8",
   "client": [
+    "ChatCommandMixin",
+    "InGameHudMixin",
     "InteractionMixin",
     "WorldRendererMixin"
   ],
