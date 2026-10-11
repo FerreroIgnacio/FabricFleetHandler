@@ -6,6 +6,15 @@ plugins {
 group = project.maven_group
 version = project.mod_version
 
+repositories {
+	mavenCentral()
+}
+
+// Gson only to compile against: Minecraft ships it (2.8.0 with 1.12.2), the primitives' JSON is encoded with it (see FleetProtocol#primitive).
+dependencies {
+	compileOnly "com.google.code.gson:gson:2.8.0"
+}
+
 java {
 	sourceCompatibility = JavaVersion.VERSION_1_8
 	targetCompatibility = JavaVersion.VERSION_1_8

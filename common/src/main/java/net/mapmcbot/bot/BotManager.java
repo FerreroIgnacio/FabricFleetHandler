@@ -23,9 +23,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -95,8 +98,14 @@ public final class BotManager implements FleetChannel {
 
 	private static final int SOCKET_LOG_LINES = 1000;
 
-	/** Lines in socket.log since it was last written out; guarded by socketLog. */
+	/** Frames into socket.log since it was last written out; guarded by socketLog. */
 	private int socketLogPending;
+
+	/** The chatty frames counted up and not written yet, by way, type and bot, in the order they came; guarded by socketLog. */
+	private final Map<String, FrameGroup> frameGroups = new LinkedHashMap<String, FrameGroup>();
+
+	/** Times in socket.log and fleet.log: to the millisecond. */
+	private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
 	public BotManager(File directory) {
 		if (!CREATED.compareAndSet(false, true)) {
@@ -218,7 +227,7 @@ public final class BotManager implements FleetChannel {
 
 	@Override
 	public void action(String bot, String json) {
-		send(FleetProtocol.action(bot, json));
+		send(FleetProtocol.primitive(bot, json));
 	}
 
 	@Override
@@ -343,8 +352,9 @@ public final class BotManager implements FleetChannel {
 	}
 
 	/**
-	 * Fleet output to the game log and, each line with its time, to fleet.log of the fleet's folder
-	 * (the game log can drown in a map's own output); the fleet exiting on its own is a failure.
+	 * Fleet output, each line with its time, to fleet.log of the fleet's folder, and all but the bots'
+	 * info lines to the game log too (the game log can drown in a map's own output); the fleet exiting
+	 * on its own is a failure.
 	 * Written out line by line: the fleet says little, and its last words matter most.
 	 */
 		private void pump(final Process process, final ServerSocket server) {
@@ -356,8 +366,12 @@ public final class BotManager implements FleetChannel {
 				String line;
 
 				while ((line = lines.readLine()) != null) {
-					System.out.println("[mapmcbot fleet] " + line);
-					fleetLog.write(LocalTime.now() + " " + line);
+					// A bot's own info line ("[name] ...") stays in fleet.log; errors ("E "), warnings ("W ") and the fleet's own reach the game log too.
+					if (!line.startsWith("[")) {
+						System.out.println("[mapmcbot fleet] " + line);
+					}
+
+					fleetLog.write(LocalTime.now().format(TIME) + " " + line);
 					fleetLog.newLine();
 					fleetLog.flush();
 				}
@@ -438,13 +452,35 @@ public final class BotManager implements FleetChannel {
 		return new String(frame, offset + 3, nameLength, StandardCharsets.UTF_8);
 	}
 
-	/** Type, bot and size of a frame; `offset` skips the length a written frame still has. */
+	/**
+	 * A frame into socket.log, by its type's name: one of a chatty type (see FleetProtocol#isChatty) is
+	 * counted up with the others of its type, way and bot, written out as a line per group before the
+	 * next frame that is not chatty, and whenever socket.log is written out; any other gets a line of
+	 * its own. `offset` skips the length a written frame still has.
+	 */
 	private void logFrame(String direction, byte[] frame, int offset) {
 		final int type = frame[offset] & 0xFF;
 		final String bot = botOf(frame, offset);
+		final String now = LocalTime.now().format(TIME);
+		final int bytes = frame.length - offset;
 
 		synchronized (socketLog) {
-			socketLog.println(LocalTime.now() + " " + direction + " type=" + type + " bot=" + bot + " bytes=" + (frame.length - offset));
+			if (FleetProtocol.isChatty(type)) {
+				final String key = direction + " " + FleetProtocol.typeName(type) + (bot.isEmpty() ? "" : " " + bot);
+				FrameGroup group = frameGroups.get(key);
+
+				if (group == null) {
+					group = new FrameGroup(now);
+					frameGroups.put(key, group);
+				}
+
+				group.last = now;
+				group.count++;
+				group.bytes += bytes;
+			} else {
+				writeFrameGroups();
+				socketLog.println(now + " " + direction + " " + FleetProtocol.typeName(type) + (bot.isEmpty() ? "" : " " + bot) + " " + size(bytes));
+			}
 
 			if (++socketLogPending >= SOCKET_LOG_LINES) {
 				flushSocketLog();
@@ -452,14 +488,46 @@ public final class BotManager implements FleetChannel {
 		}
 	}
 
-	/** Writes out what socket.log holds (checkError flushes); PrintWriter keeps its write errors to itself, so one is thrown here. */
+	/** The groups counted so far, a line each: from..to, way, type, bot, how many and their bytes. Guarded by socketLog. */
+	private void writeFrameGroups() {
+		for (Map.Entry<String, FrameGroup> entry : frameGroups.entrySet()) {
+			final FrameGroup group = entry.getValue();
+			socketLog.println((group.count == 1 ? group.first : group.first + ".." + group.last) + " " + entry.getKey()
+					+ (group.count == 1 ? "" : " x" + group.count) + " " + size(group.bytes));
+		}
+
+		frameGroups.clear();
+	}
+
+	private static String size(long bytes) {
+		if (bytes < 1024) {
+			return bytes + "B";
+		}
+
+		return bytes < 1024 * 1024 ? String.format(Locale.ROOT, "%.1fKB", bytes / 1024.0) : String.format(Locale.ROOT, "%.1fMB", bytes / (1024.0 * 1024));
+	}
+
+	/** Writes out what socket.log holds, the frame groups too (checkError flushes); PrintWriter keeps its write errors to itself, so one is thrown here. */
 	private void flushSocketLog() {
 		synchronized (socketLog) {
+			writeFrameGroups();
 			socketLogPending = 0;
 
 			if (socketLog.checkError()) {
 				throw new UncheckedIOException(new IOException("could not write socket.log in " + directory));
 			}
+		}
+	}
+
+	/** Frames of one chatty type, way and bot in a row of socket.log; guarded by socketLog. */
+	private static final class FrameGroup {
+		private final String first;
+		private String last;
+		private int count;
+		private long bytes;
+
+		private FrameGroup(String first) {
+			this.first = first;
 		}
 	}
 

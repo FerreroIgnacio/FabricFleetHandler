@@ -44,7 +44,7 @@ public interface FleetChannel {
 	/** The bot walks to stand at x, y, z. */
 	void gotoSpot(String bot, int x, int y, int z);
 
-	/** A primitive for the bot, as JSON (see FleetProtocol#ACTION). */
+	/** A primitive for the bot, as JSON (see FleetProtocol#primitive). */
 	void action(String bot, String json);
 
 	/** A click on the bot's inventory window (see FleetProtocol#WINDOW_CLICK). */

@@ -99,6 +99,8 @@ class AreaGoal extends goals.Goal {
 // until the server lists them; selectTrade(window, trade): picks one (see bot.js merchant).
 module.exports = function actions ({ bot, name, log, publish, walk, blockStates, trades, selectTrade, rawClick }) {
   let current = null
+  // Each primitive's number, counting up for the bot: its lines in fleet.log carry it ("#12").
+  let lastId = 0
 
   function windowType (window) {
     const type = typeof window.type === 'string' ? window.type : bot.registry.windows?.[window.type]?.name
@@ -106,10 +108,18 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     return full(type)
   }
 
+  // How long the primitive has run, for its last line.
+  const took = action => `${((Date.now() - action.started) / 1000).toFixed(1)}s`
+
   // A new primitive takes over from the one running: its listeners and deadline gone, its state replaced.
-  function begin (primitive) {
+  // Logged with its fields (the job's step it is, "job", among them) and, for the one it replaced, how long that ran.
+  function begin (primitive, a) {
+    const action = { id: ++lastId, primitive, started: Date.now(), over: false, cleanups: [] }
+    if (current) log(`#${current.id} ${current.primitive} replaced by #${action.id} after ${took(current)}`)
     cancel()
-    const action = { primitive, over: false, cleanups: [] }
+    const { action: _, ...fields } = a
+    const shown = JSON.stringify(fields)
+    log(`#${action.id} ${primitive}${shown === '{}' ? '' : ' ' + (shown.length > 160 ? shown.slice(0, 160) + '...' : shown)}`)
     current = action
     publish('doing', primitive, '')
     return action
@@ -129,13 +139,14 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   function done (action) {
     if (action.over) return
     end(action)
+    log(`#${action.id} ${action.primitive} ok ${took(action)}`)
     publish('idle', '', '')
   }
 
   function fail (action, message) {
     if (action.over) return
     end(action)
-    log(`error ${action.primitive}: ${message}`)
+    log(`#${action.id} ${action.primitive} failed after ${took(action)}: ${message}`, 'E')
     publish('error', action.primitive, message)
   }
 
@@ -1125,18 +1136,20 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     windowType,
     cancel,
     syncedClick,
+    // The running primitive's number, for the bot's own lines; 0 for none.
+    currentId: () => current ? current.id : 0,
 
     // An order from the mod: a primitive, run to its end by the events that confirm it. A failure,
     // from the primitive or from what it threw, is the bot's error state, not the process's.
     async run (a) {
       const primitive = primitives[a.action]
       if (!primitive) throw new Error(`unknown action ${a.action} for ${name}`)
-      const action = begin(a.action)
+      const action = begin(a.action, a)
       try {
         if (!bot.entity) throw new Error('the bot is not in the world yet')
         await primitive(action, a)
       } catch (e) {
-        log(e.stack)
+        log(e.stack, 'E')
         fail(action, e.message)
       }
     }

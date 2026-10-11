@@ -258,7 +258,7 @@ public final class RelayHub {
 	}
 
 	public void action(int rid, String bot, String json) {
-		relay(rid).send(FleetProtocol.action(bot, json));
+		relay(rid).send(FleetProtocol.primitive(bot, json));
 	}
 
 	public void gotoSpot(int rid, String bot, int x, int y, int z) {
@@ -420,7 +420,7 @@ public final class RelayHub {
 		}
 
 		/** The relay's errors, next to relays.txt and one after the other, for whoever debugs them: the relay's own terminal is on another machine. */
-		/** What the relay wrote, to the game log and, each line with its time, to fleet-relay<N>.log beside the mod's fleet.log of its own. */
+		/** What the relay wrote, all but the bots' info lines to the game log, and each line with its time, to fleet-relay<N>.log beside the mod's fleet.log of its own. */
 		private void keepLog(String text) {
 			final File log = new File(file.getAbsoluteFile().getParentFile(), "bot/fleet-relay" + rid + ".log");
 			final StringBuilder lines = new StringBuilder();
@@ -430,8 +430,12 @@ public final class RelayHub {
 					continue;
 				}
 
-				System.out.println("[mapmcbot relay " + rid + "] " + line);
-				lines.append(java.time.LocalTime.now()).append(' ').append(line).append('\n');
+				// As the mod's own fleet's: a bot's info line ("[name] ...") stays in the file.
+				if (!line.startsWith("[")) {
+					System.out.println("[mapmcbot relay " + rid + "] " + line);
+				}
+
+				lines.append(java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"))).append(' ').append(line).append('\n');
 			}
 
 			try {

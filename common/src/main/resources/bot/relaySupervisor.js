@@ -22,7 +22,7 @@ module.exports = function supervise (port) {
   let restart = null
 
   const crash = text => {
-    console.error(`relay supervisor: ${text}`)
+    console.error(`E relay supervisor: ${text}`)
     for (const connection of held.values()) {
       if (!connection.destroyed) connection.write(protocol.crash(text))
     }
@@ -82,7 +82,7 @@ module.exports = function supervise (port) {
   const server = net.createServer({ pauseOnConnect: true }, connection => {
     const id = nextId++
     held.set(id, connection)
-    connection.on('error', err => console.error(`relay supervisor: connection ${id} failed: ${err.message}`))
+    connection.on('error', err => console.error(`E relay supervisor: connection ${id} failed: ${err.message}`))
     if (child) hand(id)
     else start()
   })

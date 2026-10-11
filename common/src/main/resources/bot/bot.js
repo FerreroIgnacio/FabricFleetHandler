@@ -18,7 +18,13 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   const server = `${host}:${port}`
   // Always the fewest chunks it can ask for; a 1.12.2 server (a LAN world) sends its own view distance whatever it asks.
   const bot = mineflayer.createBot({ username: name, host, port, viewDistance: 2, auth: 'offline' })
-  const log = line => console.log(`[${name}] ${line}`)
+  // A line of fleet.log: "[name] #12 ...", the number being the primitive it runs (see actions.js);
+  // level 'E' (error) or 'W' (warning) before it, which the mod also puts in the game log.
+  let currentId = () => 0
+  const log = (line, level) => {
+    const id = currentId()
+    console.log(`${level ? level + ' ' : ''}[${name}] ${id && !line.startsWith('#') ? `#${id} ` : ''}${line}`)
+  }
   // The time its handlers take on the thread: mineflayer's events and the client's packets.
   const meter = botMeter()
   meter.wrap(bot)
@@ -68,6 +74,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     rawClick,
     blockStates
   })
+  currentId = act.currentId
 
   function held (x, z) {
     const key = columns.get(`${x >> 4},${z >> 4}`)
@@ -217,7 +224,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   }
   bot.on('path_update', result => {
     setSearching(result.status === 'partial')
-    if (result.status === 'noPath') log('no path' + (result.reason ? ` (${result.reason})` : ''))
+    if (result.status === 'noPath') log('no path' + (result.reason ? ` (${result.reason})` : ''), 'W')
     // Every search once it is over, with how long it took (taking turns with the other searches of the
     // thread included); not its parts while it goes on, one a tick.
     if (result.status !== 'partial') log(`search: ${result.visitedNodes} nodes, done after ${Math.round(result.time)} ms (${result.status})`)
@@ -254,13 +261,13 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   })
   bot.on('path_reset', reason => {
     setSearching(true)
-    log(`path reset (${reason}) at ${at()} (goal ${spot(goalOf())})`)
-    if (reason === 'stuck') log(`stuck around (x-1..x+1 per z-1..z+1): ${around()}; vel ${bot.entity.velocity.toString()} onGround ${bot.entity.onGround}`)
+    log(`path reset (${reason}) at ${at()} (goal ${spot(goalOf())})`, reason === 'stuck' ? 'W' : undefined)
+    if (reason === 'stuck') log(`stuck around (x-1..x+1 per z-1..z+1): ${around()}; vel ${bot.entity.velocity.toString()} onGround ${bot.entity.onGround}`, 'W')
     clearPath()
   })
 
-  bot.on('kicked', reason => log('kicked: ' + reason))
-  bot.on('error', err => log('error: ' + err.message))
+  bot.on('kicked', reason => log('kicked: ' + reason, 'E'))
+  bot.on('error', err => log('error: ' + err.message, 'E'))
 
   bot.on('chunkColumnLoad', point => {
     columns.set(`${point.x >> 4},${point.z >> 4}`, { server, dimension: dimension(), x: point.x >> 4, z: point.z >> 4 })
@@ -461,7 +468,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       await act.syncedClick(window, slot, button, mode)
     } catch (e) {
       if (!e.closed) throw e
-      log(e.message)
+      log(e.message, 'W')
     }
   }
 
@@ -703,11 +710,6 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // A primitive from the mod (see actions.js).
     action (a) {
       act.run(a)
-    },
-
-    // Walks to the spot (the formation's order): the goto primitive.
-    goto (spot) {
-      act.run({ action: 'goto', spot })
     }
   }
 }

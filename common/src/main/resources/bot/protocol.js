@@ -33,11 +33,32 @@ const TYPES = {
   QUIT: 18,
   PROFILE_REQUEST: 21,
   HELLO: 22,
-  GOTO: 23,
   WINDOW_CLICK: 25,
-  ACTION: 28,
-  TRADE_SELECT: 29
+  TRADE_SELECT: 29,
+  // mod -> fleet: the primitives (see actions.js), one type each
+  GOTO: 23,
+  INTERACT: 34,
+  BREAK: 35,
+  PLACE: 36,
+  CLOSE_WINDOW: 37,
+  MOVE: 38,
+  ITEM_FILL: 39,
+  WAIT_SLOT: 40,
+  HOTBAR: 41,
+  SELECT_TRADE: 42,
+  LOOK_AT: 43,
+  DROP: 44,
+  SHIFT_MOVE: 45,
+  STOP: 46
 }
+
+// The primitive each of its types is, as actions.js names it.
+const PRIMITIVES = new Map([
+  [TYPES.GOTO, 'goto'], [TYPES.INTERACT, 'interact'], [TYPES.BREAK, 'break'], [TYPES.PLACE, 'place'],
+  [TYPES.CLOSE_WINDOW, 'close_window'], [TYPES.MOVE, 'move'], [TYPES.ITEM_FILL, 'item_fill'],
+  [TYPES.WAIT_SLOT, 'wait_slot'], [TYPES.HOTBAR, 'hotbar'], [TYPES.SELECT_TRADE, 'select_trade'],
+  [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop']
+])
 
 class Writer {
   constructor (type) {
@@ -116,6 +137,52 @@ class Reader {
     const value = this.buffer.readInt32BE(this.offset)
     this.offset += 4
     return value
+  }
+
+  f64 () {
+    const value = this.buffer.readDoubleBE(this.offset)
+    this.offset += 8
+    return value
+  }
+
+  pos () {
+    return { x: this.i32(), y: this.i32(), z: this.i32() }
+  }
+
+  ints () {
+    const count = this.i32()
+    if (count < 0) throw new Error(`bad count ${count}`)
+    return Array.from({ length: count }, () => this.i32())
+  }
+
+  // An item match as actions.js itemMatcher takes it: u8 name present, u8 metadata present, u8 NBT
+  // mode (0 none, 1 match, 2 ignore); then the name, i32 metadata, and with a mode the reference's NBT
+  // bytes, i32 path count and each path.
+  matcher () {
+    const hasName = this.u8()
+    const hasMetadata = this.u8()
+    const mode = this.u8()
+    const spec = {}
+    if (hasName) spec.name = this.str()
+    if (hasMetadata) spec.metadata = this.i32()
+    if (mode > 2) throw new Error(`item match of unknown NBT mode ${mode}`)
+    if (mode) {
+      spec.nbt = this.bytes().toString('hex')
+      const count = this.i32()
+      if (count < 0) throw new Error(`bad path count ${count}`)
+      spec[mode === 1 ? 'match' : 'ignore'] = Array.from({ length: count }, () => this.str())
+    }
+    return spec
+  }
+
+  // The fields every primitive with them may carry, each a u8 present then its value: i32 deadline in
+  // ms, f64 turn speed in rad/s. Set on a only when present.
+  deadline (a) {
+    if (this.u8()) a.deadline = this.i32()
+  }
+
+  turnSpeed (a) {
+    if (this.u8()) a.turn_speed = this.f64()
   }
 
   bytes () {
@@ -435,26 +502,116 @@ function decode (frame) {
       // 6 pickup all) and its id, counting up from 1 for each bot.
       message = { type, bot: r.str(), slot: r.i32(), button: r.u8(), mode: r.u8(), id: r.i32() }
       break
-    case TYPES.GOTO:
-      message = { type, bot: r.str(), spot: { x: r.i32(), y: r.i32(), z: r.i32() } }
-      break
     case TYPES.TRADE_SELECT:
       // The villager trade the bot's open window shows, as the game's arrows pick it.
       message = { type, bot: r.str(), trade: r.i32() }
-      break
-    case TYPES.ACTION:
-      // A primitive for the bot as JSON (see actions.js for each one's fields).
-      message = { type, bot: r.str(), action: JSON.parse(r.bytes().toString('utf8')) }
       break
     case TYPES.HELLO:
       // version: the commit the mod was built at.
       message = { type, bot: r.str(), version: r.str() }
       break
     default:
-      throw new Error(`unknown message type ${type} from the mod`)
+      if (!PRIMITIVES.has(type)) throw new Error(`unknown message type ${type} from the mod`)
+      // A primitive for the bot: action as actions.js takes it.
+      message = { type, bot: r.str(), action: primitive(r, type) }
   }
   r.end(type)
   return message
+}
+
+// The fields of a primitive's frame after the bot, as the object actions.js runs.
+function primitive (r, type) {
+  const a = { action: PRIMITIVES.get(type) }
+  switch (type) {
+    case TYPES.GOTO: {
+      // u8 kind: 0 a spot to stand on, 1 an area to stand in (min x, y, z, max x, y, z), 2 a block to stand in sight of.
+      const kind = r.u8()
+      if (kind === 0) a.spot = r.pos()
+      else if (kind === 1) a.area = { minX: r.i32(), minY: r.i32(), minZ: r.i32(), maxX: r.i32(), maxY: r.i32(), maxZ: r.i32() }
+      else if (kind === 2) a.look = r.pos()
+      else throw new Error(`goto of unknown kind ${kind}`)
+      break
+    }
+    case TYPES.INTERACT: {
+      // u8 button (0 left, 1 right), u8 target kind (0 block at i32 x, y, z, 1 entity by its UUID), u8 expect kind
+      // (0 none: the interaction's own; 1 window of a type, 2 block taking a state, 3 block changed,
+      // 4 block filled, 5 entity hurt by its id) and its fields, deadline, turn speed.
+      const button = r.u8()
+      if (button > 1) throw new Error(`interact of unknown button ${button}`)
+      a.button = button ? 'right' : 'left'
+      const target = r.u8()
+      if (target === 0) a.target = { kind: 'block', ...r.pos() }
+      else if (target === 1) a.target = { kind: 'entity', uuid: r.str() }
+      else throw new Error(`interact target of unknown kind ${target}`)
+      const expect = r.u8()
+      if (expect === 1) a.expect = { kind: 'window', type: r.str() }
+      else if (expect === 2) a.expect = { kind: 'block', ...r.pos(), state: r.str() }
+      else if (expect === 3) a.expect = { kind: 'changed', ...r.pos() }
+      else if (expect === 4) a.expect = { kind: 'filled', ...r.pos() }
+      else if (expect === 5) a.expect = { kind: 'hurt', id: r.i32() }
+      else if (expect !== 0) throw new Error(`interact expect of unknown kind ${expect}`)
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    }
+    case TYPES.BREAK:
+      // i32 x, y, z, deadline, turn speed.
+      a.target = r.pos()
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    case TYPES.PLACE:
+      // i32 x, y, z, u8 state present and the state the block takes, deadline, turn speed.
+      a.target = r.pos()
+      if (r.u8()) a.state = r.str()
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    case TYPES.MOVE:
+      a.from = r.i32()
+      a.to = r.i32()
+      break
+    case TYPES.ITEM_FILL: {
+      // i32 match count and each item match, the target slots, u8 sources present and the source slots,
+      // u8 count present and i32 count.
+      const count = r.i32()
+      if (count < 0) throw new Error(`bad match count ${count}`)
+      a.items = Array.from({ length: count }, () => r.matcher())
+      a.targets = r.ints()
+      if (r.u8()) a.sources = r.ints()
+      if (r.u8()) a.count = r.i32()
+      break
+    }
+    case TYPES.WAIT_SLOT: {
+      // i32 count, each i32 slot, i32 min, u8 item match present and the match; deadline.
+      const count = r.i32()
+      if (count < 0) throw new Error(`bad slot count ${count}`)
+      a.slots = Array.from({ length: count }, () => {
+        const wait = { slot: r.i32(), min: r.i32() }
+        if (r.u8()) wait.item = r.matcher()
+        return wait
+      })
+      r.deadline(a)
+      break
+    }
+    case TYPES.HOTBAR:
+    case TYPES.SHIFT_MOVE:
+      a.slot = r.i32()
+      break
+    case TYPES.SELECT_TRADE:
+      a.trade = r.i32()
+      break
+    case TYPES.LOOK_AT:
+      // f64 yaw, pitch (degrees, as the game has them), turn speed.
+      a.yaw = r.f64()
+      a.pitch = r.f64()
+      r.turnSpeed(a)
+      break
+    case TYPES.DROP:
+      a.slots = r.ints()
+      break
+  }
+  return a
 }
 
 // A socket 'data' listener that calls onFrame with each whole frame, length stripped.
@@ -472,4 +629,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

@@ -179,7 +179,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 				});
 				starting[0] = false;
 			} else {
-				bots.actionInternal(bot, step);
+				bots.actionInternal(bot, tagged(step, run));
 			}
 		} catch (RuntimeException e) {
 			running.remove(bot);
@@ -188,7 +188,17 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		}
 	}
 
-	/** The step after the run's; instant when the run's was over as it was started. */
+	/** The step with the job's name and its number in it (counted from 1, as in the file), "job":"name#3", for the fleet's log. */
+	private static String tagged(String step, Run run) {
+		if (!step.startsWith("{")) {
+			throw new IllegalStateException("a step is a JSON object: " + step);
+		}
+
+		final String tag = (run.job.getName() + "#" + (run.index + 1)).replace("\\", "\\\\").replace("\"", "\\\"");
+		return "{\"job\":\"" + tag + "\"" + (step.replaceAll("\\s", "").equals("{}") ? "}" : "," + step.substring(1));
+	}
+
+		/** The step after the run's; instant when the run's was over as it was started. */
 	private void next(String bot, Run run, boolean instant) {
 		final int size = run.job.size();
 		final int instants = instant ? run.instant + 1 : 0;

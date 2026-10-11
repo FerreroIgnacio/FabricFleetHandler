@@ -444,7 +444,7 @@ let socket = null
 // machine. The relay goes on, it never goes down; should it end anyway, its supervisor says so and
 // starts another.
 const relayFailed = err => {
-  console.error(err)
+  console.error('E', err)
   if (!relay) process.exit(1)
   if (socket && !socket.destroyed) socket.write(protocol.crash(err?.stack ?? String(err)))
 }
@@ -473,6 +473,11 @@ if (relay) {
 
 function onFrame (frame) {
   const message = protocol.decode(frame)
+  if (protocol.PRIMITIVES.has(message.type)) {
+    // Already gone: its BOT_GONE is on the way to the mod.
+    bots.get(message.bot)?.worker.postMessage({ type: 'action', bot: message.bot, action: message.action })
+    return
+  }
   switch (message.type) {
     case protocol.TYPES.SPAWN: {
       if (bots.has(message.bot)) throw new Error(`a bot named ${message.bot} is already running`)
@@ -487,13 +492,6 @@ function onFrame (frame) {
     case protocol.TYPES.QUIT:
       // Already gone: its BOT_GONE is on the way to the mod.
       bots.get(message.bot)?.worker.postMessage({ type: 'quit', bot: message.bot })
-      break
-    case protocol.TYPES.GOTO:
-      // Already gone: its BOT_GONE is on the way to the mod.
-      bots.get(message.bot)?.worker.postMessage({ type: 'goto', bot: message.bot, spot: message.spot })
-      break
-    case protocol.TYPES.ACTION:
-      bots.get(message.bot)?.worker.postMessage({ type: 'action', bot: message.bot, action: message.action })
       break
     case protocol.TYPES.WINDOW_CLICK:
       bots.get(message.bot)?.worker.postMessage({ type: 'click', bot: message.bot, slot: message.slot, button: message.button, mode: message.mode, id: message.id })
@@ -537,7 +535,7 @@ function serve (connection) {
   connection.on('error', err => {
     if (!relay) throw err
     // A relay outlives the mod: a connection that fails ends that session, said loudly, and it waits for the next.
-    console.error(`the mod's connection failed: ${err.message}`)
+    console.error(`E the mod's connection failed: ${err.message}`)
   })
   // First of all: the names of the state ids the slots hold.
   send(protocol.stateNames(states.legacyNames()))
@@ -551,7 +549,7 @@ function hello (connection, id) {
   closing = false
   socket = connection
   const onClose = () => { closing = true }
-  const onError = err => console.error(`the mod's connection failed before its HELLO: ${err.message}`)
+  const onError = err => console.error(`E the mod's connection failed before its HELLO: ${err.message}`)
   const onData = protocol.frames(frame => {
     const message = protocol.decode(frame)
     if (message.type !== protocol.TYPES.HELLO) throw new Error(`the mod's first frame is type ${message.type}, not HELLO`)
@@ -599,8 +597,8 @@ function update (connection, id, version) {
 
 // The mod's commit is out of this relay's reach: the mod is told why and the relay waits for the next.
 function refuse (connection, text) {
-  console.error(text)
-  connection.on('error', err => console.error(`the mod's connection failed while refused: ${err.message}`))
+  console.error(`E ${text}`)
+  connection.on('error', err => console.error(`E the mod's connection failed while refused: ${err.message}`))
   send(protocol.updateFailed(text))
   closing = true
   connection.end()
@@ -625,7 +623,7 @@ if (relay) {
     }
     // One mod at a time, and not while the last one's bots are still leaving.
     if (!(closing && bots.size === 0)) {
-      console.error(`refused ${connection.remoteAddress}: a mod is connected or its bots are still leaving`)
+      console.error(`E refused ${connection.remoteAddress}: a mod is connected or its bots are still leaving`)
       connection.destroy()
       return
     }

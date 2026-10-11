@@ -13,6 +13,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import net.mapmcbot.bot.BotInventory;
 import net.mapmcbot.bot.BotStatus;
 import net.mapmcbot.bot.BotWindow;
@@ -129,8 +134,6 @@ public final class FleetProtocol {
 	 * WELCOME once it is at that commit (updating itself first when not) or UPDATE_FAILED.
 	 */
 	public static final int HELLO = 22;
-	/** bot name, i32 x, y, z: the bot walks to stand on that block. */
-	public static final int GOTO = 23;
 	/**
 	 * bot name, i32 slot (-999 outside), u8 mouse button, u8 mode: a click on the bot's inventory
 	 * window, as the player's own client sends one (mode 0 pickup, 1 quick move, 2 swap, 3 clone, 4
@@ -138,14 +141,122 @@ public final class FleetProtocol {
 	 * says it is done.
 	 */
 	public static final int WINDOW_CLICK = 25;
-	/** bot name, bytes: a primitive for the bot as UTF-8 JSON (see the fleet's actions.js for each one's fields). */
-	public static final int ACTION = 28;
 	/** bot name, i32 trade: the villager trade the bot's open window shows, as the game's arrows pick it. */
 	public static final int TRADE_SELECT = 29;
+
+	// Mod to fleet: the primitives (see the fleet's actions.js), one type each, written by {@link #primitive}.
+	// Optional fields go as a u8 present and the value; a deadline is i32 ms, a turn speed f64 rad/s.
+	/**
+	 * bot name, u8 kind: 0 i32 x, y, z of the block to stand on; 1 i32 min x, y, z, max x, y, z of an
+	 * area to stand in; 2 i32 x, y, z of a block to stand in sight of.
+	 */
+	public static final int GOTO = 23;
+	/**
+	 * bot name, u8 button (0 left, 1 right), u8 target kind (0 block: i32 x, y, z; 1 entity: its UUID
+	 * string), u8 expect kind (0 none: the interaction's own; 1 window: its type string; 2 block: i32
+	 * x, y, z and the state string; 3 changed, 4 filled: i32 x, y, z; 5 hurt: i32 entity id), optional
+	 * deadline, optional turn speed.
+	 */
+	public static final int INTERACT = 34;
+	/** bot name, i32 x, y, z, optional deadline, optional turn speed. */
+	public static final int BREAK = 35;
+	/** bot name, i32 x, y, z, optional state string, optional deadline, optional turn speed. */
+	public static final int PLACE = 36;
+	/** bot name. */
+	public static final int CLOSE_WINDOW = 37;
+	/** bot name, i32 from slot, i32 to slot. */
+	public static final int MOVE = 38;
+	/**
+	 * bot name, i32 match count and each item match, the target slots, optional source slots,
+	 * optional i32 count. Slots are an i32 count and each i32. An item match is u8 name present, u8
+	 * metadata present, u8 NBT mode (0 none, 1 match, 2 ignore), the name string, i32 metadata, and
+	 * with a mode the reference's NBT (i32 length and its bytes), i32 path count and each path string.
+	 */
+	public static final int ITEM_FILL = 39;
+	/** bot name, i32 count, each i32 slot, i32 min and an optional item match (as ITEM_FILL's), optional deadline. */
+	public static final int WAIT_SLOT = 40;
+	/** bot name, i32 slot. */
+	public static final int HOTBAR = 41;
+	/** bot name, i32 trade. */
+	public static final int SELECT_TRADE = 42;
+	/** bot name, f64 yaw, f64 pitch (degrees, as the game has them), optional turn speed. */
+	public static final int LOOK_AT = 43;
+	/** bot name, slots as ITEM_FILL's. */
+	public static final int DROP = 44;
+	/** bot name, i32 slot. */
+	public static final int SHIFT_MOVE = 45;
+	/** bot name. */
+	public static final int STOP = 46;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
 	private FleetProtocol() {
+	}
+
+	/** The frame type's name, as its constant here (for the logs); an unknown type throws. */
+	public static String typeName(int type) {
+		switch (type) {
+			case CLAIM: return "CLAIM";
+			case READY: return "READY";
+			case CHANGED: return "CHANGED";
+			case BLOCK_ENTITY_UPDATE: return "BLOCK_ENTITY_UPDATE";
+			case UNLOAD: return "UNLOAD";
+			case BOT_GONE: return "BOT_GONE";
+			case PATH: return "PATH";
+			case BOT_SPAWNED: return "BOT_SPAWNED";
+			case STATE_NAMES: return "STATE_NAMES";
+			case LOAD: return "LOAD";
+			case PROFILE: return "PROFILE";
+			case CRASH: return "CRASH";
+			case WELCOME: return "WELCOME";
+			case UPDATING: return "UPDATING";
+			case UPDATE_FAILED: return "UPDATE_FAILED";
+			case INVENTORY: return "INVENTORY";
+			case STATE: return "STATE";
+			case WINDOW: return "WINDOW";
+			case CHEST_LID: return "CHEST_LID";
+			case CHEST: return "CHEST";
+			case COLUMN_GONE: return "COLUMN_GONE";
+			case LOG: return "LOG";
+			case RELEASE: return "RELEASE";
+			case LOADED: return "LOADED";
+			case SPAWN: return "SPAWN";
+			case QUIT: return "QUIT";
+			case PROFILE_REQUEST: return "PROFILE_REQUEST";
+			case HELLO: return "HELLO";
+			case WINDOW_CLICK: return "WINDOW_CLICK";
+			case TRADE_SELECT: return "TRADE_SELECT";
+			case GOTO: return "GOTO";
+			case INTERACT: return "INTERACT";
+			case BREAK: return "BREAK";
+			case PLACE: return "PLACE";
+			case CLOSE_WINDOW: return "CLOSE_WINDOW";
+			case MOVE: return "MOVE";
+			case ITEM_FILL: return "ITEM_FILL";
+			case WAIT_SLOT: return "WAIT_SLOT";
+			case HOTBAR: return "HOTBAR";
+			case SELECT_TRADE: return "SELECT_TRADE";
+			case LOOK_AT: return "LOOK_AT";
+			case DROP: return "DROP";
+			case SHIFT_MOVE: return "SHIFT_MOVE";
+			case STOP: return "STOP";
+			default: throw new IllegalArgumentException("unknown frame type " + type);
+		}
+	}
+
+	/**
+	 * Whether frames of the type come in floods (chunks, chests, inventories, profiles): socket.log
+	 * counts them up instead of a line each.
+	 */
+	public static boolean isChatty(int type) {
+		switch (type) {
+			case CLAIM: case READY: case CHANGED: case BLOCK_ENTITY_UPDATE: case UNLOAD: case LOAD: case LOADED: case RELEASE:
+			case CHEST: case CHEST_LID: case COLUMN_GONE: case INVENTORY: case WINDOW: case PATH: case STATE:
+			case PROFILE: case PROFILE_REQUEST: case LOG:
+				return true;
+			default:
+				return false;
+		}
 	}
 
 	/** The error text of a CRASH frame. */
@@ -600,14 +711,168 @@ public final class FleetProtocol {
 		return frame.bytes();
 	}
 
-	public static byte[] action(String bot, String json) {
-		final Frame frame = new Frame(ACTION);
+	/**
+	 * The primitive as the frame of its type: json is the object the fleet's actions.js runs, its name
+	 * in "action" and its fields beside it.
+	 */
+	public static byte[] primitive(String bot, String json) {
+		final JsonObject a = new JsonParser().parse(json).getAsJsonObject();
+		final String name = field(a, "action").getAsString();
+		final Frame frame = new Frame(primitiveType(name));
+		final DataOutputStream out = frame.out;
 
 		try {
-			writeString(frame.out, bot);
-			final byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-			frame.out.writeInt(bytes.length);
-			frame.out.write(bytes);
+			writeString(out, bot);
+
+			switch (name) {
+				case "goto":
+					if (a.has("spot")) {
+						out.writeByte(0);
+						writePos(out, field(a, "spot").getAsJsonObject());
+					} else if (a.has("area")) {
+						final JsonObject area = a.getAsJsonObject("area");
+						out.writeByte(1);
+						out.writeInt(field(area, "minX").getAsInt());
+						out.writeInt(field(area, "minY").getAsInt());
+						out.writeInt(field(area, "minZ").getAsInt());
+						out.writeInt(field(area, "maxX").getAsInt());
+						out.writeInt(field(area, "maxY").getAsInt());
+						out.writeInt(field(area, "maxZ").getAsInt());
+					} else if (a.has("look")) {
+						out.writeByte(2);
+						writePos(out, a.getAsJsonObject("look"));
+					} else {
+						throw new IllegalArgumentException("goto needs a spot, an area or a look: " + json);
+					}
+					break;
+
+				case "interact": {
+					final String button = field(a, "button").getAsString();
+
+					if (!button.equals("left") && !button.equals("right")) {
+						throw new IllegalArgumentException("button must be left or right: " + json);
+					}
+
+					out.writeByte(button.equals("left") ? 0 : 1);
+					final JsonObject target = field(a, "target").getAsJsonObject();
+					final String kind = field(target, "kind").getAsString();
+
+					if (kind.equals("block")) {
+						out.writeByte(0);
+						writePos(out, target);
+					} else if (kind.equals("entity")) {
+						out.writeByte(1);
+						writeString(out, field(target, "uuid").getAsString());
+					} else {
+						throw new IllegalArgumentException("target of unknown kind " + kind + ": " + json);
+					}
+
+					writeExpect(out, a.has("expect") ? a.getAsJsonObject("expect") : null, json);
+					writeDeadline(out, a);
+					writeTurnSpeed(out, a);
+					break;
+				}
+
+				case "break":
+					writePos(out, field(a, "target").getAsJsonObject());
+					writeDeadline(out, a);
+					writeTurnSpeed(out, a);
+					break;
+
+				case "place":
+					writePos(out, field(a, "target").getAsJsonObject());
+					out.writeBoolean(a.has("state"));
+
+					if (a.has("state")) {
+						writeString(out, a.get("state").getAsString());
+					}
+
+					writeDeadline(out, a);
+					writeTurnSpeed(out, a);
+					break;
+
+				case "move":
+					out.writeInt(field(a, "from").getAsInt());
+					out.writeInt(field(a, "to").getAsInt());
+					break;
+
+				case "item_fill": {
+					final JsonArray items;
+
+					if (a.has("items")) {
+						items = a.getAsJsonArray("items");
+					} else {
+						items = new JsonArray();
+						items.add(field(a, "item"));
+					}
+
+					out.writeInt(items.size());
+
+					for (JsonElement item : items) {
+						writeMatcher(out, item.getAsJsonObject());
+					}
+
+					writeSlots(out, field(a, "targets").getAsJsonArray());
+					out.writeBoolean(a.has("sources"));
+
+					if (a.has("sources")) {
+						writeSlots(out, a.getAsJsonArray("sources"));
+					}
+
+					out.writeBoolean(a.has("count"));
+
+					if (a.has("count")) {
+						out.writeInt(a.get("count").getAsInt());
+					}
+
+					break;
+				}
+
+				case "wait_slot": {
+					final JsonArray slots = field(a, "slots").getAsJsonArray();
+					out.writeInt(slots.size());
+
+					for (JsonElement element : slots) {
+						final JsonObject wait = element.getAsJsonObject();
+						out.writeInt(field(wait, "slot").getAsInt());
+						out.writeInt(wait.has("min") ? wait.get("min").getAsInt() : 1);
+						out.writeBoolean(wait.has("item"));
+
+						if (wait.has("item")) {
+							writeMatcher(out, wait.getAsJsonObject("item"));
+						}
+					}
+
+					writeDeadline(out, a);
+					break;
+				}
+
+				case "hotbar":
+				case "shift_move":
+					out.writeInt(field(a, "slot").getAsInt());
+					break;
+
+				case "select_trade":
+					out.writeInt(field(a, "trade").getAsInt());
+					break;
+
+				case "look_at":
+					out.writeDouble(field(a, "yaw").getAsDouble());
+					out.writeDouble(field(a, "pitch").getAsDouble());
+					writeTurnSpeed(out, a);
+					break;
+
+				case "drop":
+					writeSlots(out, field(a, "slots").getAsJsonArray());
+					break;
+
+				case "close_window":
+				case "stop":
+					break;
+
+				default:
+					throw new IllegalStateException("primitive " + name + " has no frame");
+			}
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}
@@ -615,11 +880,180 @@ public final class FleetProtocol {
 		return frame.bytes();
 	}
 
+	private static int primitiveType(String name) {
+		switch (name) {
+			case "goto":
+				return GOTO;
+			case "interact":
+				return INTERACT;
+			case "break":
+				return BREAK;
+			case "place":
+				return PLACE;
+			case "close_window":
+				return CLOSE_WINDOW;
+			case "move":
+				return MOVE;
+			case "item_fill":
+				return ITEM_FILL;
+			case "wait_slot":
+				return WAIT_SLOT;
+			case "hotbar":
+				return HOTBAR;
+			case "select_trade":
+				return SELECT_TRADE;
+			case "look_at":
+				return LOOK_AT;
+			case "drop":
+				return DROP;
+			case "shift_move":
+				return SHIFT_MOVE;
+			case "stop":
+				return STOP;
+			default:
+				throw new IllegalArgumentException("no primitive named " + name + " for the fleet");
+		}
+	}
+
+	private static JsonElement field(JsonObject object, String key) {
+		final JsonElement value = object.get(key);
+
+		if (value == null || value.isJsonNull()) {
+			throw new IllegalArgumentException(key + " is required in " + object);
+		}
+
+		return value;
+	}
+
+	private static void writePos(DataOutput out, JsonObject pos) throws IOException {
+		out.writeInt(field(pos, "x").getAsInt());
+		out.writeInt(field(pos, "y").getAsInt());
+		out.writeInt(field(pos, "z").getAsInt());
+	}
+
+	private static void writeSlots(DataOutput out, JsonArray slots) throws IOException {
+		out.writeInt(slots.size());
+
+		for (JsonElement slot : slots) {
+			out.writeInt(slot.getAsInt());
+		}
+	}
+
+	private static void writeExpect(DataOutput out, JsonObject expect, String json) throws IOException {
+		if (expect == null) {
+			out.writeByte(0);
+			return;
+		}
+
+		final String kind = field(expect, "kind").getAsString();
+
+		switch (kind) {
+			case "window":
+				out.writeByte(1);
+				writeString(out, field(expect, "type").getAsString());
+				break;
+			case "block":
+				out.writeByte(2);
+				writePos(out, expect);
+				writeString(out, field(expect, "state").getAsString());
+				break;
+			case "changed":
+				out.writeByte(3);
+				writePos(out, expect);
+				break;
+			case "filled":
+				out.writeByte(4);
+				writePos(out, expect);
+				break;
+			case "hurt":
+				out.writeByte(5);
+				out.writeInt(field(expect, "id").getAsInt());
+				break;
+			default:
+				throw new IllegalArgumentException("expect of unknown kind " + kind + ": " + json);
+		}
+	}
+
+	private static void writeMatcher(DataOutput out, JsonObject spec) throws IOException {
+		if (spec.has("match") && spec.has("ignore")) {
+			throw new IllegalArgumentException("an item match takes match or ignore, not both: " + spec);
+		}
+
+		final String paths = spec.has("match") ? "match" : spec.has("ignore") ? "ignore" : null;
+
+		if (paths == null && spec.has("nbt")) {
+			throw new IllegalArgumentException("an item match's nbt says nothing without match or ignore: " + spec);
+		}
+
+		out.writeBoolean(spec.has("name"));
+		out.writeBoolean(spec.has("metadata"));
+		out.writeByte(paths == null ? 0 : paths.equals("match") ? 1 : 2);
+
+		if (spec.has("name")) {
+			writeString(out, spec.get("name").getAsString());
+		}
+
+		if (spec.has("metadata")) {
+			out.writeInt(spec.get("metadata").getAsInt());
+		}
+
+		if (paths != null) {
+			final byte[] nbt = hex(field(spec, "nbt").getAsString());
+			out.writeInt(nbt.length);
+			out.write(nbt);
+			final JsonArray list = spec.getAsJsonArray(paths);
+			out.writeInt(list.size());
+
+			for (JsonElement path : list) {
+				writeString(out, path.getAsString());
+			}
+		}
+	}
+
+	private static byte[] hex(String hex) {
+		if (hex.length() % 2 != 0) {
+			throw new IllegalArgumentException("odd length hex NBT: " + hex);
+		}
+
+		final byte[] bytes = new byte[hex.length() / 2];
+
+		for (int i = 0; i < bytes.length; i++) {
+			final int high = Character.digit(hex.charAt(2 * i), 16);
+			final int low = Character.digit(hex.charAt(2 * i + 1), 16);
+
+			if (high < 0 || low < 0) {
+				throw new IllegalArgumentException("not hex NBT: " + hex);
+			}
+
+			bytes[i] = (byte) (high << 4 | low);
+		}
+
+		return bytes;
+	}
+
+	private static void writeDeadline(DataOutput out, JsonObject a) throws IOException {
+		out.writeBoolean(a.has("deadline"));
+
+		if (a.has("deadline")) {
+			out.writeInt(a.get("deadline").getAsInt());
+		}
+	}
+
+	private static void writeTurnSpeed(DataOutput out, JsonObject a) throws IOException {
+		out.writeBoolean(a.has("turn_speed"));
+
+		if (a.has("turn_speed")) {
+			out.writeDouble(a.get("turn_speed").getAsDouble());
+		}
+	}
+
+	/** The goto primitive to stand on the block. */
 	public static byte[] gotoSpot(String bot, int x, int y, int z) {
 		final Frame frame = new Frame(GOTO);
 
 		try {
 			writeString(frame.out, bot);
+			frame.out.writeByte(0);
 			frame.out.writeInt(x);
 			frame.out.writeInt(y);
 			frame.out.writeInt(z);

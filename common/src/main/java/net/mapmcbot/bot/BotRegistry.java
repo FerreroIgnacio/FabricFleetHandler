@@ -166,7 +166,7 @@ public final class BotRegistry implements BotListener {
 		return windows.get(bot);
 	}
 
-	/** A primitive for the bot as JSON, on the fleet running it (see FleetProtocol#ACTION). */
+	/** A primitive for the bot as JSON, on the fleet running it (see FleetProtocol#primitive). */
 	public void action(String bot, String json) {
 		send(bot, json, false);
 	}

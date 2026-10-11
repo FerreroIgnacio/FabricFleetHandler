@@ -113,9 +113,6 @@ parentPort.on('message', message => {
     case 'quit':
       bot.quit()
       break
-    case 'goto':
-      bot.goto(message.spot)
-      break
     case 'action':
       bot.action(message.action)
       break

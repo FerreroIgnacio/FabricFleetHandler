@@ -56,6 +56,16 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 	/** A profile is taken every this many ms (see timingExceptions.txt), unless the one before is still on its way. */
 	private static final long PROFILE_EVERY = 1000;
 
+	/** The log is moved to <name>.prev.log (the one there before dropped) on opening and once it grows past this. */
+	private static final long MAX_LOG = 64L * 1024 * 1024;
+
+	/** Every this many reports, a line with the threads and bots that took the most CPU. */
+	private static final int TOP_EVERY = 10;
+
+	private static final int TOP = 5;
+
+	private static final java.time.format.DateTimeFormatter TIME = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss");
+
 	private final FleetChannel channel;
 	private final RelayHub relays;
 	/** Each relay's newest profile and the one its rates are worked out against (its own reports, apart from the mod's). */
@@ -63,8 +73,15 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 	private final java.util.Map<Integer, ProfileReport> relayBase = new java.util.HashMap<Integer, ProfileReport>();
 	/** Per bot that claimed them: {chunks, block entities, bytes of their NBT} held by the chunk registry. */
 	private final Supplier<Map<String, long[]>> chunksByBot;
-	private final BufferedWriter log;
+	/** Reopened on each rotation (see MAX_LOG). */
+	private BufferedWriter log;
 	private final File logFile;
+	/** Bytes (chars, near enough) written to the log since it was opened. */
+	private long logSize;
+	/** What the log last said of each row that is a reading, by scope and name: one that did not change is left out. */
+	private final Map<String, String> lastReading = new java.util.HashMap<String, String>();
+	/** Reports written since the last top line (see TOP_EVERY). */
+	private int sinceTop;
 	private final LinkedList<ProfileReport> history = new LinkedList<ProfileReport>();
 	private final com.sun.management.ThreadMXBean threads;
 	private final com.sun.management.OperatingSystemMXBean system;
@@ -103,14 +120,7 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 			throw new IllegalStateException("cannot create " + logFile.getParentFile());
 		}
 
-		try {
-			this.log = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(logFile, true), StandardCharsets.UTF_8));
-			log.write("# session " + LocalDateTime.now() + ": time, reason, scope, name, unit, value, rate (ms: % of a core, n and bytes: per second)");
-			log.newLine();
-			log.flush();
-		} catch (IOException e) {
-			throw new UncheckedIOException("could not open " + logFile, e);
-		}
+		openLog();
 
 		channel.setProfileListener(this);
 		relays.setProfileSink(this);
@@ -296,53 +306,211 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		return rows;
 	}
 
-	/** Appends the report to the log: a summary line, then a line per row. Flushed: reports are rare. */
-	private void write(ProfileReport report) {
-		final String time = LocalDateTime.ofInstant(Instant.ofEpochMilli(report.getTime()), ZoneId.systemDefault()).toString();
-		final String reason = report.getReason().replace('\t', ' ').replace('\n', ' ');
+	/**
+	 * Moves the log there was to <name>.prev.log and starts a new one, its first line saying how to
+	 * read it. Each report is then its summary line ("# time reason: ..."), now and then a top line,
+	 * and a line per scope with something to say: "time scope name=value ...", where a rate (ms as % of
+	 * a core, n and bytes per second) of zero and a reading the log already said are left out; the
+	 * first report, with no rates, gives what each count is so far.
+	 */
+	private void openLog() {
+		final File previous = new File(logFile.getParentFile(), logFile.getName().replaceFirst("\\.log$", "") + ".prev.log");
 
 		try {
-			log.write("# " + time + " " + reason + ": " + summary(report));
-			log.newLine();
-
-			for (String scope : report.scopes("")) {
-				for (ProfileReport.Row row : report.rows(scope).values()) {
-					log.write(time + "\t" + reason + "\t" + scope + "\t" + row.getName() + "\t" + row.getUnit() + "\t" + number(row.getValue())
-							+ "\t" + (Double.isNaN(row.getRate()) ? "" : number(row.getRate())));
-					log.newLine();
-				}
+			if (log != null) {
+				log.close();
 			}
 
+			if (logFile.isFile()) {
+				java.nio.file.Files.move(logFile.toPath(), previous.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+			}
+
+			log = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(logFile, false), StandardCharsets.UTF_8));
+			logSize = 0;
+			lastReading.clear();
+			sinceTop = TOP_EVERY;
+			line("# session " + LocalDateTime.now().withNano(0) + ": \"time scope name=value ...\"; rates: ms as % of a core, n and bytes per second;"
+					+ " B, # and % are readings; zero rates and readings unchanged since the log last said them are left out");
 			log.flush();
+		} catch (IOException e) {
+			throw new UncheckedIOException("could not open " + logFile, e);
+		}
+	}
+
+	private void line(String text) throws IOException {
+		log.write(text);
+		log.newLine();
+		logSize += text.length() + 1;
+	}
+
+	/** Appends the report to the log (see openLog). Flushed: reports are once a second. */
+	private void write(ProfileReport report) {
+		final String time = time(report);
+
+		try {
+			line("# " + time + " " + oneLine(report.getReason()) + ": " + summary(report));
+
+			if (report.hasRates() && ++sinceTop >= TOP_EVERY) {
+				sinceTop = 0;
+				line("# " + time + " top cpu: " + top(report));
+			}
+
+			rows(time, "", report);
+			finish();
 		} catch (IOException e) {
 			throw new UncheckedIOException("could not write " + logFile, e);
 		}
 	}
 
-	/** A relay's report in the log as the mod's: its summary line, then its rows, scoped "relay<rid>.". */
+	/** A relay's report in the log as the mod's: its summary line, then its scopes, "relay<rid>." before each. */
 	private void writeRelay(int rid, ProfileReport report) {
-		final String time = LocalDateTime.ofInstant(Instant.ofEpochMilli(report.getTime()), ZoneId.systemDefault()).toString();
-		final String reason = report.getReason().replace('\t', ' ').replace('\n', ' ');
+		final String time = time(report);
 		final String prefix = "relay" + rid + ".";
 
 		try {
-			log.write("# " + time + " " + prefix + " " + reason + ": " + String.format(Locale.ROOT, "node cpu %s, rss %s, bots %d%s",
+			line("# " + time + " " + prefix + " " + oneLine(report.getReason()) + ": " + String.format(Locale.ROOT, "node cpu %s, rss %s, bots %d%s",
 					cpu(report, "node", "cpu.user", "cpu.system"), megabytes(report.value("node", "mem.rss")), (int) report.value("node", "bots"),
 					report.hasRates() ? String.format(Locale.ROOT, " | over %.1f s", report.getInterval() / 1000.0) : ""));
-			log.newLine();
-
-			for (String scope : report.scopes("")) {
-				for (ProfileReport.Row row : report.rows(scope).values()) {
-					log.write(time + "\t" + reason + "\t" + prefix + scope + "\t" + row.getName() + "\t" + row.getUnit() + "\t" + number(row.getValue())
-							+ "\t" + (Double.isNaN(row.getRate()) ? "" : number(row.getRate())));
-					log.newLine();
-				}
-			}
-
-			log.flush();
+			rows(time, prefix, report);
+			finish();
 		} catch (IOException e) {
 			throw new UncheckedIOException("could not write " + logFile, e);
 		}
+	}
+
+	/** Each scope's line, those with nothing left to say left out. */
+	private void rows(String time, String prefix, ProfileReport report) throws IOException {
+		for (String scope : report.scopes("")) {
+			final StringBuilder out = new StringBuilder();
+
+			for (ProfileReport.Row row : report.rows(scope).values()) {
+				final String value = shown(report, row);
+
+				if (value == null) {
+					continue;
+				}
+
+				if (!isCount(row.getUnit()) && value.equals(lastReading.put(prefix + scope + "\t" + row.getName(), value))) {
+					continue;
+				}
+
+				out.append(' ').append(row.getName()).append('=').append(value);
+			}
+
+			if (out.length() > 0) {
+				line(time + " " + prefix + scope + out);
+			}
+		}
+	}
+
+	/** Flushes, and rotates once the log grew past MAX_LOG. */
+	private void finish() throws IOException {
+		log.flush();
+
+		if (logSize > MAX_LOG) {
+			openLog();
+		}
+	}
+
+	/** The scopes (threads and bots, not the processes whole) that took the most CPU since the report before, their ms rows added up. */
+	private static String top(ProfileReport report) {
+		final List<Map.Entry<String, Double>> scopes = new ArrayList<Map.Entry<String, Double>>();
+
+		for (String scope : report.scopes("")) {
+			if (scope.equals("java") || scope.equals("node")) {
+				continue;
+			}
+
+			double cpu = 0;
+
+			for (ProfileReport.Row row : report.rows(scope).values()) {
+				if (row.getUnit().equals(ProfileReport.MS)) {
+					cpu += row.getRate();
+				}
+			}
+
+			if (cpu > 0) {
+				scopes.add(new java.util.AbstractMap.SimpleEntry<String, Double>(scope, cpu));
+			}
+		}
+
+		scopes.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+		final StringBuilder out = new StringBuilder();
+
+		for (int i = 0; i < Math.min(TOP, scopes.size()); i++) {
+			out.append(i == 0 ? "" : ", ").append(scopes.get(i).getKey()).append(' ').append(percent(scopes.get(i).getValue()));
+		}
+
+		return out.length() == 0 ? "-" : out.toString();
+	}
+
+	/** The row as the log says it: its rate when it has one, else its value; null for a zero. */
+	private static String shown(ProfileReport report, ProfileReport.Row row) {
+		final String unit = row.getUnit();
+
+		if (isCount(unit) && report.hasRates()) {
+			final double rate = row.getRate();
+
+			if (unit.equals(ProfileReport.MS)) {
+				return Math.abs(rate) < 0.05 ? null : percent(rate);
+			}
+
+			if (unit.equals(ProfileReport.COUNT)) {
+				return Math.abs(rate) < 0.05 ? null : decimal(rate) + "/s";
+			}
+
+			return Math.abs(rate) < 0.5 ? null : bytes(rate) + "/s";
+		}
+
+		final double value = row.getValue();
+
+		if (value == 0) {
+			return null;
+		}
+
+		switch (unit) {
+			case ProfileReport.MS:
+				return decimal(value) + "ms";
+			case ProfileReport.BYTES:
+			case ProfileReport.BYTES_SO_FAR:
+				return bytes(value);
+			case ProfileReport.PERCENT:
+				return percent(value);
+			default:
+				return decimal(value);
+		}
+	}
+
+	/** Whether the unit only goes up, its rate being what the log says. */
+	private static boolean isCount(String unit) {
+		return unit.equals(ProfileReport.MS) || unit.equals(ProfileReport.COUNT) || unit.equals(ProfileReport.BYTES_SO_FAR);
+	}
+
+	private static String time(ProfileReport report) {
+		return LocalDateTime.ofInstant(Instant.ofEpochMilli(report.getTime()), ZoneId.systemDefault()).format(TIME);
+	}
+
+	private static String oneLine(String text) {
+		return text.replace('\t', ' ').replace('\n', ' ');
+	}
+
+	/** Bytes, to K, M or G past a thousand and twenty-four. */
+	private static String bytes(double value) {
+		final String[] units = {"B", "K", "M", "G"};
+		int unit = 0;
+
+		while (Math.abs(value) >= 1024 && unit < units.length - 1) {
+			value /= 1024;
+			unit++;
+		}
+
+		return (unit == 0 ? Long.toString(Math.round(value)) : decimal(value)) + units[unit];
+	}
+
+	/** At most one decimal, none when it is whole. */
+	private static String decimal(double value) {
+		final double rounded = Math.round(value * 10) / 10.0;
+		return rounded == Math.rint(rounded) && Math.abs(rounded) < 1e15 ? Long.toString((long) rounded) : String.format(Locale.ROOT, "%.1f", rounded);
 	}
 
 	/** The processes whole, in a line: CPU since the report before (on the first, the average since each started), memory now. */
@@ -386,9 +554,5 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 
 	private static String megabytes(double bytes) {
 		return String.format(Locale.ROOT, "%.0f MB", bytes / (1024 * 1024));
-	}
-
-	private static String number(double value) {
-		return value == Math.rint(value) && Math.abs(value) < 1e15 ? Long.toString((long) value) : String.format(Locale.ROOT, "%.3f", value);
 	}
 }
