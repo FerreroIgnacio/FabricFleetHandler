@@ -12,16 +12,19 @@ public final class BotStatus {
 		IDLE, DOING, ERROR
 	}
 
-	public static final BotStatus IDLE = new BotStatus(Kind.IDLE, "", "");
+	public static final BotStatus IDLE = new BotStatus(Kind.IDLE, "", "", null);
 
 	private final Kind kind;
 	private final String primitive;
 	private final String message;
+	/** The block its feet were in, {x, y, z}; null when not in the world yet, or not told (IDLE). */
+	private final int[] feet;
 
-	public BotStatus(Kind kind, String primitive, String message) {
+	public BotStatus(Kind kind, String primitive, String message, int[] feet) {
 		this.kind = kind;
 		this.primitive = primitive;
 		this.message = message;
+		this.feet = feet;
 	}
 
 	public Kind getKind() {
@@ -30,6 +33,19 @@ public final class BotStatus {
 
 	public String getPrimitive() {
 		return primitive;
+	}
+
+	public boolean hasFeet() {
+		return feet != null;
+	}
+
+	/** The block its feet were in as the state changed, {x, y, z}. */
+	public int[] getFeet() {
+		if (feet == null) {
+			throw new IllegalStateException("expected where the bot stands with its state " + this + ", found it not told");
+		}
+
+		return feet.clone();
 	}
 
 	/** Why the primitive failed; empty unless in error. */

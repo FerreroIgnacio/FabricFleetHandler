@@ -1,0 +1,12 @@
+Terminología del proyecto (usarla igual en código, comentarios y respuestas).
+
+- comando: línea de texto del chat de Minecraft. Los del mod empiezan con # (#goto, #grab, ...), se
+  manejan en ChatCommandMixin -> MapMcBotClient.command -> BotCommands y nunca van al server.
+- prim (primitiva / primitive): acción atómica que corre la flota en el bot (actions.js, PRIMITIVES en
+  protocol.js/fleet.js, FleetProtocol). Es la unidad que manda el mod al bot.
+- job: secuencia de prims (steps) que configura el usuario. JobStore / JobRunner, panel de jobs en BotScreen.
+- plan: serie de prims que resuelve el mod a partir de un objetivo de alto nivel (grab, deposit, index; en
+  el mod original #quarry Area). No es una prim de la flota: lo corre un JobRunner.Resolver (Grab, clase
+  interna Grab.Plan) mandando prims propias. Un plan puede ser un step de un job.
+
+No mezclar: "comando" no es un plan ni una prim; un plan no es una prim; un job lo arma el usuario, un plan el mod.

@@ -11,10 +11,19 @@ const { once } = require('events')
 const conv = require('mineflayer/lib/conversions')
 
 const REACH_BLOCK = 4.5
+// The farthest the eyes get from the middle of the block the feet are in, sideways.
+const SLACK = Math.SQRT1_2
 const REACH_ENTITY = 3
 const FACES = [new Vec3(0, -1, 0), new Vec3(0, 1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)]
 const SIDES = ['bottom', 'top', 'east', 'west', 'south', 'north']
 const sideOf = face => SIDES[FACES.findIndex(f => f.equals(face))]
+const AXES = ['x', 'y', 'z']
+// The face a ray enters a block by, by prismarine-world's BlockFace (bottom, top, north, south, west, east).
+const ENTRY_FACES = [new Vec3(0, -1, 0), new Vec3(0, 1, 0), new Vec3(0, 0, -1), new Vec3(0, 0, 1), new Vec3(-1, 0, 0), new Vec3(1, 0, 0)]
+// Each face of a block is aimed at in a GRID x GRID grid of points.
+const GRID = 4
+// How many times an interact turns to its block: again when what it looks at changed on the way.
+const AIMS = 3
 
 // A primitive with an expected condition fails after this long unless the order carries its own deadline.
 const DEFAULT_DEADLINE = 5000
@@ -197,9 +206,24 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       bot.pathfinder.stop()
       bot.pathfinder.setGoal(null)
     })
+    // Standing: on the ground, or in a liquid. A walk can reach its goal in the air (a drop, a jump),
+    // and a bot whose block was dug from under it falls: an aim taken in the air is off once it lands,
+    // and a dig there takes five times as long. Its start and its end wait for the landing.
+    const standing = () => bot.entity.onGround || bot.entity.isInWater || bot.entity.isInLava
+    const landed = then => {
+      if (standing()) {
+        then()
+        return
+      }
+      listen(action, bot, 'move', function onMove () {
+        if (!standing()) return
+        bot.removeListener('move', onMove)
+        then()
+      })
+    }
     listen(action, bot, 'goal_reached', () => {
       arrived = true
-      done(action)
+      landed(() => done(action))
     })
     // mineflayer-pathfinder can end a walk on its last node with the goal not met there: it stops and
     // waits with its goal set, searching no more and saying nothing (pathUpdated stays set). Told by
@@ -211,8 +235,16 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       if (result.status === 'noPath') fail(action, `expected a path to ${where}, found none from ${stood()}${result.reason ? ` (${result.reason})` : ''}`)
       if (result.status === 'success' && result.path.length > 0) walking = true
     })
-    listen(action, bot, 'path_reset', () => {
+    // Stuck (the pathfinder's own call: no headway on its path) it searches again from where it is,
+    // and can find the same path there for ever (out of water onto a bank): failed when it is stuck
+    // twice on the same spot.
+    let stuckAt = null
+    listen(action, bot, 'path_reset', reason => {
       walking = false
+      if (reason !== 'stuck') return
+      const here = stood()
+      if (stuckAt === here) fail(action, `expected to arrive at ${where}, the walk got stuck at ${here} twice`)
+      stuckAt = here
     })
     listen(action, bot, 'move', () => {
       if (!walking || bot.pathfinder.isMoving() || bot.pathfinder.goal !== goal) return
@@ -227,16 +259,18 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       bot.pathfinder.setGoal(goal)
     })
     listen(action, bot, 'path_stop', () => fail(action, `expected to arrive at ${where}, the walk was stopped at ${stood()}`))
-    // Already there as the pathfinder has it when a walk ends (its feet's block or the one above, see
-    // its monitorMovement): it would not have it so from a standstill, and search for another spot.
-    const feet = bot.entity.position.floored()
-    if (a.look && (goal.isEnd(feet) || goal.isEnd(feet.offset(0, 1, 0)))) {
-      log(`goto: already in sight of ${at(a.look)} at ${stood()}`)
-      arrived = true
-      done(action)
-      return
-    }
-    walk(goal)
+    landed(() => {
+      // Already in sight as the interact will have it, from the eyes where they are: walked to, the
+      // spot is one where they are in reach wherever in it the bot stands (see LookGoal).
+      const look = a.look && bot.blockAt(goal.pos)
+      if (look && aimsAt(look, eyes(), FACES, true).aims.length > 0) {
+        log(`goto: already in sight of ${at(a.look)} at ${stood()}`)
+        arrived = true
+        done(action)
+        return
+      }
+      walk(goal)
+    })
   }
 
   // --- B. interact
@@ -276,57 +310,181 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     return { hit, distance, hitDistance: from.distanceTo(where) }
   }
 
-  // Where the block is clicked: the middle of one of its faces (of faces, all six by default) turned to
-  // the eyes, in reach and in sight, the closest; { point, face }. In sight: the ray from the eyes gets
-  // into the block's space before another block's collision box cuts it. The block counts whole,
-  // whatever its shape (a lever, a crop, a slab's upper half); the rest by their collision box, as
-  // mineflayer has them: what has none (grass, a torch) is seen through, a fence stands 1.5 high.
+  // Where the block is clicked: a point of one of its faces (of faces, all six by default) turned to the
+  // eyes, in reach and in sight, the safest; { point, face }. In sight: the ray from the eyes gets into
+  // the block's space before another block's collision box cuts it. The block counts whole, whatever its
+  // shape (a lever, a crop, a slab's upper half); the rest by their collision box, as mineflayer has
+  // them: what has none (grass, a torch) is seen through, a fence stands 1.5 high. The safest: the one
+  // with most seen points around it in its face's grid, so a turn off by a hair still clicks the block;
+  // of those, the closest.
   function blockAim (block, faces = FACES) {
     const { aims, reasons } = aimsAt(block, eyes(), faces)
     if (aims.length === 0) {
       throw new Error(`expected ${full(block.name)} at ${at(block.position)} in reach and in sight, found ${reasons.length ? reasons.join('; ') : 'no face of it turned to the eyes'}`)
     }
-    return aims.reduce((a, b) => b.distance < a.distance ? b : a)
+    return aims.reduce((a, b) => b.score > a.score || (b.score === a.score && b.distance < a.distance) ? b : a)
   }
 
-  // The faces of the block (of faces) in reach and in sight from eyes at from, as blockAim takes them:
-  // { aims: [{ point, face, distance }], reasons: why each other face is not }.
-  function aimsAt (block, from, faces = FACES) {
+  // The points of the faces of the block (of faces) in reach and in sight from eyes at from, as blockAim
+  // takes them: { aims: [{ point, face, distance, score }], reasons: why no face is }. Each face turned
+  // to the eyes in reach is a GRID x GRID grid of ray targets; when none is seen the cells whose blocker
+  // is not a whole block, or differs from a neighbour's (an edge of what hides it, where a gap may be),
+  // split in 2 x 2 and are tried again. first: the first point seen, no more (score 0), for a search;
+  // reach: how far the eyes reach, the interact's by default.
+  function aimsAt (block, from, faces = FACES, first = false, reach = REACH_BLOCK) {
     const pos = block.position
-    const aims = []
     const reasons = []
+    const scans = []
     for (const face of faces) {
       const middle = pos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5)
       // Turned to the eyes: they are past its plane.
       if (from.minus(middle).dot(face) <= 0) continue
-      // A hair inside, so the ray gets into the block's space.
-      const point = middle.minus(face.scaled(0.001))
-      const distance = from.distanceTo(point)
-      if (distance > REACH_BLOCK) {
-        reasons.push(`its ${sideOf(face)} face at ${distance.toFixed(2)} blocks, past ${REACH_BLOCK}`)
+      const nearest = distanceToFace(pos, face, from)
+      if (nearest > reach) {
+        reasons.push(`its ${sideOf(face)} face at ${nearest.toFixed(2)} blocks, past ${reach}`)
         continue
       }
-      const hit = bot.world.raycast(from, point.minus(from).normalize(), distance + 1, (b, ray) => b.position.equals(pos) || Boolean(ray.intersect(b.shapes, b.position)))
-      if (!hit) throw new Error(`the ray to ${full(block.name)} at ${at(pos)} never got to it`)
-      if (!hit.position.equals(pos)) {
-        reasons.push(`${full(hit.name)} at ${at(hit.position)} in the way of its ${sideOf(face)} face`)
-        continue
+      const grid = gridOf(GRID)
+      for (let i = 0; i < GRID; i++) {
+        for (let j = 0; j < GRID; j++) {
+          grid[i][j] = cellAt(block, from, face, GRID, i, j, reach)
+          if (first && grid[i][j]?.blocker === null) return { aims: [{ point: grid[i][j].point, face, distance: grid[i][j].distance, score: 0 }], reasons }
+        }
       }
-      aims.push({ point, face, distance })
+      scans.push({ face, grid })
+    }
+    if (first) return { aims: [], reasons }
+    let aims = scans.flatMap(scan => seenAims(scan.face, scan.grid))
+    if (aims.length === 0) {
+      for (const scan of scans) {
+        scan.fine = gridOf(GRID * 2)
+        for (let i = 0; i < GRID; i++) {
+          for (let j = 0; j < GRID; j++) {
+            if (!worthSplitting(scan.grid, i, j)) continue
+            for (const [di, dj] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
+              scan.fine[2 * i + di][2 * j + dj] = cellAt(block, from, scan.face, GRID * 2, 2 * i + di, 2 * j + dj, reach)
+            }
+          }
+        }
+      }
+      aims = scans.flatMap(scan => seenAims(scan.face, scan.fine))
+    }
+    if (aims.length === 0) {
+      for (const scan of scans) reasons.push(`its ${sideOf(scan.face)} face hidden by ${blockersOf(scan.grid)}`)
     }
     return { aims, reasons }
+  }
+
+  function gridOf (n) {
+    return Array.from({ length: n }, () => new Array(n))
+  }
+
+  // The nearest the eyes at from get to the face of the block at pos.
+  function distanceToFace (pos, face, from) {
+    const normal = AXES.find(k => face[k] !== 0)
+    const nearest = from.clone()
+    for (const k of AXES) nearest[k] = k === normal ? pos[k] + (face[k] > 0 ? 1 : 0) : Math.min(Math.max(from[k], pos[k]), pos[k] + 1)
+    return from.distanceTo(nearest)
+  }
+
+  // The point (u, v) of the face of the block at pos, each from 0 to 1 along its two other axes; a hair
+  // inside, so the ray gets into the block's space.
+  function facePoint (pos, face, u, v) {
+    const normal = AXES.find(k => face[k] !== 0)
+    const [b, c] = AXES.filter(k => k !== normal)
+    const point = pos.clone()
+    point[normal] += face[normal] > 0 ? 0.999 : 0.001
+    point[b] += u
+    point[c] += v
+    return point
+  }
+
+  // The cell (i, j) of the n x n grid of a face: its middle, with the block that hides it from the eyes
+  // (null when seen); nothing when past reach.
+  function cellAt (block, from, face, n, i, j, reach) {
+    const pos = block.position
+    const point = facePoint(pos, face, (i + 0.5) / n, (j + 0.5) / n)
+    const distance = from.distanceTo(point)
+    if (distance > reach) return undefined
+    const hit = bot.world.raycast(from, point.minus(from).normalize(), distance + 1, (b, ray) => b.position.equals(pos) || Boolean(ray.intersect(b.shapes, b.position)))
+    if (!hit) throw new Error(`the ray to ${full(block.name)} at ${at(pos)} never got to it`)
+    return { point, distance, blocker: hit.position.equals(pos) ? null : hit }
+  }
+
+  // The seen cells of a grid, each with how many of the 8 around it are seen too.
+  function seenAims (face, grid) {
+    const aims = []
+    for (let i = 0; i < grid.length; i++) {
+      for (let j = 0; j < grid.length; j++) {
+        if (grid[i][j]?.blocker !== null) continue
+        let score = 0
+        for (let di = -1; di <= 1; di++) {
+          for (let dj = -1; dj <= 1; dj++) {
+            if ((di !== 0 || dj !== 0) && grid[i + di]?.[j + dj]?.blocker === null) score++
+          }
+        }
+        aims.push({ point: grid[i][j].point, face, distance: grid[i][j].distance, score })
+      }
+    }
+    return aims
+  }
+
+  const wholeBlock = b => b.shapes.length === 1 && b.shapes[0].join() === '0,0,0,1,1,1'
+
+  // A cell none sees through, to split: what hides it is not a whole block, or is not what hides a
+  // neighbour (4 around it).
+  function worthSplitting (grid, i, j) {
+    const cell = grid[i][j]
+    if (!cell) return false
+    if (!wholeBlock(cell.blocker)) return true
+    return [[-1, 0], [1, 0], [0, -1], [0, 1]].some(([di, dj]) => {
+      const other = grid[i + di]?.[j + dj]
+      return other && !other.blocker.position.equals(cell.blocker.position)
+    })
+  }
+
+  // What hides the cells of a grid, as `minecraft:stone at 1,2,3 (x12)`, the most first.
+  function blockersOf (grid) {
+    const counts = new Map()
+    for (const cell of grid.flat()) {
+      if (!cell) continue
+      const key = `${full(cell.blocker.name)} at ${at(cell.blocker.position)}`
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return [...counts].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([key, count]) => `${key} (x${count})`).join(', ')
+  }
+
+  // What the server will see once turned: the ray along the yaw and pitch the head ended on enters the
+  // block by the face aimed at, else the click is not where the aim says.
+  function checkLook (block, aim) {
+    const { yaw, pitch } = bot.entity
+    const dir = new Vec3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch))
+    const pos = block.position
+    let entered = null
+    const hit = bot.world.raycast(eyes(), dir, aim.distance + 1, (b, ray) => {
+      if (b.position.equals(pos)) {
+        entered = ENTRY_FACES[ray.block.face]
+        return true
+      }
+      return Boolean(ray.intersect(b.shapes, b.position))
+    })
+    if (!hit || !hit.position.equals(pos) || !entered?.equals(aim.face)) {
+      throw new Error(`expected the head turned to ${full(block.name)} at ${at(pos)} by its ${sideOf(aim.face)} face, found it looking at ${hit ? `${full(hit.name)} at ${at(hit.position)}` : 'nothing'}${entered ? ` by its ${sideOf(entered)} face` : ''}`)
+    }
   }
 
   // Standing where the block is in reach and in sight as the interact will have it (see blockAim), the
   // eyes over the middle of the spot: GoalLookAtBlock's own end (its spot's corner 1.6 up to the block's
   // corner, within reach) misses spots the interact reaches from, a chest three blocks up among them.
+  // In reach by SLACK less: the bot stands anywhere in the spot's block once there, its eyes up to
+  // SLACK from its middle, and the interact aims from there.
   class LookGoal extends goals.GoalLookAtBlock {
     isEnd (node) {
       const block = bot.blockAt(this.pos)
       if (!block) return false
       const from = new Vec3(node.x + 0.5, node.y + bot.entity.eyeHeight, node.z + 0.5)
       if (from.distanceTo(this.pos.offset(0.5, 0.5, 0.5)) > REACH_BLOCK + 1) return false
-      return aimsAt(block, from).aims.length > 0
+      return aimsAt(block, from, FACES, true, REACH_BLOCK - SLACK).aims.length > 0
     }
   }
 
@@ -419,7 +577,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     const block = bot.blockAt(new Vec3(target.x, target.y, target.z))
     if (!block) throw new Error(`block at ${at(target)} is not loaded`)
     if (block.name === 'air') throw new Error(`expected a block at ${at(target)}, found air`)
-    const aim = blockAim(block)
+    let aim = blockAim(block)
     // Left breaks it; right opens its window, or changes it when it has none.
     const spec = a.expect ?? (left
       ? { kind: 'block', x: block.position.x, y: block.position.y, z: block.position.z, state: 'minecraft:air' }
@@ -430,11 +588,25 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       throw new Error(`block at ${at(target)} is already "${stateAt(block.position)}": the interaction would show nothing`)
     }
     expect(action, spec, ms)
-    if (!await turnTo(action, a, aim.point)) return
-    // On the face aimed at, and for a use where on it.
+    // The world can change while the head turns (sand or gravel falling in the way): aimed again from
+    // there, up to AIMS times, the block no longer in reach and in sight failing it.
+    for (let aims = 1; ; aims++) {
+      if (!await turnTo(action, a, aim.point)) return
+      try {
+        checkLook(block, aim)
+        break
+      } catch (e) {
+        if (aims === AIMS) throw e
+        log(`${e.message}: aiming again`)
+        aim = blockAim(block)
+      }
+    }
+    // On the face aimed at, and for a use where on it. The dig with no look of its own: the head is
+    // on the block already (checkLook), and mineflayer's would turn it again to the face's middle, a
+    // tick more each block. Its packet then names the top face, which the server does not check.
     if (left) {
       action.cleanups.push(() => { if (bot.targetDigBlock) bot.stopDigging() })
-      guard(action, bot.dig(block, false, aim.face))
+      guard(action, bot.dig(block, 'ignore', aim.face))
     } else {
       guard(action, bot.activateBlock(block, aim.face, aim.point.minus(block.position)))
     }
@@ -454,6 +626,12 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     const there = bot.blockAt(pos)
     if (!there) throw new Error(`block at ${at(pos)} is not loaded`)
     if (there.boundingBox !== 'empty') throw new Error(`expected a free spot at ${at(pos)}, found ${full(there.name)}`)
+    // The server takes no block where an entity is, the bot among them: it would wait out its deadline.
+    const p = bot.entity.position
+    const half = bot.entity.width / 2
+    if (p.x + half > pos.x && p.x - half < pos.x + 1 && p.y + bot.entity.height > pos.y && p.y < pos.y + 1 && p.z + half > pos.z && p.z - half < pos.z + 1) {
+      throw new Error(`expected the bot out of ${at(pos)} to place a block there, found it standing at ${p.toString()}`)
+    }
     if (!bot.heldItem) throw new Error(`expected a block in hand to place at ${at(pos)}, found nothing`)
     const reasons = []
     let found = null

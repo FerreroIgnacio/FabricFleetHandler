@@ -20,7 +20,8 @@ import org.lwjgl.opengl.GL11;
 /**
  * Each area as a coloured box in the world, plus the block a click would pick while picking, and
  * the path each walking bot is on with its target, and the chests of each grab going on: the one
- * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour.
+ * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour; and
+ * the blocks clicked in chat messages, red.
  *
  * Drawn at the end of entity rendering, where the camera transform is set with the camera at the
  * origin: boxes are shifted by the interpolated camera position, the raw one makes them jitter.
@@ -52,7 +53,9 @@ public final class AreaRenderer {
 		final Grab grab = MapMcBotClient.grabOrNull();
 		final List<Grab.Highlight> chests = grab == null ? Collections.<Grab.Highlight>emptyList() : grab.highlights();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty()) {
+		final List<BlockPos> highlighted = BlockLinks.highlighted();
+
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty() && highlighted.isEmpty()) {
 			return;
 		}
 
@@ -125,6 +128,15 @@ public final class AreaRenderer {
 				drawOutline(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1, rgb, camX, camY, camZ);
 			}
 		}
+
+		// The blocks clicked in chat (see BlockLinks), over everything.
+		GlStateManager.disableDepthTest();
+
+		for (BlockPos block : highlighted) {
+			drawBox(block.getX(), block.getY(), block.getZ(), block.getX() + 1, block.getY() + 1, block.getZ() + 1, 0xFF0000, camX, camY, camZ);
+		}
+
+		GlStateManager.enableDepthTest();
 
 		// Line width is global state the rest of the frame would inherit.
 		GL11.glLineWidth(1.0F);

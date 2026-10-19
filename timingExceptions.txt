@@ -1,4 +1,4 @@
-Excepciones a la regla "todo event driven", autorizadas una por una.
+Excepciones a la regla "todo event driven" (reglas del repo), autorizadas una por una.
 
 1. Deadline de las primitivas con condición esperada (interact, break, place, wait_slot): solo sirve para fallar; el evento que confirma el efecto lo resuelve antes. (actions.js, deadline)
 

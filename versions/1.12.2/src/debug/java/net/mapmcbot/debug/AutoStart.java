@@ -43,6 +43,7 @@ public class AutoStart implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+		DebugBridge.start(MinecraftClient.getInstance());
 	}
 
 	private void tick(MinecraftClient client) {

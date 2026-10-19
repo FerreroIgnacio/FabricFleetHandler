@@ -566,9 +566,10 @@ public class BotScreen extends HandledScreen {
 		stopJobButton.active = running;
 		stopJobButton.method_891(client, mouseX, mouseY, tickDelta);
 
-		// The bot's whole state under the buttons: an error with its message; its grab's while it has one.
+		// The bot's whole state under the buttons: an error with its message; its grab's or quarrify's while it has one.
 		final String grabStatus = MapMcBotClient.grab().status(selected);
-		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
+		final String quarrifyStatus = MapMcBotClient.quarrify().status(selected);
+		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : quarrifyStatus != null ? quarrifyStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
 		drawPickPanel(top + ACTION_ROWS * 21 + JOB_ROW + 16, mouseX, mouseY);
 		drawMatchPanel(mouseX, mouseY);
 		drawJobPanel(mouseX, mouseY);

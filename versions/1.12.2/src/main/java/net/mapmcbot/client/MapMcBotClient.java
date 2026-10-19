@@ -14,6 +14,8 @@ import java.util.stream.Collectors;
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import com.google.gson.JsonObject;
+import net.mapmcbot.area.Area;
 import net.mapmcbot.area.AreaStore;
 import net.mapmcbot.area.ChestStore;
 import net.mapmcbot.bot.BotManager;
@@ -66,6 +68,7 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static ChestStore chests;
 	private static String chestsWorldId;
 	private static Grab grab;
+	private static Quarrify quarrify;
 	private static BotRegistry bots;
 	private static JobRunner job;
 	private static BotProfileStore botProfiles;
@@ -177,7 +180,8 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	/**
 	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
-	 * #formation sends every bot in the world to a spot around the player. False when it is not one.
+	 * #formation sends every bot in the world to a spot around the player, #quarrify AREA has PandaBot1
+	 * dig out the area. False when it is not one.
 	 */
 	public static boolean command(String line) {
 		if (line.equals("#relays")) {
@@ -196,7 +200,63 @@ public class MapMcBotClient implements ClientModInitializer {
 			return true;
 		}
 
+		if (line.startsWith("#highlight")) {
+			try {
+				BlockLinks.toggle(line.trim().split("\\s+"));
+			} catch (IllegalArgumentException e) {
+				chat(MinecraftClient.getInstance(), "highlight_err: " + e.getMessage());
+			}
+
+			return true;
+		}
+
+		if (line.equals("#quarrify") || line.startsWith("#quarrify ")) {
+			quarrify(MinecraftClient.getInstance(), line.substring("#quarrify".length()).trim());
+			return true;
+		}
+
 		return false;
+	}
+
+	/** PandaBot1 digs out the area named (see Quarrify), as an order from outside; its end told in chat. */
+	private static void quarrify(MinecraftClient client, String name) {
+		final String bot = NAME_PREFIX + 1;
+		Area area = null;
+
+		for (Area one : areas().getAreas()) {
+			if (one.getName().equals(name)) {
+				area = one;
+			}
+		}
+
+		if (area == null) {
+			chat(client, "quarrify_err: no area named " + name);
+			return;
+		}
+
+		if (!bots().getSpawned().contains(bot)) {
+			chat(client, "quarrify_err: no bot named " + bot + " in the world");
+			return;
+		}
+
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", "quarrify");
+		a.addProperty("area", area.getId());
+		final String dug = area.getName();
+		job().ordered(bot, a.toString());
+		quarrify().start(bot, a.toString(), new JobRunner.Listener() {
+			@Override
+			public void done() {
+				client.submit(() -> chat(client, "quarrify: " + bot + " dug out " + dug));
+			}
+
+			@Override
+			public void failed() {
+				final String why = quarrify.status(bot);
+				// Its blocks clickable: highlighted in the world.
+				client.submit(() -> client.inGameHud.getChatHud().addMessage(BlockLinks.text("quarrify_err: " + (why == null ? bot + " taken over" : why))));
+			}
+		});
 	}
 
 	/**
@@ -418,6 +478,12 @@ public class MapMcBotClient implements ClientModInitializer {
 		return chests;
 	}
 
+	/** The quarrifies of the bots; created with the bots. */
+	static Quarrify quarrify() {
+		bots();
+		return quarrify;
+	}
+
 	/** The grabs of the bots; created with the bots. */
 	static Grab grab() {
 		bots();
@@ -436,7 +502,9 @@ public class MapMcBotClient implements ClientModInitializer {
 			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
 			grab = new Grab(bots, new ChestTracker(bots));
-			job.setResolver(grab);
+			quarrify = new Quarrify(bots, chunks);
+			job.addResolver(grab);
+			job.addResolver(quarrify);
 			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
 			relays.start();
 		}

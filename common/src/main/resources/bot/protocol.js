@@ -337,13 +337,20 @@ function item (w, it) {
 }
 
 // What the bot is doing: kind 0 idle, 1 doing `primitive`, 2 error in `primitive` with `message`
-// (what was expected and what was found). The bot stays in an error until its next primitive.
-function state (bot, kind, primitive, message) {
+// (what was expected and what was found), and where it stands then: u8 present and its feet's block
+// (i32 x, y, z), none before it is in the world. The bot stays in an error until its next primitive.
+function state (bot, kind, primitive, message, feet) {
   const w = new Writer(TYPES.STATE)
   w.str(bot)
   w.u8(kind)
   w.str(primitive)
   w.bytes(Buffer.from(message, 'utf8'))
+  w.u8(feet ? 1 : 0)
+  if (feet) {
+    w.i32(feet.x)
+    w.i32(feet.y)
+    w.i32(feet.z)
+  }
   return w.frame()
 }
 

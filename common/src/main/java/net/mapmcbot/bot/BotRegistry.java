@@ -69,7 +69,7 @@ public final class BotRegistry implements BotListener {
 
 	/**
 	 * Hears each primitive sent to a bot, once it is on its way; internal when the mod sent it on its own
-	 * (a step of the job, a part of a grab), not as an order from outside.
+	 * (a step of the job, a part of a plan), not as an order from outside.
 	 */
 	public interface ActionListener {
 		void onAction(String bot, String json, boolean internal);

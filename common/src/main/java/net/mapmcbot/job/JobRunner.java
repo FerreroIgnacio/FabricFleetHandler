@@ -1,8 +1,10 @@
 package net.mapmcbot.job;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.mapmcbot.bot.BotRegistry;
@@ -15,15 +17,15 @@ import net.mapmcbot.bot.BotStatus;
  * bot's own reports drive it. A looping job that goes a whole lap with every step over as it was started
  * (a deposit with nothing to leave) has nothing left to do: it ends there instead of starting over.
  *
- * A step the fleet does not run (a grab) is the mod's: its Resolver does it on the bot with
- * primitives of its own, and says when it is done or failed.
+ * A step the fleet does not run (a plan: grab, deposit, index, quarrify) is the mod's: the Resolver that handles it does it on
+ * the bot with primitives of its own, and says when it is done or failed.
  *
  * A primitive ordered from outside to a bot running the job takes it over: the job ends there.
  * Recording is one step at a time: armed, the next order to a bot is added to the selected job (the
  * stop primitive never is), and it disarms.
  */
 public final class JobRunner implements BotRegistry.StateListener, BotRegistry.ActionListener {
-	/** Does the steps the fleet does not run. */
+	/** Does the steps the fleet does not run: the plans. */
 	public interface Resolver {
 		/** Whether the step is one of its own. */
 		boolean handles(String json);
@@ -59,7 +61,7 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 	private final JobStore jobs;
 	/** The job shown, started and recorded into. */
 	private volatile JobStore.Job selected;
-	private Resolver resolver;
+	private final List<Resolver> resolvers = new CopyOnWriteArrayList<Resolver>();
 
 	private final Map<String, Run> running = new ConcurrentHashMap<String, Run>();
 	/** The running bots whose step is the resolver's: their states are its, not the job's. */
@@ -74,8 +76,19 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		bots.addActionListener(this);
 	}
 
-	public void setResolver(Resolver resolver) {
-		this.resolver = resolver;
+	public void addResolver(Resolver resolver) {
+		resolvers.add(resolver);
+	}
+
+	/** The resolver that handles the step, null when the fleet runs it. */
+	private Resolver resolverOf(String step) {
+		for (Resolver resolver : resolvers) {
+			if (resolver.handles(step)) {
+				return resolver;
+			}
+		}
+
+		return null;
 	}
 
 	public JobStore getJobs() {
@@ -158,7 +171,9 @@ public final class JobRunner implements BotRegistry.StateListener, BotRegistry.A
 		final String step = run.job.get(run.index);
 
 		try {
-			if (resolver != null && resolver.handles(step)) {
+			final Resolver resolver = resolverOf(step);
+
+			if (resolver != null) {
 				resolving.add(bot);
 				final boolean[] starting = { true };
 				resolver.start(bot, step, new Listener() {

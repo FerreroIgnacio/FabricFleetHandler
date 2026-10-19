@@ -62,7 +62,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     bot,
     name,
     log,
-    publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message)),
+    publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message, bot.entity?.position.floored())),
     walk: goal => {
       setSearching(true)
       log(`goto ${spot(goal)} from ${at()}`)
@@ -152,7 +152,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     bot.pathfinder.thinkTimeout = Infinity
     log('spawned')
     out(protocol.botSpawned(name))
-    out(protocol.state(name, 0, '', ''))
+    out(protocol.state(name, 0, '', '', bot.entity.position.floored()))
   })
   // Every spawn, the first and each respawn or change of dimension: the fleet keeps where each bot is.
   bot.on('spawn', () => report({ world: world() }))

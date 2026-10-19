@@ -97,8 +97,9 @@ public final class FleetProtocol {
 	 */
 	public static final int INVENTORY = 24;
 	/**
-	 * bot name, u8 kind (0 idle, 1 doing, 2 error), primitive string, message bytes: what the bot is
-	 * doing (see {@link BotStatus}).
+	 * bot name, u8 kind (0 idle, 1 doing, 2 error), primitive string, message bytes, u8 feet present
+	 * and i32 x, y, z of the block its feet are in: what the bot is doing and where it stands then (see
+	 * {@link BotStatus}).
 	 */
 	public static final int STATE = 26;
 	/**
@@ -470,13 +471,14 @@ public final class FleetProtocol {
 					final int kind = in.readUnsignedByte();
 					final String primitive = readString(in);
 					final String message = new String(readBytes(in), StandardCharsets.UTF_8);
+					final int[] feet = in.readBoolean() ? new int[] {in.readInt(), in.readInt(), in.readInt()} : null;
 					end(in, type);
 
 					if (kind > BotStatus.Kind.values().length - 1) {
 						throw new IOException("bad state kind " + kind + " for " + bot);
 					}
 
-					bots.onState(bot, new BotStatus(BotStatus.Kind.values()[kind], primitive, message));
+					bots.onState(bot, new BotStatus(BotStatus.Kind.values()[kind], primitive, message, feet));
 					break;
 				}
 

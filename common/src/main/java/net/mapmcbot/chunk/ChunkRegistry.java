@@ -96,6 +96,12 @@ public final class ChunkRegistry implements ChunkListener {
 		return ChunkSnapshotStore.stateName(stateNames, stateId(entry, local(x, key.getX()), y, local(z, key.getZ())), key);
 	}
 
+	/** World coordinates: the state's id as the slot holds it (before the flattening: block id << 4 | metadata). */
+	public synchronized int getStateId(ChunkKey key, int x, int y, int z) {
+		final Entry entry = loaded(key);
+		return stateId(entry, local(x, key.getX()), y, local(z, key.getZ()));
+	}
+
 	/** World coordinates; null when there is no block entity there, or the block is no longer of its type. */
 	public synchronized ChunkData.BlockEntity getBlockEntity(ChunkKey key, int x, int y, int z) {
 		final Entry entry = loaded(key);
