@@ -19,7 +19,7 @@ import net.minecraft.util.math.BlockPos;
  * #goto BOT         click the block to stand on
  * #interact BOT left|right   click the block or entity
  * #break BOT        click the block
- * #place BOT        click the block to put the one in hand against
+ * #place BOT        click the block to put one it may place against (see PlaceBlocks)
  * #close BOT
   * #move BOT FROM TO                    the whole stack on slot FROM onto slot TO
  * #itemfill BOT ITEM SLOT...           every ITEM off the other slots onto the slots SLOT, as much as fits
@@ -34,6 +34,16 @@ import net.minecraft.util.math.BlockPos;
  * #shiftmove BOT SLOT                  slot SLOT shift-clicked: its stack to the window's other part
  * #stop BOT                            whatever it is doing stopped, then idle
  * #status BOT
+ * #breakwsr X Y Z [N]                 PandaBot1 breaks the block at X Y Z, walking first (a walk costing N
+ *                                      at most, 5 by default) to where it is in reach and in sight
+ * #placewsr X Y Z [N]                  PandaBot1 puts a block it may place at X Y Z, as #breakwsr
+ * #breakwsr BOT [N]                   as #breakwsr X Y Z, by BOT, the block clicked
+ * #placewsr BOT [N]                   as #placewsr X Y Z, by BOT, next to the block clicked on the face clicked
+ * #breakwsrp X Y Z EX EY EZ [N]       as #breakwsr X Y Z, then PandaBot1 walks to EX EY EZ; failed before the
+ *                                      break when there is no path there from where it breaks
+ * #placewsrp X Y Z EX EY EZ [N]       as #placewsr X Y Z, then to EX EY EZ, as #breakwsrp
+ * #breakwsrp BOT [N]                  as #breakwsr BOT, then BOT walks onto the second block clicked
+ * #placewsrp BOT [N]                  as #placewsr BOT, then BOT walks onto the second block clicked
  * </pre>
  *
  * A mistake in a command is told in chat and nothing is sent.
@@ -47,7 +57,7 @@ final class BotCommands {
 		final String[] words = line.trim().split("\\s+");
 		final String command = words[0];
 
-		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#shiftmove", "#stop", "#status").contains(command)) {
+		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#shiftmove", "#stop", "#status", "#breakwsr", "#placewsr", "#breakwsrp", "#placewsrp").contains(command)) {
 			return false;
 		}
 
@@ -62,6 +72,11 @@ final class BotCommands {
 
 	private static void run(MinecraftClient client, String command, String[] w) {
 		final BotRegistry bots = MapMcBotClient.bots();
+
+		if (command.startsWith("#breakwsr") || command.startsWith("#placewsr")) {
+			withSearch(client, bots, command, w);
+			return;
+		}
 
 		if (w.length < 2) {
 			throw new IllegalArgumentException(command + " needs a bot");
@@ -276,6 +291,70 @@ final class BotCommands {
 			default:
 				throw new IllegalStateException("command " + command + " has no handler");
 		}
+	}
+
+	/**
+	 * break_wsr or place_wsr: on PandaBot1, its target and radius in the line; or on the bot named, its
+	 * target clicked in the world as #break's and #place's. break_wsrp and place_wsrp: also the block it
+	 * ends in, after the target in the line, or the one on top of the block clicked second.
+	 */
+	private static void withSearch(MinecraftClient client, BotRegistry bots, String command, String[] w) {
+		final boolean place = command.startsWith("#placewsr");
+		final boolean ends = command.endsWith("p");
+		final boolean picked = w.length >= 2 && !w[1].matches("-?[0-9]+");
+		final int given = picked ? 2 : ends ? 7 : 4;
+
+		if (w.length != given && w.length != given + 1) {
+			throw new IllegalArgumentException(command + (ends ? " X Y Z EX EY EZ [N] | " : " X Y Z [N] | ") + command + " BOT [N]");
+		}
+
+		final String bot = picked ? w[1] : MapMcBotClient.NAME_PREFIX + 1;
+
+		if (!bots.getSpawned().contains(bot)) {
+			throw new IllegalArgumentException("no bot named " + bot + " in the world");
+		}
+
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", (place ? "place_wsr" : "break_wsr") + (ends ? "p" : ""));
+		a.addProperty("radius", w.length > given ? number(w[given], "N") : 5);
+
+		if (picked) {
+			// For a place, the block clicked is the one it is put against: the target is the spot next to it, on the face clicked.
+			TargetPick.begin(client, command.substring(1) + " " + bot, false, place, hit -> {
+				final JsonObject target = new JsonObject();
+				position(target, place ? hit.getBlockPos().offset(hit.direction) : hit.getBlockPos());
+				a.add("target", target);
+
+				if (!ends) {
+					bots.action(bot, a.toString());
+					return;
+				}
+
+				// The end, as #goto's: the block on top of the one clicked.
+				TargetPick.begin(client, command.substring(1) + " " + bot + " end", false, false, true, endHit -> {
+					final JsonObject end = new JsonObject();
+					position(end, endHit.getBlockPos().up());
+					a.add("end", end);
+					bots.action(bot, a.toString());
+				});
+			});
+			return;
+		}
+
+		if (ends) {
+			final JsonObject end = new JsonObject();
+			end.addProperty("x", number(w[4], "EX"));
+			end.addProperty("y", number(w[5], "EY"));
+			end.addProperty("z", number(w[6], "EZ"));
+			a.add("end", end);
+		}
+
+		final JsonObject target = new JsonObject();
+		target.addProperty("x", number(w[1], "X"));
+		target.addProperty("y", number(w[2], "Y"));
+		target.addProperty("z", number(w[3], "Z"));
+		a.add("target", target);
+		bots.action(bot, a.toString());
 	}
 
 	private static int number(String word, String what) {

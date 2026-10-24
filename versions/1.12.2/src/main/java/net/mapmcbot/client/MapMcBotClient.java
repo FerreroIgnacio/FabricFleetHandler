@@ -23,6 +23,7 @@ import net.mapmcbot.bot.BotProfile;
 import net.mapmcbot.bot.BotProfileStore;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.NameList;
+import net.mapmcbot.bot.PlaceBlocks;
 import net.mapmcbot.bot.RelayHub;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
@@ -498,7 +499,8 @@ public class MapMcBotClient implements ClientModInitializer {
 			relays = new RelayHub(new File(directory, "relays.txt"));
 			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
 			seedProfiles();
-			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles);
+			final PlaceBlocks placeBlocks = new PlaceBlocks(new File(directory, "place_blocks.txt"), PlaceCatalog.keys());
+			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles, placeBlocks);
 			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
 			grab = new Grab(bots, new ChestTracker(bots));
@@ -543,6 +545,10 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	/** The bots, or null while none was ever started. */
 	/** The grabs, null before the bots are created. */
+	static Quarrify quarrifyOrNull() {
+		return quarrify;
+	}
+
 	static Grab grabOrNull() {
 		return grab;
 	}

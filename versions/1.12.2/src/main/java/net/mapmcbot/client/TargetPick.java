@@ -18,6 +18,8 @@ public final class TargetPick {
 	private static boolean entities;
 	/** The spot next to the block pointed at, on its face, is the one highlighted (a block put there). */
 	private static boolean onFace;
+	/** The block on top of the one pointed at is the one highlighted (a spot to stand in). */
+	private static boolean above;
 
 	private TargetPick() {
 	}
@@ -33,9 +35,15 @@ public final class TargetPick {
 
 	/** As begin, the spot on the face pointed at highlighted when onFace. */
 	public static void begin(MinecraftClient client, String what, boolean allowEntities, boolean onFace, Consumer<BlockHitResult> then) {
+		begin(client, what, allowEntities, onFace, false, then);
+	}
+
+	/** As begin, the block on top of the one pointed at highlighted when above. */
+	public static void begin(MinecraftClient client, String what, boolean allowEntities, boolean onFace, boolean above, Consumer<BlockHitResult> then) {
 		callback = then;
 		entities = allowEntities;
 		TargetPick.onFace = onFace;
+		TargetPick.above = above;
 		AreaPick.tell(client, what + ": click the " + (allowEntities ? "block or entity" : "block") + " (the areas key cancels)");
 	}
 
@@ -88,6 +96,10 @@ public final class TargetPick {
 	/** The block a click would pick (the spot on its face for a place), or null when looking at none. */
 	public static BlockPos target(MinecraftClient client) {
 		final BlockPos pointed = AreaPick.target(client);
-		return pointed != null && onFace ? pointed.offset(client.result.direction) : pointed;
+		if (pointed == null) {
+			return null;
+		}
+
+		return onFace ? pointed.offset(client.result.direction) : above ? pointed.up() : pointed;
 	}
 }

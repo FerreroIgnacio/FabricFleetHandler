@@ -125,7 +125,10 @@ public final class BotRegistry implements BotListener {
 	/** The profiles of the bots: each join is recorded on its bot's. */
 	private final BotProfileStore profiles;
 
-	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names, BotProfileStore profiles) {
+	/** The blocks each bot may place: sent to it as it spawns and again each change. */
+	private final PlaceBlocks placeBlocks;
+
+	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names, BotProfileStore profiles, PlaceBlocks placeBlocks) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
 		}
@@ -134,8 +137,33 @@ public final class BotRegistry implements BotListener {
 		this.names = names;
 		this.profiles = profiles;
 		this.relays = relays;
+		this.placeBlocks = placeBlocks;
 		channel.setBotListener(this);
 		relays.setBots(this);
+		placeBlocks.setListener(() -> {
+			for (String bot : spawned) {
+				sendAllowedPlace(bot);
+			}
+		});
+	}
+
+	public PlaceBlocks getPlaceBlocks() {
+		return placeBlocks;
+	}
+
+	/** The blocks the bot may place, on the fleet running it (see FleetProtocol#ALLOWED_PLACE). */
+	private void sendAllowedPlace(String bot) {
+		final Integer rid = fleetOf.get(bot);
+
+		if (rid == null) {
+			throw new IllegalStateException("no bot named " + bot + " to send the blocks it may place to");
+		}
+
+		if (rid == 0) {
+			channel.allowedPlace(bot, placeBlocks.allowed(bot));
+		} else {
+			relays.allowedPlace(rid, bot, placeBlocks.allowed(bot));
+		}
 	}
 
 	public Set<String> getBots() {
@@ -381,6 +409,8 @@ public final class BotRegistry implements BotListener {
 
 	@Override
 	public void onSpawned(String bot) {
+		// Before it is ready for orders: a place never finds it without its list.
+		sendAllowedPlace(bot);
 		spawned.add(bot);
 	}
 

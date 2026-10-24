@@ -143,6 +143,8 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // blocks to place (each try a place_error and a new search).
     movements.canDig = false
     movements.allow1by1towers = false
+    // No jumps over gaps: one missed, by a quarrify's edge, is a fall of the whole height.
+    movements.allowParkour = false
     movements.scafoldingBlocks = []
     bot.pathfinder.setMovements(movements)
     if (tickTimeout !== null) bot.pathfinder.tickTimeout = tickTimeout
@@ -176,7 +178,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     if (walking && walking.target.x === target.x && walking.target.y === target.y && walking.target.z === target.z &&
         walking.nodes.length === nodes.length &&
         walking.nodes.every((n, i) => Math.floor(n.x) === Math.floor(nodes[i].x) && Math.floor(n.y) === Math.floor(nodes[i].y) && Math.floor(n.z) === Math.floor(nodes[i].z))) return
-    walking = { target, nodes }
+    walking = { target, nodes: nodes.slice() }
     consumed = 0
     sendPath(target, nodes)
   }
@@ -201,7 +203,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     let bestD = Infinity
     for (let i = consumed; i < Math.min(nodes.length, consumed + 6); i++) {
       const n = nodes[i]
-      const d = (n.x + 0.5 - p.x) ** 2 + (n.y - p.y) ** 2 + (n.z + 0.5 - p.z) ** 2
+      const d = (n.x - p.x) ** 2 + (n.y - p.y) ** 2 + (n.z - p.z) ** 2
       if (d < bestD) { bestD = d; best = i }
     }
     if (bestD > 2.25 || best === consumed) return
@@ -705,6 +707,11 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
         if (!bot.currentWindow) throw new Error(`${name}: trade ${trade} picked with no window open`)
         pickTrade(bot.currentWindow, trade)
       })
+    },
+
+    // The blocks it may place, as the mod keys them (see actions.js holdAllowed).
+    setAllowedPlace (blocks) {
+      act.setAllowedPlace(blocks)
     },
 
     // A primitive from the mod (see actions.js).

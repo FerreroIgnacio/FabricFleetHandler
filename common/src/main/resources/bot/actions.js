@@ -9,11 +9,14 @@ const { goals } = require('mineflayer-pathfinder')
 const nbt = require('prismarine-nbt')
 const { once } = require('events')
 const conv = require('mineflayer/lib/conversions')
+const { PlayerState } = require('prismarine-physics')
 
 const REACH_BLOCK = 4.5
 // The farthest the eyes get from the middle of the block the feet are in, sideways.
 const SLACK = Math.SQRT1_2
 const REACH_ENTITY = 3
+// The step mineflayer's look turns the head by (bot.look): vanilla's mouse at 100% sensitivity.
+const LOOK_STEP = conv.fromNotchianPitch(0.15)
 const FACES = [new Vec3(0, -1, 0), new Vec3(0, 1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)]
 const SIDES = ['bottom', 'top', 'east', 'west', 'south', 'north']
 const sideOf = face => SIDES[FACES.findIndex(f => f.equals(face))]
@@ -24,6 +27,21 @@ const ENTRY_FACES = [new Vec3(0, -1, 0), new Vec3(0, 1, 0), new Vec3(0, 0, -1), 
 const GRID = 4
 // How many times an interact turns to its block: again when what it looks at changed on the way.
 const AIMS = 3
+// Where in the block it stands on break_wsr and place_wsr put the feet, along x and along z: a bit off
+// the middle, and out over its edges, 0.1 of its box left on the block: the eyes past the edge, to
+// see down by it.
+const OFFSETS = [0.5, 0.3, 0.7, 0, 1, -0.2, 1.2]
+// Further out over its edges crouched, 0.05 of its box left on the block: sneaking keeps it from falling.
+const CROUCH_OFFSETS = [-0.25, 1.25]
+// The eyes crouched, as 1.12 has them: 0.08 under standing.
+const SNEAK_EYE_HEIGHT = 1.54
+// Slower than this the bot is still.
+const STILL = 0.005
+// The most ticks the bot takes to stop once it lets go of the keys, walking: friction stops it in a few.
+const STOP_TICKS = 40
+// The keys a step to where it sees the target is made of, as many ways as they go.
+const KEY_SETS = [[], ['forward'], ['back'], ['left'], ['right'], ['forward', 'left'], ['forward', 'right'], ['back', 'left'], ['back', 'right']]
+const CONTROLS = ['forward', 'back', 'left', 'right', 'jump', 'sprint', 'sneak']
 
 // A primitive with an expected condition fails after this long unless the order carries its own deadline.
 const DEFAULT_DEADLINE = 5000
@@ -108,6 +126,8 @@ class AreaGoal extends goals.Goal {
 // until the server lists them; selectTrade(window, trade): picks one (see bot.js merchant).
 module.exports = function actions ({ bot, name, log, publish, walk, blockStates, trades, selectTrade, rawClick }) {
   let current = null
+  // The blocks it may place, keyed name@metadata as the mod sends them (see holdAllowed); null until it does.
+  let allowedPlace = null
   // Each primitive's number, counting up for the bot: its lines in fleet.log carry it ("#12").
   let lastId = 0
 
@@ -145,8 +165,15 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     if (current) end(current)
   }
 
+  // action.then, when set: what follows its effect confirmed, the primitive going on.
   function done (action) {
     if (action.over) return
+    if (action.then) {
+      const then = action.then
+      action.then = null
+      then()
+      return
+    }
     end(action)
     log(`#${action.id} ${action.primitive} ok ${took(action)}`)
     publish('idle', '', '')
@@ -196,7 +223,21 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
         : new goals.GoalBlock(required(a.spot, 'spot').x, a.spot.y, a.spot.z)
     const where = a.area ? `area ${at({ x: a.area.minX, y: a.area.minY, z: a.area.minZ })}..${at({ x: a.area.maxX, y: a.area.maxY, z: a.area.maxZ })}`
       : a.look ? `sight of ${at(a.look)}` : at(a.spot)
-    const stood = () => at({ x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) })
+    walkTo(action, goal, where, () => done(action), () => {
+      // Already in sight as the interact will have it, from the eyes where they are: walked to, the
+      // spot is one where they are in reach wherever in it the bot stands (see LookGoal).
+      const look = a.look && bot.blockAt(goal.pos)
+      if (!look || aimsAt(look, eyes(), FACES, true).aims.length === 0) return false
+      log(`goto: already in sight of ${at(a.look)} at ${stood()}`)
+      return true
+    })
+  }
+
+  const stood = () => at({ x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) })
+
+  // Walks to the goal (where, for the errors), then(): once there and landed; there(), when it says so
+  // once landed, ends it there without a walk. Failed when the pathfinder finds no path or gives up.
+  function walkTo (action, goal, where, then, there = () => false) {
     // Arrived the walk is over; any other end (failed, replaced, stopped, a death) stops it, the bot
     // never left walking to a goal no primitive waits on. Not on a bot gone: its connection is closed.
     let arrived = false
@@ -223,7 +264,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     }
     listen(action, bot, 'goal_reached', () => {
       arrived = true
-      landed(() => done(action))
+      landed(then)
     })
     // mineflayer-pathfinder can end a walk on its last node with the goal not met there: it stops and
     // waits with its goal set, searching no more and saying nothing (pathUpdated stays set). Told by
@@ -260,13 +301,9 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     })
     listen(action, bot, 'path_stop', () => fail(action, `expected to arrive at ${where}, the walk was stopped at ${stood()}`))
     landed(() => {
-      // Already in sight as the interact will have it, from the eyes where they are: walked to, the
-      // spot is one where they are in reach wherever in it the bot stands (see LookGoal).
-      const look = a.look && bot.blockAt(goal.pos)
-      if (look && aimsAt(look, eyes(), FACES, true).aims.length > 0) {
-        log(`goto: already in sight of ${at(a.look)} at ${stood()}`)
+      if (there()) {
         arrived = true
-        done(action)
+        then()
         return
       }
       walk(goal)
@@ -292,12 +329,53 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   async function turnTo (action, a, point) {
     setTurnSpeed(turnSpeedOf(a))
     action.cleanups.push(() => setTurnSpeed(DEFAULT_TURN_SPEED))
-    await bot.lookAt(point, false)
+    const { yaw, pitch } = lookTo(eyes(), point)
+    await bot.look(yaw, pitch, false)
     return !action.over
   }
 
+  // The yaw and pitch from the eyes at from to point, as bot.lookAt has them but from those eyes (its
+  // own are standing ones, crouched or not).
+  function lookTo (from, point) {
+    const delta = point.minus(from)
+    return { yaw: Math.atan2(-delta.x, -delta.z), pitch: Math.atan2(delta.y, Math.sqrt(delta.x * delta.x + delta.z * delta.z)) }
+  }
+
+  // Where the head ends turning from the eyes at from to point: bot.look turns it by whole LOOK_STEPs
+  // from where it is, so the ray it ends on is off the point by up to half of one each way.
+  function landingDir (from, point) {
+    const { yaw, pitch } = lookTo(from, point)
+    const y = bot.entity.yaw + Math.round((yaw - bot.entity.yaw) / LOOK_STEP) * LOOK_STEP
+    const p = bot.entity.pitch + Math.round((pitch - bot.entity.pitch) / LOOK_STEP) * LOOK_STEP
+    return dirOf(y, p)
+  }
+
+  function dirOf (yaw, pitch) {
+    return new Vec3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch))
+  }
+
+  // The first block the ray from the eyes at from along dir gets to, with the face it enters the
+  // block at pos by (null when it gets to another).
+  function rayInto (pos, shapes, from, dir, distance) {
+    let entered = null
+    const hit = bot.world.raycast(from, dir, distance, (b, ray) => {
+      if (b.position.equals(pos)) {
+        const into = ray.intersect(shapes, pos)
+        entered = into && ENTRY_FACES[into.face]
+        return Boolean(into)
+      }
+      return Boolean(ray.intersect(b.shapes, b.position))
+    })
+    return { hit, entered }
+  }
+
   function eyes () {
-    return bot.entity.position.offset(0, bot.entity.eyeHeight, 0)
+    return bot.entity.position.offset(0, eyeHeight(bot.getControlState('sneak')), 0)
+  }
+
+  // How high the eyes are over the feet, crouched or standing.
+  function eyeHeight (crouch) {
+    return crouch ? SNEAK_EYE_HEIGHT : bot.entity.eyeHeight
   }
 
   // The first block along the way to `to` from the eyes, with how far it is.
@@ -311,10 +389,10 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   }
 
   // Where the block is clicked: a point of one of its faces (of faces, all six by default) turned to the
-  // eyes, in reach and in sight, the safest; { point, face }. In sight: the ray from the eyes gets into
-  // the block's space before another block's collision box cuts it. The block counts whole, whatever its
-  // shape (a lever, a crop, a slab's upper half); the rest by their collision box, as mineflayer has
-  // them: what has none (grass, a torch) is seen through, a fence stands 1.5 high. The safest: the one
+  // eyes, in reach and in sight, the safest; { point, face }. In sight: the ray from the eyes gets to the
+  // block's shape (see shapeOf) by that face before another block's collision box cuts it. The rest by
+  // their collision box, as mineflayer has them: what has none (grass, a torch) is seen through, a fence
+  // stands 1.5 high. The safest: the one
   // with most seen points around it in its face's grid, so a turn off by a hair still clicks the block;
   // of those, the closest.
   function blockAim (block, faces = FACES) {
@@ -332,14 +410,15 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   // split in 2 x 2 and are tried again. first: the first point seen, no more (score 0), for a search;
   // reach: how far the eyes reach, the interact's by default.
   function aimsAt (block, from, faces = FACES, first = false, reach = REACH_BLOCK) {
-    const pos = block.position
+    const shape = shapeOf(block)
     const reasons = []
     const scans = []
     for (const face of faces) {
-      const middle = pos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5)
+      const middle = shape.min.plus(shape.max).scaled(0.5)
+      for (const k of AXES) if (face[k] !== 0) middle[k] = face[k] > 0 ? shape.max[k] : shape.min[k]
       // Turned to the eyes: they are past its plane.
       if (from.minus(middle).dot(face) <= 0) continue
-      const nearest = distanceToFace(pos, face, from)
+      const nearest = distanceToFace(shape, face, from)
       if (nearest > reach) {
         reasons.push(`its ${sideOf(face)} face at ${nearest.toFixed(2)} blocks, past ${reach}`)
         continue
@@ -347,14 +426,13 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       const grid = gridOf(GRID)
       for (let i = 0; i < GRID; i++) {
         for (let j = 0; j < GRID; j++) {
-          grid[i][j] = cellAt(block, from, face, GRID, i, j, reach)
+          grid[i][j] = cellAt(block, shape, from, face, GRID, i, j, reach)
           if (first && grid[i][j]?.blocker === null) return { aims: [{ point: grid[i][j].point, face, distance: grid[i][j].distance, score: 0 }], reasons }
         }
       }
       scans.push({ face, grid })
     }
-    if (first) return { aims: [], reasons }
-    let aims = scans.flatMap(scan => seenAims(scan.face, scan.grid))
+    let aims = first ? [] : scans.flatMap(scan => seenAims(scan.face, scan.grid))
     if (aims.length === 0) {
       for (const scan of scans) {
         scan.fine = gridOf(GRID * 2)
@@ -362,13 +440,16 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
           for (let j = 0; j < GRID; j++) {
             if (!worthSplitting(scan.grid, i, j)) continue
             for (const [di, dj] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
-              scan.fine[2 * i + di][2 * j + dj] = cellAt(block, from, scan.face, GRID * 2, 2 * i + di, 2 * j + dj, reach)
+              const cell = cellAt(block, shape, from, scan.face, GRID * 2, 2 * i + di, 2 * j + dj, reach)
+              if (first && cell?.blocker === null) return { aims: [{ point: cell.point, face: scan.face, distance: cell.distance, score: 0 }], reasons }
+              scan.fine[2 * i + di][2 * j + dj] = cell
             }
           }
         }
       }
       aims = scans.flatMap(scan => seenAims(scan.face, scan.fine))
     }
+    if (first) return { aims: [], reasons }
     if (aims.length === 0) {
       for (const scan of scans) reasons.push(`its ${sideOf(scan.face)} face hidden by ${blockersOf(scan.grid)}`)
     }
@@ -379,36 +460,63 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     return Array.from({ length: n }, () => new Array(n))
   }
 
-  // The nearest the eyes at from get to the face of the block at pos.
-  function distanceToFace (pos, face, from) {
+  // What of the block is clicked: its collision boxes cut to its own space (a fence's post, not the 1.5
+  // it stands), the whole block when it has none (grass, a torch, a lever: mineflayer has no outline for
+  // them); { shapes, from its corner, min, max: the box around them, in the world }.
+  function shapeOf (block) {
+    const shapes = block.shapes
+      .map(s => [Math.max(s[0], 0), Math.max(s[1], 0), Math.max(s[2], 0), Math.min(s[3], 1), Math.min(s[4], 1), Math.min(s[5], 1)])
+      .filter(s => s[0] < s[3] && s[1] < s[4] && s[2] < s[5])
+    if (shapes.length === 0) shapes.push([0, 0, 0, 1, 1, 1])
+    const min = new Vec3(...[0, 1, 2].map(k => Math.min(...shapes.map(s => s[k])))).plus(block.position)
+    const max = new Vec3(...[3, 4, 5].map(k => Math.max(...shapes.map(s => s[k])))).plus(block.position)
+    return { shapes, min, max }
+  }
+
+  // The nearest the eyes at from get to the face of the box around the shape.
+  function distanceToFace (shape, face, from) {
     const normal = AXES.find(k => face[k] !== 0)
     const nearest = from.clone()
-    for (const k of AXES) nearest[k] = k === normal ? pos[k] + (face[k] > 0 ? 1 : 0) : Math.min(Math.max(from[k], pos[k]), pos[k] + 1)
+    for (const k of AXES) nearest[k] = k === normal ? (face[k] > 0 ? shape.max[k] : shape.min[k]) : Math.min(Math.max(from[k], shape.min[k]), shape.max[k])
     return from.distanceTo(nearest)
   }
 
-  // The point (u, v) of the face of the block at pos, each from 0 to 1 along its two other axes; a hair
-  // inside, so the ray gets into the block's space.
-  function facePoint (pos, face, u, v) {
+  // The point (u, v) of the face of the box around the shape, each from 0 to 1 along its two other axes;
+  // a hair inside, so the ray gets into the block's space.
+  function facePoint (shape, face, u, v) {
     const normal = AXES.find(k => face[k] !== 0)
     const [b, c] = AXES.filter(k => k !== normal)
-    const point = pos.clone()
-    point[normal] += face[normal] > 0 ? 0.999 : 0.001
-    point[b] += u
-    point[c] += v
+    const point = shape.min.clone()
+    point[normal] = face[normal] > 0 ? shape.max[normal] - 0.001 : shape.min[normal] + 0.001
+    point[b] += u * (shape.max[b] - shape.min[b])
+    point[c] += v * (shape.max[c] - shape.min[c])
     return point
   }
 
-  // The cell (i, j) of the n x n grid of a face: its middle, with the block that hides it from the eyes
-  // (null when seen); nothing when past reach.
-  function cellAt (block, from, face, n, i, j, reach) {
+  // The cell (i, j) of the n x n grid of a face of the box around the shape: where its ray gets to the
+  // shape, with what hides it from the eyes (null when seen); the block itself when the ray gets to it
+  // by another face (a stair's step from above), or what the head turned there looks at instead
+  // (see landingDir). Nothing when past reach, or when the ray goes by the shape (a ladder's box seen
+  // askew) and gets to nothing.
+  function cellAt (block, shape, from, face, n, i, j, reach) {
     const pos = block.position
-    const point = facePoint(pos, face, (i + 0.5) / n, (j + 0.5) / n)
-    const distance = from.distanceTo(point)
+    const target = facePoint(shape, face, (i + 0.5) / n, (j + 0.5) / n)
+    if (from.distanceTo(target) > reach) return undefined
+    let entered = null
+    const hit = bot.world.raycast(from, target.minus(from).normalize(), from.distanceTo(target) + 1, (b, ray) => {
+      if (!b.position.equals(pos)) return Boolean(ray.intersect(b.shapes, b.position))
+      entered = ray.intersect(shape.shapes, pos)
+      return Boolean(entered)
+    })
+    if (!hit) return undefined
+    if (!hit.position.equals(pos)) return { point: target, distance: from.distanceTo(target), blocker: hit }
+    const distance = from.distanceTo(entered.pos)
     if (distance > reach) return undefined
-    const hit = bot.world.raycast(from, point.minus(from).normalize(), distance + 1, (b, ray) => b.position.equals(pos) || Boolean(ray.intersect(b.shapes, b.position)))
-    if (!hit) throw new Error(`the ray to ${full(block.name)} at ${at(pos)} never got to it`)
-    return { point, distance, blocker: hit.position.equals(pos) ? null : hit }
+    if (!ENTRY_FACES[entered.face].equals(face)) return { point: entered.pos, distance, blocker: hit }
+    const landing = rayInto(pos, shape.shapes, from, landingDir(from, entered.pos), distance + 1)
+    if (!landing.hit) return undefined
+    const lands = landing.hit.position.equals(pos) && landing.entered.equals(face)
+    return { point: entered.pos, distance, blocker: lands ? null : landing.hit }
   }
 
   // The seen cells of a grid, each with how many of the 8 around it are seen too.
@@ -432,11 +540,12 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   const wholeBlock = b => b.shapes.length === 1 && b.shapes[0].join() === '0,0,0,1,1,1'
 
   // A cell none sees through, to split: what hides it is not a whole block, or is not what hides a
-  // neighbour (4 around it).
+  // neighbour (4 around it), or it is on the face's edge (a sliver of it seen past what hides the rest).
   function worthSplitting (grid, i, j) {
     const cell = grid[i][j]
     if (!cell) return false
     if (!wholeBlock(cell.blocker)) return true
+    if (i === 0 || j === 0 || i === grid.length - 1 || j === grid.length - 1) return true
     return [[-1, 0], [1, 0], [0, -1], [0, 1]].some(([di, dj]) => {
       const other = grid[i + di]?.[j + dj]
       return other && !other.blocker.position.equals(cell.blocker.position)
@@ -457,17 +566,8 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   // What the server will see once turned: the ray along the yaw and pitch the head ended on enters the
   // block by the face aimed at, else the click is not where the aim says.
   function checkLook (block, aim) {
-    const { yaw, pitch } = bot.entity
-    const dir = new Vec3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch))
     const pos = block.position
-    let entered = null
-    const hit = bot.world.raycast(eyes(), dir, aim.distance + 1, (b, ray) => {
-      if (b.position.equals(pos)) {
-        entered = ENTRY_FACES[ray.block.face]
-        return true
-      }
-      return Boolean(ray.intersect(b.shapes, b.position))
-    })
+    const { hit, entered } = rayInto(pos, shapeOf(block).shapes, eyes(), dirOf(bot.entity.yaw, bot.entity.pitch), aim.distance + 1)
     if (!hit || !hit.position.equals(pos) || !entered?.equals(aim.face)) {
       throw new Error(`expected the head turned to ${full(block.name)} at ${at(pos)} by its ${sideOf(aim.face)} face, found it looking at ${hit ? `${full(hit.name)} at ${at(hit.position)}` : 'nothing'}${entered ? ` by its ${sideOf(entered)} face` : ''}`)
     }
@@ -588,6 +688,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
       throw new Error(`block at ${at(target)} is already "${stateAt(block.position)}": the interaction would show nothing`)
     }
     expect(action, spec, ms)
+    if (a.bestTool && !await holdBestTool(action, block)) return
     // The world can change while the head turns (sand or gravel falling in the way): aimed again from
     // there, up to AIMS times, the block no longer in reach and in sight failing it.
     for (let aims = 1; ; aims++) {
@@ -614,10 +715,10 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
 
   function breakBlock (action, a) {
     const target = required(a.target, 'target')
-    return interact(action, { ...a, button: 'left', target: { kind: 'block', ...target }, expect: { kind: 'block', ...target, state: 'minecraft:air' } })
+    return interact(action, { ...a, button: 'left', bestTool: true, target: { kind: 'block', ...target }, expect: { kind: 'block', ...target, state: 'minecraft:air' } })
   }
 
-  // Puts the block in hand at target, on a neighbour in reach and in sight, turned to it first; a is
+  // Puts a block it may place (see holdAllowed) at target, on a neighbour in reach and in sight, turned to it first; a is
   // { target: {x, y, z}, state, turn_speed }.
   async function place (action, a) {
     const target = required(a.target, 'target')
@@ -627,12 +728,10 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     if (!there) throw new Error(`block at ${at(pos)} is not loaded`)
     if (there.boundingBox !== 'empty') throw new Error(`expected a free spot at ${at(pos)}, found ${full(there.name)}`)
     // The server takes no block where an entity is, the bot among them: it would wait out its deadline.
-    const p = bot.entity.position
-    const half = bot.entity.width / 2
-    if (p.x + half > pos.x && p.x - half < pos.x + 1 && p.y + bot.entity.height > pos.y && p.y < pos.y + 1 && p.z + half > pos.z && p.z - half < pos.z + 1) {
-      throw new Error(`expected the bot out of ${at(pos)} to place a block there, found it standing at ${p.toString()}`)
+    if (occupies(bot.entity.position, pos)) {
+      throw new Error(`expected the bot out of ${at(pos)} to place a block there, found it standing at ${bot.entity.position.toString()}`)
     }
-    if (!bot.heldItem) throw new Error(`expected a block in hand to place at ${at(pos)}, found nothing`)
+    if (!await holdAllowed(action)) return
     const reasons = []
     let found = null
     for (const face of FACES) {
@@ -651,6 +750,351 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     // The middle of the face it goes against, where mineflayer would look (it then turns no more).
     if (!await turnTo(action, a, found.aim.point)) return
     guard(action, bot.placeBlock(found.reference, found.face))
+  }
+
+  // Whether the bot's box with its feet there takes some of the block at pos.
+  function occupies (feet, pos) {
+    const half = bot.entity.width / 2
+    return feet.x + half > pos.x && feet.x - half < pos.x + 1 && feet.y + bot.entity.height > pos.y && feet.y < pos.y + 1 && feet.z + half > pos.z && feet.z - half < pos.z + 1
+  }
+
+  // --- B2. with search radius
+
+  // break_wsr and place_wsr: break and place from where the bot stands; else from the spot it gets to
+  // moving the least, a walk of radius blocks at most: the pathfinder's own moves (as it walks them),
+  // each weighed by how far it takes it (a drop by the blocks it falls), then where in the block it
+  // gets to its feet go (see OFFSETS), the nearest first, standing; then crouched, further out over
+  // its edges too (see CROUCH_OFFSETS). It steps there by keys it knows stop it short of a fall (see
+  // stepTo), crouched from the start for a crouched one. Radius 0: from where it stands, not moving at all.
+  // A place where the bot stands moves it out of the spot first, as a spot not seen from there.
+  // Failed when no spot there sees the target. a is break's or place's and { radius }; with end
+  // (break_wsrp, place_wsrp) it then walks to the block end, failed before breaking or placing when
+  // there is no path there from where it does it, the target as it will be (see reachableAfter).
+  async function withSearch (action, a, kind) {
+    const target = required(a.target, 'target')
+    const pos = new Vec3(target.x, target.y, target.z)
+    const radius = required(a.radius, 'radius')
+    if (!Number.isInteger(radius) || radius < 0) throw new Error(`radius must be a whole number of blocks, got ${radius}`)
+    const block = bot.blockAt(pos)
+    if (!block) throw new Error(`block at ${at(pos)} is not loaded`)
+    if (kind === 'break' && block.name === 'air') throw new Error(`expected a block at ${at(pos)}, found air`)
+    if (kind === 'place' && block.boundingBox !== 'empty') throw new Error(`expected a free spot at ${at(pos)}, found ${full(block.name)}`)
+    if (kind === 'place') allowedSlot()
+    const what = kind === 'break' ? `${full(block.name)} at ${at(pos)}` : `a block next to ${at(pos)} to place against`
+    // Stepping, it is let go at the end, whatever the end.
+    action.cleanups.push(() => { if (!bot._client.ended) bot.clearControlStates() })
+
+    if (!seesFrom(kind, pos, bot.entity.position) || (kind === 'place' && occupies(bot.entity.position, pos))) {
+      if (radius === 0) throw new Error(`expected ${what} in reach and in sight from where the bot stands (radius 0: not moving), found it not`)
+      const found = await sightSpot(action, kind, pos, radius)
+      if (found === undefined) return
+      if (!found) throw new Error(`expected a spot a walk of ${radius} blocks at most from ${stood()} with ${what} in reach and in sight, found none (around ${at(pos)}: ${around(pos)})`)
+      const feet = bot.entity.position
+      const pose = posesIn(feet.floored(), feet.y, feet).find(p => poseSees(kind, pos, p))
+      if (!pose) throw new Error(`expected ${what} in reach and in sight from somewhere in ${stood()}, found nowhere`)
+      await stepTo(action, kind, pos, pose, what)
+      if (action.over) return
+    }
+    if (a.end) {
+      const end = new Vec3(a.end.x, a.end.y, a.end.z)
+      const reachable = await reachableAfter(action, kind, pos, end)
+      if (reachable === undefined) return
+      if (!reachable) throw new Error(`expected a path from ${stood()} to ${at(end)} once ${kind === 'break' ? 'broken' : 'placed'} ${at(pos)}, found none`)
+      // Its break or place confirmed (see expect), what it set up is let go and it walks to end.
+      action.then = () => {
+        for (const cleanup of action.cleanups.splice(0)) cleanup()
+        walkTo(action, new goals.GoalBlock(end.x, end.y, end.z), at(end), () => done(action))
+      }
+    }
+    if (kind === 'break') await breakBlock(action, a)
+    else await place(action, a)
+  }
+
+  // The blocks next to pos, each with its collision box kind, for an error: what the place had to go against.
+  function around (pos) {
+    return FACES.map(face => {
+      const b = bot.blockAt(pos.plus(face))
+      return `${at(pos.plus(face))} ${b ? `${full(b.name)} (${b.boundingBox})` : 'not loaded'}`
+    }).join(', ')
+  }
+
+  // Whether the pathfinder finds a path from where the bot stands to the block end with the block at
+  // pos as the break or the place leaves it: air, or a whole block. Undefined when the primitive is
+  // replaced on the way.
+  async function reachableAfter (action, kind, pos, end) {
+    const base = bot.pathfinder.movements
+    const Block = require('prismarine-block')(bot.registry)
+    const after = new Block(bot.registry.blocksByName[kind === 'break' ? 'air' : 'stone'].id, 0, 0)
+    after.position = pos
+    const world = Object.create(bot)
+    world.blockAt = (p, extra) => p.equals(pos) ? after : bot.blockAt(p, extra)
+    const movements = Object.create(base)
+    movements.bot = world
+    const search = bot.pathfinder.getPathFromTo(movements, bot.entity.position, new goals.GoalBlock(end.x, end.y, end.z))
+    let result
+    for (;;) {
+      result = search.next().value.result
+      if (result.status !== 'partial') break
+      await new Promise(resolve => setImmediate(resolve))
+      if (action.over) return undefined
+    }
+    return result.status === 'success'
+  }
+
+  // Where the feet can go in the block at b, at y (see OFFSETS), standing first, then crouched (see
+  // CROUCH_OFFSETS), each the nearest to from first; { feet, off, crouch }.
+  function posesIn (b, y, from) {
+    const poses = []
+    const crouched = OFFSETS.concat(CROUCH_OFFSETS)
+    for (const u of crouched) {
+      for (const v of crouched) {
+        const feet = new Vec3(b.x + u, y, b.z + v)
+        const off = u !== 0.5 || v !== 0.5
+        if (OFFSETS.includes(u) && OFFSETS.includes(v)) poses.push({ feet, ground: b, off, crouch: false })
+        poses.push({ feet, ground: b, off, crouch: true })
+      }
+    }
+    const away = p => Math.hypot(p.feet.x - from.x, p.feet.z - from.z)
+    return poses.sort((p, q) => (p.crouch - q.crouch) || away(p) - away(q))
+  }
+
+  // Whether the bot fits in the pose (see fits) and sees the target from there.
+  function poseSees (kind, pos, pose) {
+    return fits(pose, kind === 'place' ? pos : null) && seesFrom(kind, pos, pose.feet, pose.crouch)
+  }
+
+  // Whether the bot's box with its feet there is clear of every block's collision box (and of the spot
+  // avoid, a block is going there), and, off the middle of its block, that block stands on a whole one.
+  function fits (pose, avoid) {
+    const half = bot.entity.width / 2
+    const min = pose.feet.offset(-half, 1e-6, -half)
+    const max = pose.feet.offset(half, bot.entity.height, half)
+    for (let x = Math.floor(min.x); x <= Math.floor(max.x - 1e-6); x++) {
+      for (let y = Math.floor(min.y); y <= Math.floor(max.y - 1e-6); y++) {
+        for (let z = Math.floor(min.z); z <= Math.floor(max.z - 1e-6); z++) {
+          if (avoid && avoid.x === x && avoid.y === y && avoid.z === z) return false
+          const block = bot.blockAt(new Vec3(x, y, z))
+          if (!block) return false
+          for (const s of block.shapes) {
+            if (s[0] + x < max.x && s[3] + x > min.x && s[1] + y < max.y && s[4] + y > min.y && s[2] + z < max.z && s[5] + z > min.z) return false
+          }
+        }
+      }
+    }
+    if (!pose.off) return true
+    return bot.blockAt(new Vec3(pose.ground.x, Math.floor(pose.feet.y - 1e-3), pose.ground.z))?.boundingBox === 'block'
+  }
+
+  // Whether with its feet there the target is in reach and in sight from its eyes: the
+  // block to break, or a neighbour to place against by its face to the spot; crouch: the eyes crouched.
+  function seesFrom (kind, pos, feet, crouch = false) {
+    const from = feet.offset(0, eyeHeight(crouch), 0)
+    if (kind === 'break') {
+      const block = bot.blockAt(pos)
+      return Boolean(block) && aimsAt(block, from, FACES, true).aims.length > 0
+    }
+    return FACES.some(face => {
+      const reference = bot.blockAt(pos.plus(face))
+      return reference?.boundingBox === 'block' && aimsAt(reference, from, [face.scaled(-1)], true).aims.length > 0
+    })
+  }
+
+  // A spot where the feet can go somewhere in it that sees the target (see posesIn), every one as near
+  // as any other: the search goes out by its moves' weights alone, the least first.
+  class SightGoal extends goals.Goal {
+    constructor (kind, pos) {
+      super()
+      this.kind = kind
+      this.pos = pos
+      this.x = pos.x
+      this.y = pos.y
+      this.z = pos.z
+      this.known = new Map()
+    }
+
+    heuristic () {
+      return 0
+    }
+
+    isEnd (node) {
+      const key = `${node.x},${node.y},${node.z}`
+      if (!this.known.has(key)) {
+        const middle = new Vec3(node.x + 0.5, node.y, node.z + 0.5)
+        const near = this.pos.offset(0.5, 0.5, 0.5).distanceTo(middle.offset(0, 1, 0)) <= REACH_BLOCK + 2
+        this.known.set(key, near && posesIn(node, node.y, middle).some(p => poseSees(this.kind, this.pos, p)))
+      }
+      return this.known.get(key)
+    }
+  }
+
+  // The bot's moves as the pathfinder has them, each weighed by how far it takes it instead of by its
+  // cost (a drop of three blocks as one step there): the search then goes out by distance moved.
+  function distanceMovements () {
+    const base = bot.pathfinder.movements
+    const movements = Object.create(base)
+    movements.getNeighbors = node => base.getNeighbors.call(movements, node).map(move => {
+      move.cost = Math.hypot(move.x - node.x, move.y - node.y, move.z - node.z)
+      return move
+    })
+    return movements
+  }
+
+  // Walks to the spot it gets to moving the least, radius blocks at most, where the feet can go
+  // somewhere that sees the target (see SightGoal); the block it stands in first. False when there is
+  // none; undefined when the primitive is replaced on the way.
+  async function sightSpot (action, kind, pos, radius) {
+    const search = bot.pathfinder.getPathFromTo(distanceMovements(), bot.entity.position, new SightGoal(kind, pos), { searchRadius: radius })
+    let result
+    for (;;) {
+      result = search.next().value.result
+      if (result.status !== 'partial') break
+      await new Promise(resolve => setImmediate(resolve))
+      if (action.over) return undefined
+    }
+    if (result.status !== 'success') return false
+    if (result.path.length > 0) {
+      const end = result.path[result.path.length - 1]
+      log(`${action.primitive}: target seen from ${at(end)}, a walk of ${result.cost.toFixed(1)} blocks, walking there`)
+      await new Promise(resolve => walkTo(action, new goals.GoalBlock(end.x, end.y, end.z), at(end), resolve))
+      if (action.over) return undefined
+    }
+    return true
+  }
+
+  const physicsWorld = { getBlock: p => bot.blockAt(p, false) }
+
+  // Where the bot ends still with the keys down for the next tick and none after, as the client's own
+  // physics (the bot's, simulatePlayer) has it; null when it leaves the ground on the way: a fall.
+  function stopOf (keys) {
+    // Crouched, it stays crouched letting go.
+    const sneak = bot.getControlState('sneak')
+    const control = Object.fromEntries(CONTROLS.map(c => [c, c === 'sneak' ? sneak : keys.includes(c)]))
+    const state = new PlayerState(bot, control)
+    const none = Object.fromEntries(CONTROLS.map(c => [c, c === 'sneak' && sneak]))
+    let still = 0
+    for (let tick = 0; tick < STOP_TICKS; tick++) {
+      bot.physics.simulatePlayer(state, physicsWorld)
+      state.control = none
+      if (!state.onGround) return null
+      // Still two ticks running: stopped, not turning round.
+      if (Math.hypot(state.vel.x, state.vel.z) >= STILL) {
+        still = 0
+      } else if (++still === 2) {
+        return state.pos
+      }
+    }
+    throw new Error(`expected the bot still within ${STOP_TICKS} ticks of letting go of ${keys.join('+') || 'no keys'}, found it moving at ${state.vel.toString()}`)
+  }
+
+  // Steps to where in the block it stands it sees the target (pose, the nearest such), by keys alone,
+  // the head left where it is, and never into a fall: each tick, once letting go stops it where it sees
+  // the target, no keys; else the keys whose stop (see stopOf) is nearest the pose, of those that keep
+  // it on the ground, the ones whose stop sees the target first (a tap goes further than a pose a
+  // hair off). Done once still there; failed when, still, no keys bring it nearer.
+  function stepTo (action, kind, pos, pose, what) {
+    return new Promise((resolve, reject) => {
+      const avoid = kind === 'place' ? pos : null
+      const sees = feet => fits({ feet }, avoid) && seesFrom(kind, pos, feet, pose.crouch)
+      // Crouched before the first step: sneaking keeps it on the block out over its edge.
+      if (pose.crouch) bot.setControlState('sneak', true)
+      const press = keys => {
+        for (const key of ['forward', 'back', 'left', 'right']) bot.setControlState(key, keys.includes(key))
+      }
+      const step = () => {
+        // Stopped for good: the physics zeroes a speed under its negligible one, and a drift under STILL
+        // still moves the eyes enough to lose a sight at a grazing angle.
+        const still = bot.entity.velocity.x === 0 && bot.entity.velocity.z === 0
+        // Done where it really stopped, not where letting go was to stop it: a hair short of that loses
+        // a sight through a gap. Still and not seeing, keys again.
+        if (still && sees(bot.entity.position)) {
+          press([])
+          bot.removeListener('physicsTick', step)
+          resolve()
+          return
+        }
+        const coast = stopOf([])
+        if (!still && coast && sees(coast)) {
+          press([])
+          return
+        }
+        let best = null
+        let bestSees = false
+        let nearest = Infinity
+        for (const keys of KEY_SETS) {
+          const stop = stopOf(keys)
+          if (!stop) continue
+          const seen = keys.length > 0 && sees(stop)
+          const away = Math.hypot(stop.x - pose.feet.x, stop.z - pose.feet.z)
+          if ((seen && !bestSees) || (seen === bestSees && away < nearest)) {
+            best = keys
+            bestSees = seen
+            nearest = away
+          }
+        }
+        if (best === null || (best.length === 0 && still)) {
+          bot.removeListener('physicsTick', step)
+          press([])
+          reject(new Error(`expected to step to ${pose.feet.toString()} to see ${what}, found the bot at ${bot.entity.position.toString()} with no keys taking it nearer without a fall`))
+          return
+        }
+        press(best)
+      }
+      listen(action, bot, 'physicsTick', step)
+      step()
+    })
+  }
+
+  const allowed = item => Boolean(item) && allowedPlace.has(`${full(item.name)}@${item.metadata}`)
+
+  // The slot of the window its slots are on whose item passes test: the hotbar slot in its hand
+  // first, then the rest of the hotbar, then the rest of the inventory; undefined with none.
+  function slotWith (test) {
+    const window = slotWindow()
+    const hand = window.hotbarStart + bot.quickBarSlot
+    const slots = [hand]
+    for (let i = 0; i < 9; i++) slots.push(window.hotbarStart + i)
+    for (let s = window.inventoryStart; s < window.hotbarStart; s++) slots.push(s)
+    return slots.find(s => test(window.slots[s]))
+  }
+
+  // The slot with a block it may place (see slotWith). Failed with none.
+  function allowedSlot () {
+    if (allowedPlace === null) throw new Error('expected the blocks it may place from the mod, found none sent')
+    const slot = slotWith(allowed)
+    if (slot === undefined) throw new Error(`expected a block it may place in its inventory (${allowedPlace.size} allowed), found none`)
+    return slot
+  }
+
+  // A block it may place into its hand (see allowedSlot). False when the primitive was replaced on the way.
+  function holdAllowed (action) {
+    return hold(action, allowedSlot())
+  }
+
+  // The best tool it has to break block into its hand, as the pathfinder picks it (the fastest dig);
+  // none, the hand left as it is. False when the primitive was replaced on the way.
+  async function holdBestTool (action, block) {
+    const best = bot.pathfinder.bestHarvestTool(block)
+    if (!best) return true
+    const slot = slotWith(item => Boolean(item) && sameItem(item, best))
+    if (slot === undefined) throw new Error(`expected ${full(best.name)} in its inventory, found it gone`)
+    return hold(action, slot)
+  }
+
+  // The item at slot into its hand: taken off the hotbar, or swapped onto the hotbar slot in hand off
+  // the rest of the inventory, as the number keys do. False when the primitive was replaced on the way.
+  async function hold (action, slot) {
+    const window = slotWindow()
+    const index = slot - window.hotbarStart
+    if (index >= 0 && index <= 8) {
+      if (index !== bot.quickBarSlot) bot.setQuickBarSlot(index)
+      return true
+    }
+    const item = window.slots[slot]
+    await syncedClick(window, slot, bot.quickBarSlot, 2)
+    if (action.over) return false
+    const held = window.slots[window.hotbarStart + bot.quickBarSlot]
+    if (!held || !sameItem(held, item)) throw new Error(`expected ${full(item.name)} in hand swapped off slot ${slot}, found ${describeItem(held)}`)
+    return true
   }
 
   // --- C. open window
@@ -1303,7 +1747,12 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
     done(action)
   }
 
-  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, look_at: lookAt, drop, shift_move: shiftMove, stop }
+  const primitives = { goto, interact, break: breakBlock, place, close_window: closeWindow, move, item_fill: itemFill, wait_slot: waitSlot, hotbar, select_trade: selectTradeOf, look_at: lookAt, drop, shift_move: shiftMove, stop,
+    break_wsr: (action, a) => withSearch(action, a, 'break'),
+    place_wsr: (action, a) => withSearch(action, a, 'place'),
+    break_wsrp: (action, a) => withSearch(action, a, 'break'),
+    place_wsrp: (action, a) => withSearch(action, a, 'place')
+  }
 
   // Dying takes what it was doing with it: the primitive canceled by the death, a walk stopped with it.
   bot.on('death', () => {
@@ -1313,6 +1762,10 @@ module.exports = function actions ({ bot, name, log, publish, walk, blockStates,
   return {
     windowType,
     cancel,
+    setAllowedPlace (blocks) {
+      allowedPlace = new Set(blocks)
+      log(`may place ${allowedPlace.size} blocks`)
+    },
     syncedClick,
     // The running primitive's number, for the bot's own lines; 0 for none.
     currentId: () => current ? current.id : 0,

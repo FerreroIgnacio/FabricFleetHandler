@@ -1,0 +1,3 @@
+Excepciones a la regla "todo preciso" (reglas del repo), autorizadas una por una.
+
+1. SLACK de LookGoal (goto con look): el alcance se toma SLACK (√½, lo más lejos que quedan los ojos del medio del bloque de los pies, de costado) menos, porque el bot puede terminar en cualquier punto del bloque y el interact apunta desde ahí. (actions.js, SLACK y LookGoal)

@@ -2,15 +2,13 @@ package net.mapmcbot.client;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -23,131 +21,130 @@ import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.job.JobRunner;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
-import net.minecraft.block.BlockWithEntity;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FallingBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.enchantment.EnchantmentHelper;
 import net.minecraft.enchantment.Enchantments;
-import net.minecraft.item.BlockItem;
-import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.util.Identifier;
 
 /**
- * A quarrify: the bot digs out an area, a plan ({ action: quarrify, area: its id }) the mod resolves
- * into primitives, each sent as the one before ends, by the bot's state: nothing timed.
+ * A quarrify: bots dig out an area, a plan ({ action: quarrify, area: its id }) the mod resolves into
+ * primitives, each sent as the one before ends, by the bot's state: nothing timed.
  *
- * It walks first to the nearest spot the pathfinder finds in the area or a block round it, from its
- * bottom up to standing on its top. Where it ends up (its feet, as its state tells) decides the rest,
- * the top being the highest layer with something to dig:
- *  - below the top, it digs the two layers at its feet and head first (a room, whole), then the
- *    staircase up from there to the top, climbing it as it goes;
- *  - then (on the top or over it, right away) the area from the top down, three layers at a time (a
- *    slab): the staircase carved down through the slab, the bot on the slab's floor, and the slab dug
- *    from there, the block nearest to the bot first, one next to what is open to it before the rest.
- * Last, whatever is left (a block fallen into a layer already dug) is dug the same way.
+ * Done for now only for areas wider and deeper than 5 (the rest fail, not done yet): a region with a
+ * staircase in each corner, its 2x2, and an active layer, shared by the bots on it. The active layer
+ * is the highest one with something to dig (the staircases' steps and the bots' supports left out: the
+ * rest of a staircase is dug with its layer, by whichever bot is nearest); once it is empty it goes down
+ * to the next with something, never up: a block placed over it is left there. Each time a bot goes off
+ * a layer it takes the nearest staircase to where it got to, shared with the others there: a block of
+ * it one of them is on, it waits for.
  *
- * The staircase is the 2x2 at its north-east corner (most x, least z): a spiral down its four
- * columns, one step a layer, each the next column round from the one over it, so each column has a
- * step every 4 layers with 3 of air over it. A step that is not solid is placed (with a full block of
- * the hotbar) against a solid neighbour before its layer is dug; with none, on supports placed past
- * it the way it goes (down, or up climbing), each dug with its layer after. One that falls (sand,
- * gravel) is dug and placed again. Narrower than 2x2 or one high there is none: the area is dug a
- * layer at a time from the top, up to 5 high.
+ * A bot walks first to the nearest spot the pathfinder finds in the area or a block round it, at any
+ * height from its bottom to standing on its top. From there it goes down (or up) its staircase,
+ * carving and building it as it goes (break_wsrp and place_wsrp, ending each on the step it goes on to),
+ * to stand on the active layer's floor: its feet in the layer. There it digs the layer with break_wsr,
+ * of the blocks at a local minimum or maximum of the layer's in x and in z (see pick) the nearest to it,
+ * one no other bot is digging. With none left but the ones other bots dig, it waits
+ * for theirs to end. The layer empty, it goes down its staircase to the next.
  *
- * Each block is broken with the hotbar's item that breaks it fastest, walked in sight of first (the
- * walk ends at once when it is in sight already); the one the bot stands on comes last of its turn.
+ * A staircase is a spiral down its 2x2, one step a layer, each the next column round from the one over
+ * it, so each column has a step every 4 layers with 3 of air over it. A step that is not solid is placed
+ * against a solid neighbour; with none, on supports placed along its column (the shortest way, up or
+ * down, in the area) up to one that has, broken once the step stands. One that falls (sand, gravel) is
+ * dug and placed again. The steps are left once it is done.
  */
 final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, BotRegistry.ActionListener {
-	/** The highest an area with no staircase (narrower than 2x2) is dug. */
-	private static final int FLAT_HEIGHT = 5;
-	/** The layers of a slab: from its floor the bot reaches its feet's, its head's and the one over it. */
-	private static final int SLAB = 3;
-	/** How high the eyes are over the feet. */
-	private static final double EYES = 1.62;
+	/** The narrowest an area with four staircases is, along x and along z: one past two 2x2 and a column between. */
+	private static final int CORNERS_MIN = 6;
 	/** The break's deadline when its dig takes less than half of it (actions.js DEFAULT_DEADLINE), in ms. */
 	private static final int DEADLINE = 5000;
-	/** Breaks in a row that may lose sight of their block (see onState) before the quarrify fails. */
-	private static final int SIGHT_MISSES = 3;
+	/** How high the eyes are over the feet. */
+	private static final double EYES = 1.62;
+	/** The first slot of the inventory (window numbering): the tool a break holds is any of it, hotbar included. */
+	private static final int INVENTORY_FIRST = 9;
+	private static final int INVENTORY_LAST = 44;
 
 	private static final int[][] FACES = {{0, -1, 0}, {0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
 
-	private enum Phase { APPROACH, ROOM, CLIMB, DESCEND, FLAT, SWEEP }
+	/** An area being quarrified: its active layer and staircases, shared by its bots. */
+	private static final class Region {
+		final Area area;
+		/** Each corner's staircase, its 2x2 as {x, z}, gone round: the step of the top layer is the first. */
+		final int[][][] stairs;
+		/** The bots on the region. */
+		final Set<String> bots = new LinkedHashSet<String>();
+		/** The layer being dug; under the area's bottom, done. */
+		int active;
+		/** The block each bot is digging or placing, by key(). */
+		final Map<String, Long> claims = new HashMap<String, Long>();
+		/** The bots with nothing to do but what the others are on, until a primitive of theirs ends. */
+		final Set<String> waiting = new LinkedHashSet<String>();
 
-	/**
-	 * A turn of the plan: its steps made solid, then (from where it says to stand) its cells dug, in
-	 * order or the nearest to the bot first.
-	 */
-	private static final class Group {
-		final String what;
-		final List<int[]> steps = new ArrayList<int[]>();
-		/** The way the steps' supports go: -1 down, 1 up. */
-		final int way;
-		/** The layer to stand on the floor of before the cells, {x, y, z} of the feet; null for anywhere. */
-		final int[] stand;
-		final List<int[]> cells;
-		final boolean nearest;
-		int nextStep;
-		boolean stood;
+		Region(Area area) {
+			this.area = area;
+			final int w = area.getMinX();
+			final int e = area.getMaxX();
+			final int n = area.getMinZ();
+			final int s = area.getMaxZ();
+			// Each round the same way (x, then z, then back), from the corner.
+			stairs = new int[][][] {
+				{{e, n}, {e - 1, n}, {e - 1, n + 1}, {e, n + 1}},
+				{{w, n}, {w, n + 1}, {w + 1, n + 1}, {w + 1, n}},
+				{{w, s}, {w + 1, s}, {w + 1, s - 1}, {w, s - 1}},
+				{{e, s}, {e, s - 1}, {e - 1, s - 1}, {e - 1, s}}};
+			active = area.getMaxY();
+		}
 
-		Group(String what, int way, int[] stand, List<int[]> cells, boolean nearest) {
-			this.what = what;
-			this.way = way;
-			this.stand = stand;
-			this.cells = cells;
-			this.nearest = nearest;
+		/** Whether the block is the layer's step of a staircase. */
+		boolean step(int x, int y, int z) {
+			for (int[][] stair : stairs) {
+				final int[] cell = stair[stepIndex(area, y)];
+
+				if (cell[0] == x && cell[1] == z) {
+					return true;
+				}
+			}
+
+			return false;
 		}
 	}
 
 	private static final class Plan {
 		final Area area;
-		final boolean stairs;
 		final JobRunner.Listener listener;
-		volatile Phase phase = Phase.APPROACH;
-		/** The highest layer with something to dig, as it arrived. */
-		int top;
-		int roomBottom;
-		int roomTop;
-		/** The next layer of the staircase to climb. */
-		int climbY;
-		/** The slab's top layer, and the next of its layers to carve the staircase down through. */
-		int slabTop;
-		int shaftY;
-		/** The next layer to dig, with no staircase. */
-		int flatY;
-		volatile Group group;
+		Region region;
+		/** Its staircase, of the region's (shared with the others on it); -1 while it walks to the area. */
+		int corner = -1;
+		/** Whether it dug on a layer since it took its staircase: off it, it takes the nearest again. */
+		boolean dugLayer;
 		/** The primitives left of the block it is on, in order. */
 		final Deque<JsonObject> queue = new ArrayDeque<JsonObject>();
 		/** The block its feet are in, as its last state told. */
-		volatile int[] feet;
-		/** The hotbar slot in its hand (window numbering), as last sent; -1 before the first. */
-		int held;
-		/** What is open to the bot: the blocks it dug and the ones it stood in, by key(). */
-		final Set<Long> open = new HashSet<Long>();
-		volatile int dug;
+		int[] feet;
+		/** The supports placed under or over a step, to break once it stands: {x, y, z, the step's y}. */
+		final List<int[]> supports = new ArrayList<int[]>();
+		int dug;
 		/** What it is doing, for the status. */
-		volatile String doing = "walk";
+		String doing = "walk";
 		/** A primitive sent and not yet seen going: an idle before that is the end of the one before it, not of this. */
-		volatile boolean starting;
-		/** The last primitive sent. */
-		volatile String sent = "";
-		/** Breaks in a row that lost sight of their block. */
-		int misses;
+		boolean starting;
+		/** The blocks of the active layer its last pick had to choose from, drawn green. */
+		List<int[]> eligible = new ArrayList<int[]>();
 
-		Plan(Area area, boolean stairs, int held, JobRunner.Listener listener) {
+		Plan(Area area, JobRunner.Listener listener) {
 			this.area = area;
-			this.stairs = stairs;
-			this.held = held;
 			this.listener = listener;
 		}
 	}
 
 	private final BotRegistry bots;
 	private final ChunkRegistry chunks;
-	private final Map<String, Plan> plans = new ConcurrentHashMap<String, Plan>();
+	private final Map<String, Plan> plans = new HashMap<String, Plan>();
+	/** The regions being quarrified, by area id; gone once no bot is on one. */
+	private final Map<String, Region> regions = new HashMap<String, Region>();
 	/** Why each bot's last quarrify failed, until its next. */
-	private final Map<String, String> errors = new ConcurrentHashMap<String, String>();
+	private final Map<String, String> errors = new HashMap<String, String>();
 
 	Quarrify(BotRegistry bots, ChunkRegistry chunks) {
 		this.bots = bots;
@@ -161,21 +158,31 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		return new JsonParser().parse(json).getAsJsonObject().get("action").getAsString().equals("quarrify");
 	}
 
+	/** The blocks each quarrify going on had to choose from at its last pick (see pick), to draw. */
+	synchronized List<int[]> eligible() {
+		final List<int[]> out = new ArrayList<int[]>();
+
+		for (Plan plan : plans.values()) {
+			out.addAll(plan.eligible);
+		}
+
+		return out;
+	}
+
 	/** What the bot's quarrify is doing, or why it failed; null with none. */
-	String status(String bot) {
+	synchronized String status(String bot) {
 		final Plan plan = plans.get(bot);
 
 		if (plan != null) {
-			final Group group = plan.group;
-			final Phase phase = plan.phase;
-			return "quarrify " + plan.area.getName() + ": " + (group != null ? group.what : phase != null ? phase.name().toLowerCase() : "done") + ", " + plan.dug + " dug, " + plan.doing;
+			final String layer = plan.region == null ? "" : ", layer " + plan.region.active;
+			return "quarrify " + plan.area.getName() + layer + ", " + plan.dug + " dug, " + plan.doing;
 		}
 
 		return errors.containsKey(bot) ? "error " + errors.get(bot) : null;
 	}
 
 	@Override
-	public void start(String bot, String json, JobRunner.Listener listener) {
+	public synchronized void start(String bot, String json, JobRunner.Listener listener) {
 		final String areaId = new JsonParser().parse(json).getAsJsonObject().get("area").getAsString();
 		Area area = null;
 
@@ -194,15 +201,13 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 			return;
 		}
 
-		final boolean stairs = area.getWidth() >= 2 && area.getDepth() >= 2 && area.getHeight() >= 2;
-
-		if (!stairs && area.getHeight() > FLAT_HEIGHT) {
-			fail(bot, null, listener, "quarrify: an area higher than " + FLAT_HEIGHT + " and narrower than 2x2 is not done yet (" + area.getName() + " is " + area.getWidth() + "x" + area.getDepth() + "x" + area.getHeight() + ")");
+		if (area.getWidth() < CORNERS_MIN || area.getDepth() < CORNERS_MIN) {
+			// TODO the areas of 5x5 or less: fewer staircases, or none.
+			fail(bot, null, listener, "quarrify: an area of 5x5 or less is not done yet (" + area.getName() + " is " + area.getWidth() + "x" + area.getDepth() + "x" + area.getHeight() + ")");
 			return;
 		}
 
-		// The hand as it is not known for sure (a hotbar just sent may not show in the inventory yet): the first dig picks one.
-		final Plan plan = new Plan(area, stairs, -1, listener);
+		final Plan plan = new Plan(area, listener);
 		plans.put(bot, plan);
 
 		// The nearest spot in the area or a block round it, at any height from its bottom to standing on its top.
@@ -220,7 +225,7 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 	}
 
 	@Override
-	public void onState(String bot, BotStatus status) {
+	public synchronized void onState(String bot, BotStatus status) {
 		final Plan plan = plans.get(bot);
 
 		if (plan == null) {
@@ -241,481 +246,616 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		}
 
 		if (status.getKind() == BotStatus.Kind.ERROR) {
-			final String message = status.getMessage();
-
-			// A break whose block went out of sight as it turned to it (sand or gravel landing in the way):
-			// the world moved, not the plan. The next block is picked again from it, a few times in a row.
-			if (status.getPrimitive().equals("break") && (message.contains(" in reach and in sight, found ") || message.startsWith("expected the head turned to ")) && plan.misses < SIGHT_MISSES) {
-				plan.misses++;
-				plan.queue.clear();
-				plan.doing = "lost sight of its block, picking again";
-			} else {
-				fail(bot, plan, plan.listener, "quarrify: " + status.getPrimitive() + ": " + message);
-				return;
-			}
-		} else if (plan.sent.equals("break")) {
-			plan.misses = 0;
+			fail(bot, plan, plan.listener, "quarrify: " + status.getPrimitive() + ": " + status.getMessage());
+			return;
 		}
 
-		final int[] feet = plan.feet;
-
-		if (feet == null) {
+		if (plan.feet == null) {
 			fail(bot, plan, plan.listener, "quarrify: expected where " + bot + " stands with its state, found it not told (a fleet older than the mod?)");
 			return;
 		}
 
-		plan.open.add(key(feet[0], feet[1], feet[2]));
-		plan.open.add(key(feet[0], feet[1] + 1, feet[2]));
-
-		if (plan.phase == Phase.APPROACH && !arrive(bot, plan)) {
-			return;
+		if (plan.corner < 0) {
+			arrive(bot, plan);
 		}
 
+		// Its dig over: the bots waiting on it pick again, after it.
+		final Region region = plan.region;
+		final boolean released = region.claims.remove(bot) != null;
 		advance(bot, plan);
+
+		if (released) {
+			wake(region);
+		}
 	}
 
-	/** Where it arrived decides the turns: a room and the climb below the top, the slabs from there. False when it failed. */
-	private boolean arrive(String bot, Plan plan) {
-		final Area area = plan.area;
-		plan.top = Integer.MIN_VALUE;
+	/** At the area: its region joined, the nearest staircase to it taken. */
+	private void arrive(String bot, Plan plan) {
+		Region region = regions.get(plan.area.getId());
 
-		for (int y = area.getMaxY(); y >= area.getMinY() && plan.top == Integer.MIN_VALUE; y--) {
-			for (int[] cell : layer(plan, y)) {
-				final BlockState state = state(bot, plan, cell[0], y, cell[1]);
+		if (region == null) {
+			region = new Region(plan.area);
+			regions.put(plan.area.getId(), region);
+		}
 
-				if (state == null) {
-					return false;
-				}
+		plan.region = region;
+		region.bots.add(bot);
+		plan.corner = nearest(region, plan.feet);
+	}
 
-				if (!air(state)) {
-					plan.top = y;
-					break;
-				}
+	/** The region's staircase nearest to the feet. */
+	private static int nearest(Region region, int[] feet) {
+		int best = -1;
+		long bestDistance = Long.MAX_VALUE;
+
+		for (int i = 0; i < region.stairs.length; i++) {
+			final int[] cell = region.stairs[i][0];
+			final long dx = cell[0] - feet[0];
+			final long dz = cell[1] - feet[2];
+
+			if (dx * dx + dz * dz < bestDistance) {
+				best = i;
+				bestDistance = dx * dx + dz * dz;
 			}
 		}
 
-		if (plan.top == Integer.MIN_VALUE) {
-			// Nothing to dig.
-			plan.phase = Phase.SWEEP;
+		return best;
+	}
+
+	/** Whether the block is left out of the layers: a staircase's step, or a support of a bot's on the region. */
+	private boolean leftOut(Region region, int x, int y, int z) {
+		if (region.step(x, y, z)) {
 			return true;
+		}
+
+		for (Plan plan : plans.values()) {
+			if (plan.region == region && supports(plan, new int[] {x, y, z})) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** The bots waiting on the region's digs, each on to pick again. */
+	private void wake(Region region) {
+		final List<String> waiting = new ArrayList<String>(region.waiting);
+		region.waiting.clear();
+
+		for (String other : waiting) {
+			final Plan plan = plans.get(other);
+
+			if (plan != null && plan.region == region) {
+				advance(other, plan);
+			}
+		}
+	}
+
+	/** The next primitive, worked out from the world as the ones before are over; the region dug, done. */
+	private void advance(String bot, Plan plan) {
+		if (plan.queue.isEmpty() && !next(bot, plan)) {
+			return;
+		}
+
+		if (plan.queue.isEmpty()) {
+			// Waiting, or done.
+			return;
+		}
+
+		send(bot, plan, plan.queue.poll());
+	}
+
+	/** The plan's next primitive queued: to the active layer by its staircase, or a block of it. False when it failed or ended. */
+	private boolean next(String bot, Plan plan) {
+		final Region region = plan.region;
+		final Integer active = active(bot, plan);
+
+		if (active == null) {
+			return false;
+		}
+
+		if (active < plan.area.getMinY()) {
+			release(bot, plan);
+			plans.remove(bot);
+			plan.listener.done();
+			return false;
 		}
 
 		final int feet = plan.feet[1];
 
-		if (!plan.stairs) {
-			plan.phase = Phase.FLAT;
-			plan.flatY = plan.top;
-		} else if (feet <= plan.top) {
-			plan.phase = Phase.ROOM;
-			plan.roomBottom = feet;
-			plan.roomTop = Math.min(feet + 1, plan.top);
-		} else {
-			startDescent(plan);
+		if (feet != active && plan.dugLayer) {
+			// Off the layer: by the nearest staircase, all carved with the layers.
+			plan.corner = nearest(region, plan.feet);
+			plan.dugLayer = false;
 		}
 
-		return true;
-	}
-
-	private static void startDescent(Plan plan) {
-		plan.phase = Phase.DESCEND;
-		plan.slabTop = plan.top;
-		plan.shaftY = plan.top;
-	}
-
-	/** The next primitive, the next blocks' worked out as the ones before are over; none left, done. */
-	private void advance(String bot, Plan plan) {
-		while (plan.queue.isEmpty()) {
-			if (!expand(bot, plan)) {
-				return;
-			}
-
-			if (plan.phase == null) {
-				plans.remove(bot, plan);
-				plan.listener.done();
-				return;
-			}
+		if (feet > active) {
+			return down(bot, plan, active);
 		}
 
-		final JsonObject a = plan.queue.poll();
-
-		// The block to place picked as it is sent: the one before may have used a stack up.
-		if (a.get("action").getAsString().equals("hotbar") && !a.has("slot")) {
-			final int slot = blockSlot(bot);
-
-			if (slot < 0) {
-				fail(bot, plan, plan.listener, "quarrify: expected a full block in the hotbar of " + bot + " to place a step, found none");
-				return;
-			}
-
-			a.addProperty("slot", slot);
+		if (feet < active) {
+			return up(bot, plan, active);
 		}
 
-		if (a.get("action").getAsString().equals("hotbar")) {
-			plan.held = a.get("slot").getAsInt();
-		}
-
-		send(bot, plan, a);
-	}
-
-	/** The plan's next block into primitives (or none, it being done already), on to the next turn when its are over; false when it failed. */
-	private boolean expand(String bot, Plan plan) {
-		Group group = plan.group;
-
-		if (group == null) {
-			group = nextGroup(bot, plan);
-
-			if (group == null) {
-				// Done (phase null), or failed.
-				return plan.phase == null;
-			}
-
-			plan.group = group;
-		}
-
-		if (group.nextStep < group.steps.size()) {
-			final int[] step = group.steps.get(group.nextStep);
-			final BlockState state = state(bot, plan, step[0], step[1], step[2]);
-
-			if (state == null) {
-				return false;
-			}
-
-			// One that falls (sand, gravel) would once the block under it is dug: dug, the step still to make.
-			if (solid(state) && state.getBlock() instanceof FallingBlock) {
-				return dig(bot, plan, step[0], step[1], step[2]);
-			}
-
-			group.nextStep++;
-			return step(bot, plan, group.way, step[0], step[1], step[2]);
-		}
-
-		if (!group.stood) {
-			group.stood = true;
-
-			if (group.stand != null && plan.feet[1] != group.stand[1]) {
-				final int[] spot = standSpot(bot, plan, group.stand);
-
-				if (spot != null) {
-					final JsonObject a = new JsonObject();
-					a.addProperty("action", "goto");
-					a.add("spot", position(spot[0], spot[1], spot[2]));
-					plan.queue.add(a);
-					plan.doing = "down to " + at(spot[0], spot[1], spot[2]);
-				}
-			}
-
-			return true;
-		}
-
-		final int[] cell = group.nearest ? nearest(bot, plan, group) : ordered(bot, plan, group);
+		plan.dugLayer = true;
+		final int[] cell = pick(bot, plan, active);
 
 		if (cell == null) {
-			// Failed when a state was missing, or the turn is over.
-			if (plans.get(bot) != plan) {
-				return false;
-			}
-
-			plan.group = null;
-			return true;
+			return plans.get(bot) == plan;
 		}
 
-		// Kept in the turn: one that is not air again (gravel fallen into it) is dug again.
-		return dig(bot, plan, cell[0], cell[1], cell[2]);
-	}
-
-	/** The plan's next turn, its phase moved on; null when done (phase null) or failed. */
-	private Group nextGroup(String bot, Plan plan) {
-		final Area area = plan.area;
-
-		while (true) {
-			switch (plan.phase) {
-				case ROOM:
-					plan.phase = Phase.CLIMB;
-					plan.climbY = plan.roomBottom;
-					return box(bot, plan, "room " + plan.roomBottom + ".." + plan.roomTop, null, plan.roomBottom, plan.roomTop);
-
-				case CLIMB:
-					if (plan.climbY > plan.top) {
-						startDescent(plan);
-						continue;
-					}
-
-					return shaft(plan, plan.climbY++, 1);
-
-				case DESCEND: {
-					final int bottom = Math.max(area.getMinY(), plan.slabTop - SLAB + 1);
-
-					if (plan.shaftY >= bottom) {
-						return shaft(plan, plan.shaftY--, -1);
-					}
-
-					final Group slab = box(bot, plan, "slab " + bottom + ".." + plan.slabTop, new int[] {0, bottom, 0}, bottom, plan.top);
-
-					if (slab != null && bottom - 1 >= area.getMinY()) {
-						// It stands on the step of the floor's layer, made solid first.
-						slab.steps.add(stepAt(area, bottom - 1));
-					}
-
-					plan.slabTop = bottom - 1;
-					plan.shaftY = plan.slabTop;
-
-					if (plan.slabTop < area.getMinY()) {
-						plan.phase = Phase.SWEEP;
-					}
-
-					return slab;
-				}
-
-				case FLAT:
-					if (plan.flatY < area.getMinY()) {
-						plan.phase = Phase.SWEEP;
-						continue;
-					}
-
-					final int y = plan.flatY--;
-					return box(bot, plan, "layer " + y, null, y, y);
-
-				case SWEEP: {
-					final Group left = box(bot, plan, "what is left", null, area.getMinY(), area.getMaxY());
-
-					if (left == null || !left.cells.isEmpty()) {
-						return left;
-					}
-
-					plan.phase = null;
-					return null;
-				}
-
-				default:
-					throw new IllegalStateException("quarrify: no turn after " + plan.phase);
-			}
-		}
+		region.claims.put(bot, key(cell[0], cell[1], cell[2]));
+		return dig(bot, plan, cell, null);
 	}
 
 	/**
-	 * The turn of a layer of the staircase: its step made solid, the way it goes (-1 down, 1 up), then
-	 * its three other blocks, the ones open on the side it comes from first.
+	 * The region's active layer, gone down past the empty ones: the highest with something to dig
+	 * (the steps and supports left out), never over the one it was. Null when a state was missing (failed).
 	 */
-	private static Group shaft(Plan plan, int y, int way) {
-		final int[][] cells = cells(plan.area);
-		final int k = stepIndex(plan.area, y);
-		// Coming down, the one under the step over it last; climbing, the one over the step under it.
-		final int[] order = way < 0 ? new int[] {k + 1, k + 2, k + 3} : new int[] {k + 2, k + 3, k + 1};
-		final List<int[]> dig = new ArrayList<int[]>();
+	private Integer active(String bot, Plan plan) {
+		final Region region = plan.region;
+		final Area area = plan.area;
 
-		for (int i : order) {
-			final int[] cell = cells[i % 4];
-			dig.add(new int[] {cell[0], y, cell[1]});
+		for (; region.active >= area.getMinY(); region.active--) {
+			for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
+				for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
+					if (leftOut(region, x, region.active, z)) {
+						continue;
+					}
+
+					final BlockState state = state(bot, plan, x, region.active, z);
+
+					if (state == null) {
+						return null;
+					}
+
+					if (!air(state)) {
+						return region.active;
+					}
+				}
+			}
 		}
 
-		final Group group = new Group((way < 0 ? "stairs down " : "stairs up ") + y, way, null, dig, false);
-		group.steps.add(stepAt(plan.area, y));
-		return group;
+		return region.active;
 	}
 
-	/** The turn of the blocks to dig in the layers from lo to hi, the nearest first; null when a chunk was not loaded (failed). */
-	private Group box(String bot, Plan plan, String what, int[] stand, int lo, int hi) {
-		final List<int[]> dig = new ArrayList<int[]>();
+	/**
+	 * The block of the active layer to dig: of the ones no other bot digs, next to something not solid,
+	 * the ones at a local minimum or maximum in x and in z are the ones to dig (the layer's block at x - 1
+	 * or at x + 1 gone, and the one at z - 1 or at z + 1: the steps, the supports and the rest of the area count as
+	 * gone, the ones other bots dig as there), and of those the nearest to the bot's eyes. Null
+	 * when it waits on the others' digs, or failed (a state missing, or all sealed in).
+	 */
+	private int[] pick(String bot, Plan plan, int y) {
+		final Region region = plan.region;
+		final Area area = plan.area;
+		final double ex = plan.feet[0] + 0.5;
+		final double ey = plan.feet[1] + EYES;
+		final double ez = plan.feet[2] + 0.5;
+		final List<int[]> open = new ArrayList<int[]>();
+		final Set<Long> left = new HashSet<Long>();
+		int[] sealed = null;
 
-		for (int y = hi; y >= lo; y--) {
-			for (int[] cell : layer(plan, y)) {
-				final BlockState state = state(bot, plan, cell[0], y, cell[1]);
+		for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
+			for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
+				if (leftOut(region, x, y, z)) {
+					continue;
+				}
+
+				final BlockState state = state(bot, plan, x, y, z);
 
 				if (state == null) {
 					return null;
 				}
 
-				if (!air(state)) {
-					dig.add(new int[] {cell[0], y, cell[1]});
+				if (air(state)) {
+					continue;
+				}
+
+				left.add(key(x, y, z));
+
+				if (region.claims.containsValue(key(x, y, z))) {
+					continue;
+				}
+
+				final Boolean seen = open(bot, plan, x, y, z);
+
+				if (seen == null) {
+					return null;
+				}
+
+				if (!seen) {
+					sealed = new int[] {x, y, z};
+					continue;
+				}
+
+				open.add(new int[] {x, y, z});
+			}
+		}
+
+		int[] best = null;
+		double bestEyes = Double.MAX_VALUE;
+		final List<int[]> eligibles = new ArrayList<int[]>();
+
+		for (int[] cell : open) {
+			final int x = cell[0];
+			final int z = cell[2];
+			final boolean eligible = (!left.contains(key(x - 1, y, z)) || !left.contains(key(x + 1, y, z)))
+					&& (!left.contains(key(x, y, z - 1)) || !left.contains(key(x, y, z + 1)));
+
+			final double dx = cell[0] + 0.5 - ex;
+			final double dy = cell[1] + 0.5 - ey;
+			final double dz = cell[2] + 0.5 - ez;
+			final double eyes = dx * dx + dy * dy + dz * dz;
+
+			if (eligible) {
+				eligibles.add(cell);
+			}
+
+			if (eligible && eyes < bestEyes) {
+				best = cell;
+				bestEyes = eyes;
+			}
+		}
+
+		plan.eligible = eligibles;
+
+		if (best != null) {
+			return best;
+		}
+
+		if (region.claims.isEmpty() && sealed != null) {
+			fail(bot, plan, plan.listener, "quarrify: expected a block of layer " + y + " of " + area.getName() + " next to something not solid, to dig it from there, found them all sealed in (" + at(sealed[0], sealed[1], sealed[2]) + " one)");
+			return null;
+		}
+
+		// The others' digs left: picked again as one ends.
+		region.waiting.add(bot);
+		plan.doing = "waiting on the others' digs";
+		return null;
+	}
+
+	/**
+	 * Down the staircase to stand with its feet in the layer: the layers round its feet carved, then
+	 * on the step under them, then each layer under it carved, ending on its step, one a time.
+	 */
+	private boolean down(String bot, Plan plan, int active) {
+		final int feet = plan.feet[1];
+
+		for (int y = feet + 1; y >= feet - 1; y--) {
+			if (y >= active - 1 && carvable(plan, y)) {
+				final Boolean queued = carve(bot, plan, y, null, -1);
+
+				if (queued == null || queued) {
+					return queued != null;
 				}
 			}
 		}
 
-		return new Group(what, -1, stand, dig, true);
+		final int[] on = stepTop(plan, feet - 1);
+
+		if (!at(plan.feet, on)) {
+			return walk(plan, on);
+		}
+
+		final int[] next = stepTop(plan, feet - 2);
+
+		if (carvable(plan, feet - 2)) {
+			final Boolean queued = carve(bot, plan, feet - 2, next, -1);
+
+			if (queued == null || queued) {
+				return queued != null;
+			}
+		}
+
+		return walk(plan, next);
 	}
 
-	/** The next block to dig in order, the one the bot stands on last; null when none is left. */
-	private int[] ordered(String bot, Plan plan, Group group) {
+	/**
+	 * Up the staircase to stand with its feet in the layer: the layers at its feet and head carved,
+	 * then the one over those, ending on the step at its feet, one a time.
+	 */
+	private boolean up(String bot, Plan plan, int active) {
+		final int feet = plan.feet[1];
+
+		for (int y = feet; y <= feet + 1; y++) {
+			if (carvable(plan, y)) {
+				final Boolean queued = carve(bot, plan, y, null, -1);
+
+				if (queued == null || queued) {
+					return queued != null;
+				}
+			}
+		}
+
+		final int[] next = stepTop(plan, feet);
+
+		if (carvable(plan, feet + 2)) {
+			// The block over the step alone: the head's room to go on to it. The rest of that layer, its
+			// step first, is carved from on the step: from here the eyes are under the top of a support
+			// placed at the feet's height, the step seen from nowhere to place against it. The room over
+			// where it jumps from too, when that is of the staircase. No end: dug from where it stands.
+			final int[][] stair = plan.region.stairs[plan.corner];
+			// The one it jumps from by the step it stands on, not its feet: those floor an x or z hanging
+			// over the step's edge to the next column.
+			final int[] column = stair[stepIndex(plan.area, feet)];
+			final int[] from = stair[stepIndex(plan.area, feet - 1)];
+
+			for (int[] cell : stair) {
+				if ((cell[0] != column[0] || cell[1] != column[1]) && (cell[0] != from[0] || cell[1] != from[1])) {
+					continue;
+				}
+
+				final int[] head = {cell[0], feet + 2, cell[1]};
+				final BlockState there = state(bot, plan, head[0], head[1], head[2]);
+
+				if (there == null) {
+					return false;
+				}
+
+				if (!air(there) && !supports(plan, head)) {
+					return !claim(bot, plan, head) || dig(bot, plan, head, null);
+				}
+			}
+		}
+
+		return walk(plan, next);
+	}
+
+	/** Whether the layer has a staircase to carve: it is in the area. */
+	private static boolean carvable(Plan plan, int y) {
+		return y >= plan.area.getMinY() && y <= plan.area.getMaxY();
+	}
+
+	/**
+	 * The next primitive of the layer of its staircase queued: its supports, its step made solid, the
+	 * supports broken after, then its three other blocks dug (the column first first, if any), the one
+	 * the bot stands on last. With end, each a wsrp ending there. True when one was queued, false with
+	 * the layer carved, null when it failed.
+	 */
+	private Boolean carve(String bot, Plan plan, int y, int[] end, int first) {
+		final int[][] stair = plan.region.stairs[plan.corner];
+		final int k = stepIndex(plan.area, y);
+		final int[] step = {stair[k][0], y, stair[k][1]};
+		final BlockState state = state(bot, plan, step[0], step[1], step[2]);
+
+		if (state == null) {
+			return null;
+		}
+
+		if (solid(state) && state.getBlock() instanceof FallingBlock) {
+			// It would fall once the block under it is dug: dug, placed again after.
+			return !claim(bot, plan, step) || dig(bot, plan, step, end) ? Boolean.TRUE : null;
+		}
+
+		if (!solid(state)) {
+			return support(bot, plan, step, end) ? Boolean.TRUE : null;
+		}
+
+		// This layer's step's supports alone: one of another's is not this one's to break.
+		for (int i = plan.supports.size() - 1; i >= 0; i--) {
+			if (plan.supports.get(i)[3] != y) {
+				continue;
+			}
+
+			final int[] support = plan.supports.remove(i);
+			final BlockState there = state(bot, plan, support[0], support[1], support[2]);
+
+			if (there == null) {
+				return null;
+			}
+
+			if (!air(there)) {
+				return !claim(bot, plan, support) || dig(bot, plan, support, end) ? Boolean.TRUE : null;
+			}
+		}
+
+		final List<int[]> cells = new ArrayList<int[]>();
+
+		if (first >= 0 && first != k) {
+			cells.add(new int[] {stair[first][0], y, stair[first][1]});
+		}
+
+		for (int i = 1; i < 4; i++) {
+			final int c = (k + i) % 4;
+
+			if (c != first) {
+				cells.add(new int[] {stair[c][0], y, stair[c][1]});
+			}
+		}
+
 		int[] under = null;
+		int[] sealed = null;
 
-		for (int[] cell : group.cells) {
-			final BlockState state = state(bot, plan, cell[0], cell[1], cell[2]);
+		for (int[] cell : cells) {
+			final BlockState there = state(bot, plan, cell[0], cell[1], cell[2]);
 
-			if (state == null) {
+			if (there == null) {
 				return null;
 			}
 
-			if (air(state)) {
+			if (air(there) || supports(plan, cell)) {
+				// A support of another layer's step stays till that step stands (see the supports above).
 				continue;
 			}
 
-			if (!underFeet(plan, cell)) {
-				return cell;
-			}
-
-			if (under == null) {
+			if (cell[0] == plan.feet[0] && cell[1] == plan.feet[1] - 1 && cell[2] == plan.feet[2]) {
 				under = cell;
-			}
-		}
-
-		return under;
-	}
-
-	/**
-	 * The block to dig nearest to the bot's eyes: of the ones next to what is open to it first, then of
-	 * the ones next to air, then the one it stands on, the ones under sand or gravel after all those;
-	 * null when none is left, or all are sealed in (failed).
-	 */
-	private int[] nearest(String bot, Plan plan, Group group) {
-		final int[] feet = plan.feet;
-		final double ex = feet[0] + 0.5;
-		final double ey = feet[1] + EYES;
-		final double ez = feet[2] + 0.5;
-		Collections.sort(group.cells, new Comparator<int[]>() {
-			@Override
-			public int compare(int[] a, int[] b) {
-				return Double.compare(distance(a, ex, ey, ez), distance(b, ex, ey, ez));
-			}
-		});
-
-		// Ranks 0 to 2 as above, 3 to 5 the same under a block that falls (it would fall in once this is
-		// dug: dug last, from over it first), 6 sealed in.
-		final int[][] best = new int[7][];
-
-		for (Iterator<int[]> it = group.cells.iterator(); it.hasNext();) {
-			final int[] cell = it.next();
-			final BlockState state = state(bot, plan, cell[0], cell[1], cell[2]);
-
-			if (state == null) {
-				return null;
-			}
-
-			if (air(state)) {
-				it.remove();
 				continue;
 			}
 
-			final int rank;
+			final Boolean open = open(bot, plan, cell[0], cell[1], cell[2]);
 
-			if (underFeet(plan, cell)) {
-				rank = 2;
-			} else {
-				// Open: not solid now (a step placed where it dug is solid again), and dug or stood in.
-				boolean open = false;
-				boolean air = false;
-
-				for (int i = 0; i < FACES.length && !open; i++) {
-					final int x = cell[0] + FACES[i][0];
-					final int y = cell[1] + FACES[i][1];
-					final int z = cell[2] + FACES[i][2];
-					final BlockState there = state(bot, plan, x, y, z);
-
-					if (there == null) {
-						return null;
-					}
-
-					if (!solid(there)) {
-						air = true;
-						open = plan.open.contains(key(x, y, z));
-					}
-				}
-
-				rank = open ? 0 : air ? 1 : 6;
-			}
-
-			final BlockState over = state(bot, plan, cell[0], cell[1] + 1, cell[2]);
-
-			if (over == null) {
+			if (open == null) {
 				return null;
 			}
 
-			final int ranked = rank < 6 && over.getBlock() instanceof FallingBlock ? rank + 3 : rank;
+			// One sealed in is seen from nowhere: after the ones next to it, which open it.
+			if (!open) {
+				if (sealed == null) {
+					sealed = cell;
+				}
 
-			if (ranked == 0) {
-				return cell;
+				continue;
 			}
 
-			if (best[ranked] == null) {
-				best[ranked] = cell;
-			}
+			return !claim(bot, plan, cell) || dig(bot, plan, cell, end) ? Boolean.TRUE : null;
 		}
 
-		for (int rank = 1; rank < 6; rank++) {
-			if (best[rank] != null) {
-				return best[rank];
-			}
+		if (under != null) {
+			return !claim(bot, plan, under) || dig(bot, plan, under, end) ? Boolean.TRUE : null;
 		}
 
-		if (best[6] != null) {
-			// Seen from nowhere: a walk to sight of it would search all the bot reaches, and find none.
-			fail(bot, plan, plan.listener, "quarrify: expected one of the " + group.cells.size() + " blocks left of " + group.what + " next to air, to dig it from there, found them all sealed in (" + at(best[6][0], best[6][1], best[6][2]) + " the nearest)");
+		if (sealed != null) {
+			fail(bot, plan, plan.listener, "quarrify: expected a block of the staircase at layer " + y + " next to something not solid, to dig it from there, found them all sealed in (" + at(sealed[0], sealed[1], sealed[2]) + " one)");
+			return null;
 		}
 
-		return null;
-	}
-
-	private static double distance(int[] cell, double x, double y, double z) {
-		final double dx = cell[0] + 0.5 - x;
-		final double dy = cell[1] + 0.5 - y;
-		final double dz = cell[2] + 0.5 - z;
-		return dx * dx + dy * dy + dz * dz;
-	}
-
-	private static boolean underFeet(Plan plan, int[] cell) {
-		final int[] feet = plan.feet;
-		return cell[0] == feet[0] && cell[1] == feet[1] - 1 && cell[2] == feet[2];
+		return Boolean.FALSE;
 	}
 
 	/**
-	 * Where to stand on the floor of the layer stand[1]: on the step under it, or (at the bottom of the
-	 * area, with none) on a block under another column of the staircase; its feet's block and the one
-	 * over it free. Null for none such: it stands where it is.
+	 * The step placed against a solid neighbour; with none, the farthest of its supports: the blocks
+	 * of its column from it, up or down (the fewer, in the area), to the first with one. False when
+	 * it failed.
 	 */
-	private int[] standSpot(String bot, Plan plan, int[] stand) {
-		final Area area = plan.area;
-		final int y = stand[1];
-		final List<int[]> columns = new ArrayList<int[]>();
+	private boolean support(String bot, Plan plan, int[] step, int[] end) {
+		if (against(bot, plan, step[0], step[1], step[2])) {
+			plan.doing = "step " + at(step[0], step[1], step[2]);
+			return !claim(bot, plan, step) || place(bot, plan, step, end);
+		}
 
-		if (y - 1 >= area.getMinY()) {
-			final int[] step = stepAt(area, y - 1);
-			columns.add(new int[] {step[0], step[2]});
-		} else {
-			final int[] step = stepAt(area, y);
+		if (plans.get(bot) != plan) {
+			return false;
+		}
 
-			for (int[] cell : cells(area)) {
-				if (cell[0] != step[0] || cell[1] != step[2]) {
-					columns.add(cell);
+		int[] best = null;
+
+		for (int way = -1; way <= 1; way += 2) {
+			for (int y = step[1] + way; y >= plan.area.getMinY() && y <= plan.area.getMaxY(); y += way) {
+				if (best != null && Math.abs(y - step[1]) >= Math.abs(best[1] - step[1])) {
+					break;
+				}
+
+				if (against(bot, plan, step[0], y, step[2])) {
+					best = new int[] {step[0], y, step[2]};
+					break;
+				}
+
+				if (plans.get(bot) != plan) {
+					return false;
 				}
 			}
 		}
 
-		for (int[] column : columns) {
-			final BlockState floor = state(bot, plan, column[0], y - 1, column[1]);
-			final BlockState feet = state(bot, plan, column[0], y, column[1]);
-			final BlockState head = state(bot, plan, column[0], y + 1, column[1]);
+		if (best == null) {
+			fail(bot, plan, plan.listener, "quarrify: expected a solid block next to the step at " + at(step[0], step[1], step[2]) + " or to its column in the area, found none: the staircase would stand in the air");
+			return false;
+		}
 
-			if (floor == null || feet == null || head == null) {
-				return null;
-			}
+		if (!claim(bot, plan, best)) {
+			return true;
+		}
 
-			if (solid(floor) && !solid(feet) && !solid(head)) {
-				return new int[] {column[0], y, column[1]};
+		plan.supports.add(new int[] {best[0], best[1], best[2], step[1]});
+		plan.doing = "support " + at(best[0], best[1], best[2]) + " for the step " + at(step[0], step[1], step[2]);
+		return place(bot, plan, best, end);
+	}
+
+	/** Whether a support of the plan's stands at the cell, to break once its step stands. */
+	private static boolean supports(Plan plan, int[] cell) {
+		for (int[] support : plan.supports) {
+			if (support[0] == cell[0] && support[1] == cell[1] && support[2] == cell[2]) {
+				return true;
 			}
 		}
 
-		return null;
+		return false;
 	}
 
-	/** The block walked in sight of and broken, with the hotbar's item that breaks it fastest; air, nothing. False when it failed. */
-	private boolean dig(String bot, Plan plan, int x, int y, int z) {
+	/**
+	 * The block taken for the bot's next primitive; false when another bot is on it, the bot waiting
+	 * for that one's to end (see wake).
+	 */
+	private static boolean claim(String bot, Plan plan, int[] cell) {
+		final Region region = plan.region;
+		final long key = key(cell[0], cell[1], cell[2]);
+
+		for (Map.Entry<String, Long> claim : region.claims.entrySet()) {
+			if (claim.getValue() == key && !claim.getKey().equals(bot)) {
+				region.waiting.add(bot);
+				plan.doing = "waiting on " + claim.getKey() + " at " + at(cell[0], cell[1], cell[2]);
+				return false;
+			}
+		}
+
+		region.claims.put(bot, key);
+		return true;
+	}
+
+	/** Whether the block has something not solid next to it, to be seen from; null when a state was missing (failed). */
+	private Boolean open(String bot, Plan plan, int x, int y, int z) {
+		for (int[] face : FACES) {
+			final BlockState there = state(bot, plan, x + face[0], y + face[1], z + face[2]);
+
+			if (there == null) {
+				return null;
+			}
+
+			if (!solid(there)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Whether the spot has a solid block next to it to place against; false too when a state was missing (failed). */
+	private boolean against(String bot, Plan plan, int x, int y, int z) {
+		for (int[] face : FACES) {
+			final BlockState there = state(bot, plan, x + face[0], y + face[1], z + face[2]);
+
+			if (there == null) {
+				return false;
+			}
+
+			if (solid(there)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** The top of the layer's step of the bot's staircase: where the feet go standing on it, {x, y, z}. */
+	private static int[] stepTop(Plan plan, int y) {
+		final int[] cell = plan.region.stairs[plan.corner][stepIndex(plan.area, y)];
+		return new int[] {cell[0], y + 1, cell[1]};
+	}
+
+	/** The layer's step's column of a staircase: the first at the top, one column round a layer. */
+	private static int stepIndex(Area area, int y) {
+		return Math.floorMod(area.getMaxY() - y, 4);
+	}
+
+	private boolean walk(Plan plan, int[] spot) {
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", "goto");
+		a.add("spot", position(spot[0], spot[1], spot[2]));
+		plan.queue.add(a);
+		plan.doing = "to " + at(spot[0], spot[1], spot[2]);
+		return true;
+	}
+
+	/** The block broken from a spot it is seen from (break_wsr), with end ending there (break_wsrp). False when it failed. */
+	private boolean dig(String bot, Plan plan, int[] cell, int[] end) {
+		final int x = cell[0];
+		final int y = cell[1];
+		final int z = cell[2];
 		final BlockState block = state(bot, plan, x, y, z);
 
 		if (block == null) {
 			return false;
-		}
-
-		if (air(block)) {
-			return true;
 		}
 
 		final String name = name(block);
@@ -732,25 +872,14 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 			return false;
 		}
 
-		final int tool = toolSlot(bot, plan, block);
-		final ItemStack stack = BotScreen.stackOf(bots.getInventory(bot).getSlots().get(tool));
+		final ItemStack stack = bestTool(bot, block);
 
 		if (hardness > 0 && !harvests(stack, block)) {
-			fail(bot, plan, plan.listener, "quarrify: expected an item in the hotbar of " + bot + " that harvests " + name + " at " + at(x, y, z) + ", found none");
+			fail(bot, plan, plan.listener, "quarrify: expected an item in the inventory of " + bot + " that harvests " + name + " at " + at(x, y, z) + ", found none");
 			return false;
 		}
 
-		if (tool != plan.held) {
-			final JsonObject hotbar = new JsonObject();
-			hotbar.addProperty("action", "hotbar");
-			hotbar.addProperty("slot", tool);
-			plan.queue.add(hotbar);
-		}
-
-		plan.queue.add(gotoLook(x, y, z));
-		final JsonObject a = new JsonObject();
-		a.addProperty("action", "break");
-		a.add("target", position(x, y, z));
+		final JsonObject a = search(plan, end == null ? "break_wsr" : "break_wsrp", cell, end);
 		// Twice its dig and 2 s, when that is past the default: an obsidian one takes longer than it.
 		final int ms = hardness == 0 ? 0 : (int) Math.ceil(hardness / speed(stack, block)) * 50;
 
@@ -759,165 +888,34 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		}
 
 		plan.queue.add(a);
-		plan.open.add(key(x, y, z));
 		plan.dug++;
 		plan.doing = "dig " + at(x, y, z);
+
 		return true;
 	}
 
-	/**
-	 * The step at the spot made solid: kept when it is, placed when not, against a solid neighbour;
-	 * with none, on supports placed past it the way it goes (way: -1 down, 1 up), in the area, up to
-	 * one that has.
-	 */
-	private boolean step(String bot, Plan plan, int way, int x, int y, int z) {
-		final BlockState state = state(bot, plan, x, y, z);
-
-		if (state == null) {
-			return false;
-		}
-
-		if (solid(state)) {
-			return true;
-		}
-
-		// From the step on: each spot placed on the one past it, the last against the neighbour found.
-		final List<int[]> chain = new ArrayList<int[]>();
-		int[] against = null;
-
-		for (int at = y; against == null; at += way) {
-			// Supports in the area only: its blocks are dug with their layers after; past it they would stay.
-			if (at < plan.area.getMinY() || at > plan.area.getMaxY()) {
-				fail(bot, plan, plan.listener, "quarrify: expected a solid block next to the step at " + at(x, y, z) + " or to its column " + (way < 0 ? "under" : "over") + " it in the area, found none: the staircase would stand in the air");
-				return false;
-			}
-
-			chain.add(new int[] {x, at, z});
-
-			for (int[] face : FACES) {
-				final BlockState there = state(bot, plan, x + face[0], at + face[1], z + face[2]);
-
-				if (there == null) {
-					return false;
-				}
-
-				if (solid(there)) {
-					against = new int[] {x + face[0], at + face[1], z + face[2]};
-					break;
-				}
-			}
-		}
-
-		// Out of the spots first: a block is not placed where the bot stands.
-		final int[] feet = plan.feet;
-
-		for (int[] spot : chain) {
-			if (spot[0] == feet[0] && spot[2] == feet[2] && (spot[1] == feet[1] || spot[1] == feet[1] + 1)) {
-				final int[] aside = aside(bot, plan, chain);
-
-				if (aside == null) {
-					return false;
-				}
-
-				final JsonObject a = new JsonObject();
-				a.addProperty("action", "goto");
-				a.add("spot", position(aside[0], aside[1], aside[2]));
-				plan.queue.add(a);
-				break;
-			}
-		}
-
-		for (int i = chain.size() - 1; i >= 0; i--) {
-			final int[] spot = chain.get(i);
-			final int[] reference = i == chain.size() - 1 ? against : chain.get(i + 1);
-			final JsonObject hotbar = new JsonObject();
-			hotbar.addProperty("action", "hotbar");
-			plan.queue.add(hotbar);
-			plan.queue.add(gotoLook(reference[0], reference[1], reference[2]));
-			final JsonObject a = new JsonObject();
-			a.addProperty("action", "place");
-			a.add("target", position(spot[0], spot[1], spot[2]));
-			plan.queue.add(a);
-		}
-
-		plan.doing = "step " + at(x, y, z) + (chain.size() > 1 ? " on " + (chain.size() - 1) + " support(s)" : "");
+	/** A block it may place put at the spot from one it is seen from (place_wsr), with end ending there (place_wsrp). */
+	private boolean place(String bot, Plan plan, int[] spot, int[] end) {
+		plan.queue.add(search(plan, end == null ? "place_wsr" : "place_wsrp", spot, end));
 		return true;
 	}
 
-	/**
-	 * A block next to the bot's feet, the sides first, to stand in out of the spots: one to stand on
-	 * under it, it and the one over it free. Null when there is none, the plan failed with it.
-	 */
-	private int[] aside(String bot, Plan plan, List<int[]> spots) {
-		final int[] feet = plan.feet;
-		final int[][] around = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+	/** A wsr or wsrp primitive at the block: its walk to sight of it as far as the area's across, up and down. */
+	private static JsonObject search(Plan plan, String action, int[] cell, int[] end) {
+		final JsonObject a = new JsonObject();
+		a.addProperty("action", action);
+		a.add("target", position(cell[0], cell[1], cell[2]));
+		a.addProperty("radius", plan.area.getWidth() + plan.area.getDepth() + plan.area.getHeight());
 
-		for (int[] d : around) {
-			final int x = feet[0] + d[0];
-			final int z = feet[2] + d[1];
-			boolean taken = false;
-
-			for (int[] spot : spots) {
-				taken |= spot[0] == x && spot[2] == z && (spot[1] == feet[1] || spot[1] == feet[1] + 1);
-			}
-
-			final BlockState floor = state(bot, plan, x, feet[1] - 1, z);
-			final BlockState body = state(bot, plan, x, feet[1], z);
-			final BlockState head = state(bot, plan, x, feet[1] + 1, z);
-
-			if (floor == null || body == null || head == null) {
-				return null;
-			}
-
-			if (!taken && solid(floor) && !solid(body) && !solid(head)) {
-				return new int[] {x, feet[1], z};
-			}
+		if (end != null) {
+			a.add("end", position(end[0], end[1], end[2]));
 		}
 
-		fail(bot, plan, plan.listener, "quarrify: expected a block next to " + bot + " at " + at(feet[0], feet[1], feet[2]) + " to stand in out of the step to place there, found none");
-		return null;
+		return a;
 	}
 
-	/** The columns of the layer to dig, {x, z}: all of the area's, its step's left out. */
-	private static List<int[]> layer(Plan plan, int y) {
-		final Area area = plan.area;
-		final int[] step = plan.stairs ? stepAt(area, y) : null;
-		final List<int[]> columns = new ArrayList<int[]>();
-
-		for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
-			for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
-				if (step == null || step[0] != x || step[2] != z) {
-					columns.add(new int[] {x, z});
-				}
-			}
-		}
-
-		return columns;
-	}
-
-	/** The layer's step, {x, y, z}. */
-	private static int[] stepAt(Area area, int y) {
-		final int[] cell = cells(area)[stepIndex(area, y)];
-		return new int[] {cell[0], y, cell[1]};
-	}
-
-	/** The layer's step's column, as cells() has them: the corner first at the top, one column round a layer. */
-	private static int stepIndex(Area area, int y) {
-		return (area.getMaxY() - y) % 4;
-	}
-
-	/** The staircase's 2x2, {x, z}, gone round from its north-east corner. */
-	private static int[][] cells(Area area) {
-		final int east = area.getMaxX();
-		final int north = area.getMinZ();
-		return new int[][] {{east, north}, {east - 1, north}, {east - 1, north + 1}, {east, north + 1}};
-	}
-
-	/**
-	 * The hotbar slot (window numbering) whose item breaks the block fastest, the one in hand on a tie:
-	 * its speed on the block (efficiency added), a third as fast with the block not harvested by it.
-	 */
-	private int toolSlot(String bot, Plan plan, BlockState block) {
+	/** The inventory's item that breaks the block fastest, as the break picks it: empty for the hand. */
+	private ItemStack bestTool(String bot, BlockState block) {
 		final BotInventory inventory = bots.getInventory(bot);
 
 		if (inventory == null) {
@@ -925,14 +923,15 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		}
 
 		final List<BotInventory.Item> slots = inventory.getSlots();
-		int best = plan.held;
-		float bestSpeed = best < 0 ? -1 : speed(BotScreen.stackOf(slots.get(best)), block);
+		ItemStack best = ItemStack.EMPTY;
+		float bestSpeed = speed(best, block);
 
-		for (int slot = 36; slot <= 44; slot++) {
-			final float speed = speed(BotScreen.stackOf(slots.get(slot)), block);
+		for (int slot = INVENTORY_FIRST; slot <= INVENTORY_LAST; slot++) {
+			final ItemStack stack = BotScreen.stackOf(slots.get(slot));
+			final float speed = speed(stack, block);
 
 			if (speed > bestSpeed) {
-				best = slot;
+				best = stack;
 				bestSpeed = speed;
 			}
 		}
@@ -959,43 +958,6 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 	private static boolean harvests(ItemStack stack, BlockState block) {
 		// doesBlockMovement: no tool needed (yarn's name for it).
 		return block.getMaterial().doesBlockMovement() || (!stack.isEmpty() && stack.method_11396(block));
-	}
-
-	/** The hotbar slot (window numbering) of a full block that does not fall and holds nothing; -1 for none. */
-	private int blockSlot(String bot) {
-		final BotInventory inventory = bots.getInventory(bot);
-
-		if (inventory == null) {
-			throw new IllegalStateException("quarrify: no inventory of " + bot + " yet");
-		}
-
-		final List<BotInventory.Item> slots = inventory.getSlots();
-
-		for (int slot = 36; slot <= 44; slot++) {
-			final BotInventory.Item item = slots.get(slot);
-
-			if (item == null) {
-				continue;
-			}
-
-			final Item kind = Item.REGISTRY.get(new Identifier(item.getName()));
-
-			if (kind == null) {
-				throw new IllegalStateException("no item " + item.getName() + " in the registry");
-			}
-
-			if (!(kind instanceof BlockItem)) {
-				continue;
-			}
-
-			final Block block = ((BlockItem) kind).getBlock();
-
-			if (block.isFullBlock(block.getDefaultState()) && !(block instanceof FallingBlock) && !(block instanceof BlockWithEntity)) {
-				return slot;
-			}
-		}
-
-		return -1;
 	}
 
 	/**
@@ -1038,16 +1000,13 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		return ((long) x & 0x3ffffff) << 38 | ((long) y & 0xfff) << 26 | ((long) z & 0x3ffffff);
 	}
 
+	private static boolean at(int[] a, int[] b) {
+		return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+	}
+
 	/** The dimension being played, as the fleet keys its columns. */
 	private static String dimension() {
 		return "minecraft:" + MinecraftClient.getInstance().world.dimension.getDimensionType().getName();
-	}
-
-	private static JsonObject gotoLook(int x, int y, int z) {
-		final JsonObject a = new JsonObject();
-		a.addProperty("action", "goto");
-		a.add("look", position(x, y, z));
-		return a;
 	}
 
 	private static JsonObject position(int x, int y, int z) {
@@ -1064,12 +1023,12 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 	private void send(String bot, Plan plan, JsonObject a) {
 		plan.starting = true;
-		plan.sent = a.get("action").getAsString();
+		System.out.println("[quarrify trace] " + bot + " feet " + java.util.Arrays.toString(plan.feet) + " " + plan.doing + " " + a);
 		bots.actionInternal(bot, a.toString());
 	}
 
 	@Override
-	public void onAction(String bot, String json, boolean internal) {
+	public synchronized void onAction(String bot, String json, boolean internal) {
 		if (internal) {
 			return;
 		}
@@ -1083,14 +1042,41 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		final Plan plan = plans.remove(bot);
 
 		if (plan != null) {
+			release(bot, plan);
 			plan.listener.failed();
 		}
 	}
 
+	/** The bot off its region: its staircase free, its dig no more; the region gone with no bot left on it. */
+	private void release(String bot, Plan plan) {
+		final Region region = plan.region;
+
+		if (region == null) {
+			return;
+		}
+
+		plan.region = null;
+		final boolean released = region.claims.remove(bot) != null;
+		region.waiting.remove(bot);
+
+		region.bots.remove(bot);
+
+		if (region.bots.isEmpty()) {
+			regions.remove(plan.area.getId(), region);
+		} else if (released) {
+			wake(region);
+		}
+	}
+
 	private void fail(String bot, Plan plan, JobRunner.Listener listener, String message) {
-		if (plan != null && !plans.remove(bot, plan)) {
+		if (plan != null && plans.get(bot) != plan) {
 			// Failed already, or taken over: the first end stands.
 			return;
+		}
+
+		if (plan != null) {
+			plans.remove(bot);
+			release(bot, plan);
 		}
 
 		errors.put(bot, message);

@@ -21,7 +21,7 @@ import org.lwjgl.opengl.GL11;
  * Each area as a coloured box in the world, plus the block a click would pick while picking, and
  * the path each walking bot is on with its target, and the chests of each grab going on: the one
  * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour; and
- * the blocks clicked in chat messages, red.
+ * the blocks each quarrify chooses from, green; and the blocks clicked in chat messages, red.
  *
  * Drawn at the end of entity rendering, where the camera transform is set with the camera at the
  * origin: boxes are shifted by the interpolated camera position, the raw one makes them jitter.
@@ -54,8 +54,10 @@ public final class AreaRenderer {
 		final List<Grab.Highlight> chests = grab == null ? Collections.<Grab.Highlight>emptyList() : grab.highlights();
 
 		final List<BlockPos> highlighted = BlockLinks.highlighted();
+		final Quarrify quarrify = MapMcBotClient.quarrifyOrNull();
+		final List<int[]> eligible = quarrify == null ? Collections.<int[]>emptyList() : quarrify.eligible();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty() && highlighted.isEmpty()) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty() && highlighted.isEmpty() && eligible.isEmpty()) {
 			return;
 		}
 
@@ -127,6 +129,11 @@ public final class AreaRenderer {
 			} else {
 				drawOutline(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1, rgb, camX, camY, camZ);
 			}
+		}
+
+		// The blocks of the active layer each quarrify chooses from (see Quarrify.pick).
+		for (int[] block : eligible) {
+			drawBox(block[0], block[1], block[2], block[0] + 1, block[1] + 1, block[2] + 1, 0x00FF00, camX, camY, camZ);
 		}
 
 		// The blocks clicked in chat (see BlockLinks), over everything.

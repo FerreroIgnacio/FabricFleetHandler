@@ -35,6 +35,7 @@ const TYPES = {
   HELLO: 22,
   WINDOW_CLICK: 25,
   TRADE_SELECT: 29,
+  ALLOWED_PLACE: 49,
   // mod -> fleet: the primitives (see actions.js), one type each
   GOTO: 23,
   INTERACT: 34,
@@ -49,7 +50,11 @@ const TYPES = {
   LOOK_AT: 43,
   DROP: 44,
   SHIFT_MOVE: 45,
-  STOP: 46
+  STOP: 46,
+  BREAK_WSR: 47,
+  PLACE_WSR: 48,
+  BREAK_WSRP: 50,
+  PLACE_WSRP: 51
 }
 
 // The primitive each of its types is, as actions.js names it.
@@ -57,7 +62,9 @@ const PRIMITIVES = new Map([
   [TYPES.GOTO, 'goto'], [TYPES.INTERACT, 'interact'], [TYPES.BREAK, 'break'], [TYPES.PLACE, 'place'],
   [TYPES.CLOSE_WINDOW, 'close_window'], [TYPES.MOVE, 'move'], [TYPES.ITEM_FILL, 'item_fill'],
   [TYPES.WAIT_SLOT, 'wait_slot'], [TYPES.HOTBAR, 'hotbar'], [TYPES.SELECT_TRADE, 'select_trade'],
-  [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop']
+  [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop'],
+  [TYPES.BREAK_WSR, 'break_wsr'], [TYPES.PLACE_WSR, 'place_wsr'], [TYPES.BREAK_WSRP, 'break_wsrp'],
+  [TYPES.PLACE_WSRP, 'place_wsrp']
 ])
 
 class Writer {
@@ -513,6 +520,14 @@ function decode (frame) {
       // The villager trade the bot's open window shows, as the game's arrows pick it.
       message = { type, bot: r.str(), trade: r.i32() }
       break
+    case TYPES.ALLOWED_PLACE: {
+      // The blocks the bot may place, as the mod keys them: name@metadata.
+      const bot = r.str()
+      const count = r.i32()
+      if (count < 0) throw new Error(`bad block count ${count}`)
+      message = { type, bot, blocks: Array.from({ length: count }, () => r.str()) }
+      break
+    }
     case TYPES.HELLO:
       // version: the commit the mod was built at.
       message = { type, bot: r.str(), version: r.str() }
@@ -567,9 +582,23 @@ function primitive (r, type) {
       r.deadline(a)
       r.turnSpeed(a)
       break
-    case TYPES.PLACE:
-      // i32 x, y, z, u8 state present and the state the block takes, deadline, turn speed.
+    case TYPES.BREAK_WSR:
+    case TYPES.BREAK_WSRP:
+      // i32 x, y, z, i32 radius, break_wsrp's i32 x, y, z it ends in, deadline, turn speed.
       a.target = r.pos()
+      a.radius = r.i32()
+      if (type === TYPES.BREAK_WSRP) a.end = r.pos()
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    case TYPES.PLACE:
+    case TYPES.PLACE_WSR:
+    case TYPES.PLACE_WSRP:
+      // i32 x, y, z, place_wsr's and place_wsrp's i32 radius, place_wsrp's i32 x, y, z it ends in, u8 state
+      // present and the state the block takes, deadline, turn speed.
+      a.target = r.pos()
+      if (type !== TYPES.PLACE) a.radius = r.i32()
+      if (type === TYPES.PLACE_WSRP) a.end = r.pos()
       if (r.u8()) a.state = r.str()
       r.deadline(a)
       r.turnSpeed(a)

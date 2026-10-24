@@ -53,6 +53,9 @@ public interface FleetChannel {
 	/** The villager trade the bot's open window shows (see FleetProtocol#TRADE_SELECT). */
 	void tradeSelect(String bot, int trade);
 
+	/** The blocks the bot may place (see FleetProtocol#ALLOWED_PLACE). */
+	void allowedPlace(String bot, List<String> blocks);
+
 	/** The columns file the fleet loads every chunk into, one slot each (see FleetProtocol). */
 	File columns();
 

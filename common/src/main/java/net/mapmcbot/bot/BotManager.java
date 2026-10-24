@@ -226,6 +226,11 @@ public final class BotManager implements FleetChannel {
 	}
 
 	@Override
+	public void allowedPlace(String bot, List<String> blocks) {
+		send(FleetProtocol.allowedPlace(bot, blocks));
+	}
+
+	@Override
 	public void action(String bot, String json) {
 		send(FleetProtocol.primitive(bot, json));
 	}

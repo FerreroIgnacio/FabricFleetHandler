@@ -499,6 +499,9 @@ function onFrame (frame) {
     case protocol.TYPES.TRADE_SELECT:
       bots.get(message.bot)?.worker.postMessage({ type: 'trade', bot: message.bot, trade: message.trade })
       break
+    case protocol.TYPES.ALLOWED_PLACE:
+      bots.get(message.bot)?.worker.postMessage({ type: 'allowed_place', bot: message.bot, blocks: message.blocks })
+      break
     case protocol.TYPES.RELEASE:
       // The mod has the snapshot of an unloaded column: done with its slot.
       onRelease(message.slot)

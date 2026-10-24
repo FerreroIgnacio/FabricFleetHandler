@@ -22,6 +22,7 @@ import net.mapmcbot.bot.BotInventory;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.BotStatus;
 import net.mapmcbot.bot.BotWindow;
+import net.mapmcbot.bot.PlaceBlocks;
 import net.mapmcbot.job.JobRunner;
 import net.mapmcbot.job.JobStore;
 import net.minecraft.client.render.DiffuseLighting;
@@ -104,6 +105,11 @@ public class BotScreen extends HandledScreen {
 			{"Look at", "#lookat %s"},
 			{"Drop", null},
 			{"Shift move", null},
+			{"Place blocks", null},
+			{"Break WSR", "#breakwsr %s"},
+			{"Place WSR", "#placewsr %s"},
+			{"Break WSRP", "#breakwsrp %s"},
+			{"Place WSRP", "#placewsrp %s"},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
@@ -209,6 +215,20 @@ public class BotScreen extends HandledScreen {
 	private boolean dragging;
 	/** Whether Delete was pressed and the next click on it deletes the job; any other click takes it back. */
 	private boolean deleting;
+
+	/**
+	 * Place blocks: in place of the inventory every block the game has (see PlaceCatalog), those the
+	 * bots may place lit, a click or a drag over them turning them on or off as the first one turned;
+	 * the search by name over them, the first row shown, the drag's way (null with no drag).
+	 */
+	private boolean placeView;
+	private TextFieldWidget placeSearch;
+	private int placeScroll;
+	private Boolean placeDrag;
+	private static final int PLACE_COLUMNS = 9;
+	private static final int PLACE_TOP = 22;
+	private static final int PLACE_DENIED = 0xFF7A3434;
+	private static final int PLACE_OFF = 0xA0000000;
 
 	/** Each bot's wait sent, its slots lit until it ends: kept between openings. */
 	private static final Map<String, Sent> sent = new HashMap<String, Sent>();
@@ -319,6 +339,10 @@ public class BotScreen extends HandledScreen {
 		jobName = new TextFieldWidget(4, textRenderer, 0, 0, JOB_WIDTH - 2 * ARROW_WIDTH - 6, HEADER_HEIGHT - 2);
 		jobName.setMaxLength(48);
 		jobName.setText(MapMcBotClient.job().getSelected().getName());
+		final String searchText = placeSearch == null ? "" : placeSearch.getText();
+		placeSearch = new TextFieldWidget(5, textRenderer, 0, 0, 120, 14);
+		placeSearch.setMaxLength(48);
+		placeSearch.setText(searchText);
 
 		final List<String> names = names();
 
@@ -331,6 +355,16 @@ public class BotScreen extends HandledScreen {
 
 	/** The button's command for the selected bot. */
 	private void launch(int index) {
+		final boolean places = ACTIONS[index][0].equals("Place blocks");
+		// Any other button is the inventory's: back to it.
+		placeView = places && !placeView;
+		placeSearch.setFocused(placeView);
+
+		if (places) {
+			resetPick();
+			return;
+		}
+
 		if (ACTIONS[index][1] == null) {
 			final String label = ACTIONS[index][0];
 			final Pick start = label.equals("Move") ? Pick.MOVE_FROM : label.equals("ItemFill") ? Pick.FILL_ITEM : label.equals("Hotbar") ? Pick.HOTBAR : label.equals("Grab") ? Pick.GRAB_ITEM : label.equals("Deposit") ? Pick.DEPOSIT_ITEM : label.equals("Index") ? Pick.INDEX : label.equals("Drop") ? Pick.DROP : label.equals("Shift move") ? Pick.SHIFT : Pick.WAIT;
@@ -529,10 +563,15 @@ public class BotScreen extends HandledScreen {
 		refreshWindow(bots.getWindow(selected));
 		place();
 		textRenderer.drawWithShadow(selected + (held < 0 ? "  (waiting for its inventory)" : ""), x, y - 11, TEXT);
-		super.render(mouseX, mouseY, tickDelta);
-		renderTooltip(mouseX, mouseY);
-		if (shownWindow != null && !shownWindow.getTrades().isEmpty()) {
-			drawTrade(shownWindow, mouseX, mouseY);
+
+		if (placeView) {
+			drawPlaceView(mouseX, mouseY);
+		} else {
+			super.render(mouseX, mouseY, tickDelta);
+			renderTooltip(mouseX, mouseY);
+			if (shownWindow != null && !shownWindow.getTrades().isEmpty()) {
+				drawTrade(shownWindow, mouseX, mouseY);
+			}
 		}
 
 		final int top = y + backgroundHeight + 6;
@@ -866,8 +905,17 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
-		// Over the job's steps they scroll; anywhere else the wheel goes to the bot above or under the selected one.
-		if (Mouse.getEventX() * width / client.width >= jobLeft() - 4) {
+		// Over Place blocks' blocks they scroll (clamped by the next frame's draw); over the job's steps
+		// they do; anywhere else the wheel goes to the bot above or under the selected one.
+		final int wheelX = Mouse.getEventX() * width / client.width;
+		final int wheelY = height - Mouse.getEventY() * height / client.height - 1;
+
+		if (placeView && wheelX >= x && wheelX < x + backgroundWidth && wheelY >= y && wheelY < y + backgroundHeight) {
+			placeScroll += wheel > 0 ? -1 : 1;
+			return;
+		}
+
+		if (wheelX >= jobLeft() - 4) {
 			// Clamped by the next frame's draw.
 			jobScroll += wheel > 0 ? -1 : 1;
 			return;
@@ -1128,6 +1176,121 @@ public class BotScreen extends HandledScreen {
 		if (hovered != null) {
 			renderTooltip(hovered, mouseX, mouseY);
 		}
+	}
+
+	/** The blocks Place blocks shows: the catalog's whose name or key has the search in it. */
+	private List<ItemStack> placeShown() {
+		final String search = placeSearch.getText().trim().toLowerCase();
+		final List<ItemStack> shown = new ArrayList<ItemStack>();
+
+		for (ItemStack stack : PlaceCatalog.stacks()) {
+			if (search.isEmpty() || stack.getItem().getDisplayName(stack).toLowerCase().contains(search) || PlaceCatalog.key(stack).contains(search)) {
+				shown.add(stack);
+			}
+		}
+
+		return shown;
+	}
+
+	/** The rows of blocks Place blocks has room for, under its search. */
+	private int placeRows() {
+		return (backgroundHeight - PLACE_TOP - 4) / 18;
+	}
+
+	/** The first row shown, kept within the blocks shown. */
+	private int placeScroll(int count) {
+		placeScroll = Math.max(0, Math.min(placeScroll, (count + PLACE_COLUMNS - 1) / PLACE_COLUMNS - placeRows()));
+		return placeScroll;
+	}
+
+	/** The block of those shown under the point, -1 for none. */
+	private int placeCellAt(List<ItemStack> shown, int mouseX, int mouseY) {
+		if (mouseX < x + 7 || mouseX >= x + 7 + PLACE_COLUMNS * 18 || mouseY < y + PLACE_TOP || mouseY >= y + PLACE_TOP + placeRows() * 18) {
+			return -1;
+		}
+
+		final int index = (placeScroll(shown.size()) + (mouseY - y - PLACE_TOP) / 18) * PLACE_COLUMNS + (mouseX - x - 7) / 18;
+		return index < shown.size() ? index : -1;
+	}
+
+	/** Every block as the creative search shows them, the ones taken off red and dark, how many on beside the search. */
+	private void drawPlaceView(int mouseX, int mouseY) {
+		final PlaceBlocks blocks = bots.getPlaceBlocks();
+		final List<ItemStack> shown = placeShown();
+		final int scroll = placeScroll(shown.size());
+		fill(x, y, x + backgroundWidth, y + backgroundHeight, CHEST_BACKGROUND);
+		placeSearch.x = x + 7;
+		placeSearch.y = y + 4;
+		placeSearch.render();
+		final int on = blocks.allowed(selected).size();
+		textRenderer.draw(on + "/" + blocks.getCatalog().size(), x + 7 + 124, y + 7, 0x404040);
+		final int hovered = placeCellAt(shown, mouseX, mouseY);
+
+		for (int row = 0; row < placeRows(); row++) {
+			for (int column = 0; column < PLACE_COLUMNS; column++) {
+				final int index = (scroll + row) * PLACE_COLUMNS + column;
+				final int cellX = x + 8 + column * 18;
+				final int cellY = y + PLACE_TOP + 1 + row * 18;
+				fill(cellX - 1, cellY - 1, cellX + 17, cellY + 17, 0xFF373737);
+
+				if (index >= shown.size()) {
+					fill(cellX, cellY, cellX + 16, cellY + 16, 0xFF8B8B8B);
+					continue;
+				}
+
+				final ItemStack stack = shown.get(index);
+				final boolean allowed = blocks.isAllowed(PlaceCatalog.key(stack));
+				fill(cellX, cellY, cellX + 16, cellY + 16, allowed ? 0xFF8B8B8B : PLACE_DENIED);
+				drawItem(stack, cellX, cellY);
+				GlStateManager.disableLighting();
+				GlStateManager.disableDepthTest();
+
+				if (!allowed) {
+					fill(cellX, cellY, cellX + 16, cellY + 16, PLACE_OFF);
+				}
+
+				if (index == hovered) {
+					fill(cellX, cellY, cellX + 16, cellY + 16, 0x80FFFFFF);
+				}
+
+				GlStateManager.enableDepthTest();
+			}
+		}
+
+		// Where the rows shown are among them all.
+		final int rows = (shown.size() + PLACE_COLUMNS - 1) / PLACE_COLUMNS;
+
+		if (rows > placeRows()) {
+			final int trackTop = y + PLACE_TOP;
+			final int trackHeight = placeRows() * 18;
+			final int thumbHeight = Math.max(8, trackHeight * placeRows() / rows);
+			final int thumbTop = trackTop + (trackHeight - thumbHeight) * scroll / (rows - placeRows());
+			fill(x + 170, trackTop, x + 173, trackTop + trackHeight, 0xFF8B8B8B);
+			fill(x + 170, thumbTop, x + 173, thumbTop + thumbHeight, 0xFF373737);
+		}
+
+		if (hovered >= 0) {
+			renderTooltip(shown.get(hovered), mouseX, mouseY);
+		}
+	}
+
+	/** The block under the point turned the drag's way, the first one deciding it (the other way from how it was). */
+	private void placeDragOver(int mouseX, int mouseY) {
+		final List<ItemStack> shown = placeShown();
+		final int cell = placeCellAt(shown, mouseX, mouseY);
+
+		if (cell < 0) {
+			return;
+		}
+
+		final PlaceBlocks blocks = bots.getPlaceBlocks();
+		final String key = PlaceCatalog.key(shown.get(cell));
+
+		if (placeDrag == null) {
+			placeDrag = !blocks.isAllowed(key);
+		}
+
+		blocks.setAllowed(key, placeDrag);
 	}
 
 	/** The wait's match button where its row puts it, off with no item to match; it shows its match in the panel. */
@@ -1476,6 +1639,7 @@ public class BotScreen extends HandledScreen {
 		super.tick();
 		tradeField.tick();
 		jobName.tick();
+		placeSearch.tick();
 
 		for (Wait wait : waits) {
 			wait.min.tick();
@@ -2064,6 +2228,17 @@ public class BotScreen extends HandledScreen {
 				}
 			}
 
+			// Place blocks takes the clicks the inventory would.
+			if (placeView) {
+				placeSearch.method_920(mouseX, mouseY, button);
+
+				if (button == 0) {
+					placeDragOver(mouseX, mouseY);
+				}
+
+				return;
+			}
+
 			if (pick == Pick.NONE) {
 				super.mouseClicked(mouseX, mouseY, button);
 				return;
@@ -2184,6 +2359,11 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
+		if (placeDrag != null) {
+			placeDragOver(mouseX, mouseY);
+			return;
+		}
+
 		if (fillDrag != null) {
 			final Slot over = slotAt(mouseX, mouseY);
 
@@ -2194,7 +2374,7 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
-		if (selected != null && pick == Pick.NONE) {
+		if (selected != null && pick == Pick.NONE && !placeView) {
 			super.mouseDragged(mouseX, mouseY, button, held);
 		}
 	}
@@ -2202,6 +2382,7 @@ public class BotScreen extends HandledScreen {
 	@Override
 	protected void mouseReleased(int mouseX, int mouseY, int button) {
 		fillDrag = null;
+		placeDrag = null;
 
 		if (dragStep >= 0) {
 			final JobStore.Job shown = MapMcBotClient.job().getSelected();
@@ -2215,7 +2396,7 @@ public class BotScreen extends HandledScreen {
 			return;
 		}
 
-		if (selected != null && pick == Pick.NONE) {
+		if (selected != null && pick == Pick.NONE && !placeView) {
 			super.mouseReleased(mouseX, mouseY, button);
 		}
 	}
@@ -2246,6 +2427,13 @@ public class BotScreen extends HandledScreen {
 					tradeField.keyPressed(character, keyCode);
 				}
 
+				return;
+			}
+
+			// The search as it is typed, from its first row.
+			if (placeView && placeSearch.isFocused()) {
+				placeSearch.keyPressed(character, keyCode);
+				placeScroll = 0;
 				return;
 			}
 

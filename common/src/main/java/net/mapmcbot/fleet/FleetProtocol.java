@@ -188,6 +188,16 @@ public final class FleetProtocol {
 	public static final int SHIFT_MOVE = 45;
 	/** bot name. */
 	public static final int STOP = 46;
+	/** bot name, i32 x, y, z, i32 radius (the most the walk to a spot it is seen from costs), optional deadline, optional turn speed. */
+	public static final int BREAK_WSR = 47;
+	/** bot name, i32 x, y, z, i32 radius (as BREAK_WSR's), optional state string, optional deadline, optional turn speed. */
+	public static final int PLACE_WSR = 48;
+	/** bot name, i32 count and each block it may place, as PlaceBlocks keys it (name@metadata). */
+	public static final int ALLOWED_PLACE = 49;
+	/** bot name, as BREAK_WSR's with i32 x, y, z of the spot it ends standing in after the radius. */
+	public static final int BREAK_WSRP = 50;
+	/** bot name, as PLACE_WSR's with i32 x, y, z of the spot it ends standing in after the radius. */
+	public static final int PLACE_WSRP = 51;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -241,6 +251,11 @@ public final class FleetProtocol {
 			case DROP: return "DROP";
 			case SHIFT_MOVE: return "SHIFT_MOVE";
 			case STOP: return "STOP";
+			case BREAK_WSR: return "BREAK_WSR";
+			case PLACE_WSR: return "PLACE_WSR";
+			case ALLOWED_PLACE: return "ALLOWED_PLACE";
+			case BREAK_WSRP: return "BREAK_WSRP";
+			case PLACE_WSRP: return "PLACE_WSRP";
 			default: throw new IllegalArgumentException("unknown frame type " + type);
 		}
 	}
@@ -713,6 +728,23 @@ public final class FleetProtocol {
 		return frame.bytes();
 	}
 
+	public static byte[] allowedPlace(String bot, List<String> blocks) {
+		final Frame frame = new Frame(ALLOWED_PLACE);
+
+		try {
+			writeString(frame.out, bot);
+			frame.out.writeInt(blocks.size());
+
+			for (String block : blocks) {
+				writeString(frame.out, block);
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
 	/**
 	 * The primitive as the frame of its type: json is the object the fleet's actions.js runs, its name
 	 * in "action" and its fields beside it.
@@ -781,8 +813,32 @@ public final class FleetProtocol {
 					writeTurnSpeed(out, a);
 					break;
 
-				case "place":
+				case "break_wsr":
+				case "break_wsrp":
 					writePos(out, field(a, "target").getAsJsonObject());
+					out.writeInt(field(a, "radius").getAsInt());
+
+					if (name.equals("break_wsrp")) {
+						writePos(out, field(a, "end").getAsJsonObject());
+					}
+
+					writeDeadline(out, a);
+					writeTurnSpeed(out, a);
+					break;
+
+				case "place":
+				case "place_wsr":
+				case "place_wsrp":
+					writePos(out, field(a, "target").getAsJsonObject());
+
+					if (!name.equals("place")) {
+						out.writeInt(field(a, "radius").getAsInt());
+					}
+
+					if (name.equals("place_wsrp")) {
+						writePos(out, field(a, "end").getAsJsonObject());
+					}
+
 					out.writeBoolean(a.has("state"));
 
 					if (a.has("state")) {
@@ -912,6 +968,14 @@ public final class FleetProtocol {
 				return SHIFT_MOVE;
 			case "stop":
 				return STOP;
+			case "break_wsr":
+				return BREAK_WSR;
+			case "place_wsr":
+				return PLACE_WSR;
+			case "break_wsrp":
+				return BREAK_WSRP;
+			case "place_wsrp":
+				return PLACE_WSRP;
 			default:
 				throw new IllegalArgumentException("no primitive named " + name + " for the fleet");
 		}

@@ -122,6 +122,9 @@ parentPort.on('message', message => {
     case 'trade':
       bot.selectTrade(message.trade)
       break
+    case 'allowed_place':
+      bot.setAllowedPlace(message.blocks)
+      break
     default:
       throw new Error(`unknown order ${message.type} for the pool thread`)
   }
