@@ -13,6 +13,9 @@ public interface BotListener {
 	/** Not walking a path any more. */
 	void onPathCleared(String bot);
 
+	/** What its wsr primitive shows now (see BotVis), null once there is nothing to show. */
+	void onVis(String bot, BotVis vis);
+
 	/** Its inventory window changed: the whole of it now. */
 	void onInventory(String bot, BotInventory inventory);
 

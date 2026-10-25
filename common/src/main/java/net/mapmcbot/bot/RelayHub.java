@@ -261,6 +261,10 @@ public final class RelayHub {
 		relay(rid).send(FleetProtocol.allowedPlace(bot, blocks));
 	}
 
+	public void clearQ(int rid, String bot) {
+		relay(rid).send(FleetProtocol.clearQ(bot));
+	}
+
 	public void action(int rid, String bot, String json) {
 		relay(rid).send(FleetProtocol.primitive(bot, json));
 	}

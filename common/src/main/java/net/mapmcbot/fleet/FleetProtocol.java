@@ -20,6 +20,7 @@ import com.google.gson.JsonParser;
 
 import net.mapmcbot.bot.BotInventory;
 import net.mapmcbot.bot.BotStatus;
+import net.mapmcbot.bot.BotVis;
 import net.mapmcbot.bot.BotWindow;
 import net.mapmcbot.bot.BotListener;
 import net.mapmcbot.chunk.ChunkData;
@@ -118,6 +119,17 @@ public final class FleetProtocol {
 	public static final int COLUMN_GONE = 32;
 	/** bot name (empty), the text: what a relay wrote to its output, a chunk of lines. Only relays send it, once served; {@link #relayText} reads it. */
 	public static final int LOG = 33;
+	/**
+	 * bot name, u8 present; when present u8 kind (0 break, 1 place), i32 target x, y, z, the phase
+	 * string, the failure's bytes (none for none), u8 aimed and then f64 eyes x, y, z, f64 point x, y,
+	 * z, f64 ray x, y, z, f64 box min x, y, z, max x, y, z, i32 block x, y, z, u8 face (see {@link BotVis#FACES}), u8 missed; u8 spot and then i32 x, y,
+	 * z, u8 feet and then f64 x, y, z, u8 crouch; u8 end and i32 x, y, z; u8 partial and i32 x, y, z;
+	 * i32 count and each walk block i32 x, y, z; the same for the run; u8 takeover and i32 x, y, z:
+	 * what a wsr primitive shows now (see {@link BotVis}); not present once there is nothing to show.
+	 */
+	public static final int VIS = 54;
+	/** bot name: the primitive it runs ended and the ones it holds dropped, nothing published (see actions.js run). */
+	public static final int CLEAR_Q = 55;
 
 	// Mod to fleet.
 	/** bot name (the claim's), i32 slot: the mod is done with the unloaded column's slot. */
@@ -233,6 +245,8 @@ public final class FleetProtocol {
 			case CHEST: return "CHEST";
 			case COLUMN_GONE: return "COLUMN_GONE";
 			case LOG: return "LOG";
+			case VIS: return "VIS";
+			case CLEAR_Q: return "CLEAR_Q";
 			case RELEASE: return "RELEASE";
 			case LOADED: return "LOADED";
 			case SPAWN: return "SPAWN";
@@ -274,7 +288,7 @@ public final class FleetProtocol {
 		switch (type) {
 			case CLAIM: case READY: case CHANGED: case BLOCK_ENTITY_UPDATE: case UNLOAD: case LOAD: case LOADED: case RELEASE:
 			case CHEST: case CHEST_LID: case COLUMN_GONE: case INVENTORY: case WINDOW: case PATH: case STATE:
-			case PROFILE: case PROFILE_REQUEST: case LOG:
+			case PROFILE: case PROFILE_REQUEST: case LOG: case VIS:
 				return true;
 			default:
 				return false;
@@ -462,6 +476,18 @@ public final class FleetProtocol {
 					bots.onPath(bot, path);
 					break;
 
+				case VIS:
+					if (!in.readBoolean()) {
+						end(in, type);
+						bots.onVis(bot, null);
+						break;
+					}
+
+					final BotVis vis = readVis(in);
+					end(in, type);
+					bots.onVis(bot, vis);
+					break;
+
 				case BOT_SPAWNED:
 					end(in, type);
 					bots.onSpawned(bot);
@@ -608,6 +634,74 @@ public final class FleetProtocol {
 		}
 
 		return new BotInventory.Item(readString(in), in.readInt(), in.readInt(), readBytes(in));
+	}
+
+	/** A present VIS's, past its u8 present. */
+	private static BotVis readVis(DataInput in) throws IOException {
+		final boolean place = in.readBoolean();
+		final int[] target = readBlock(in);
+		final String phase = readString(in);
+		final String failure = new String(readBytes(in), StandardCharsets.UTF_8);
+		final boolean aimed = in.readBoolean();
+		final double[] eyes = aimed ? readPoint(in) : null;
+		final double[] aimPoint = aimed ? readPoint(in) : null;
+		final double[] aimRay = aimed ? readPoint(in) : null;
+		double[] aimBox = null;
+
+		if (aimed) {
+			final double[] min = readPoint(in);
+			final double[] max = readPoint(in);
+			aimBox = new double[] {min[0], min[1], min[2], max[0], max[1], max[2]};
+		}
+
+		final int[] aimBlock = aimed ? readBlock(in) : null;
+		int[] aimFace = null;
+
+		if (aimed) {
+			final int face = in.readUnsignedByte();
+
+			if (face >= BotVis.FACES.length) {
+				throw new IOException("bad face " + face + " in a VIS");
+			}
+
+			aimFace = BotVis.FACES[face];
+		}
+
+		final boolean missed = aimed && in.readBoolean();
+		final int[] spot = in.readBoolean() ? readBlock(in) : null;
+		final boolean stands = spot != null && in.readBoolean();
+		final double[] feet = stands ? readPoint(in) : null;
+		final boolean crouch = stands && in.readBoolean();
+		final int[] end = in.readBoolean() ? readBlock(in) : null;
+		final int[] partial = in.readBoolean() ? readBlock(in) : null;
+		final int[][] walk = readBlocks(in);
+		final int[][] run = readBlocks(in);
+		final int[] takeover = in.readBoolean() ? readBlock(in) : null;
+		return new BotVis(place, target, phase, failure, eyes, aimPoint, aimRay, aimBox, aimBlock, aimFace, missed, spot, feet, crouch, end, partial, walk, run, takeover);
+	}
+
+	private static int[] readBlock(DataInput in) throws IOException {
+		return new int[] {in.readInt(), in.readInt(), in.readInt()};
+	}
+
+	private static double[] readPoint(DataInput in) throws IOException {
+		return new double[] {in.readDouble(), in.readDouble(), in.readDouble()};
+	}
+
+	private static int[][] readBlocks(DataInput in) throws IOException {
+		final int count = in.readInt();
+
+		if (count < 0) {
+			throw new IOException("bad block count " + count);
+		}
+
+		final int[][] blocks = new int[count][];
+
+		for (int i = 0; i < count; i++) {
+			blocks[i] = readBlock(in);
+		}
+
+		return blocks;
 	}
 
 	/** {target x, y, z, node x, y, z, ...}. */
@@ -1137,6 +1231,18 @@ public final class FleetProtocol {
 			frame.out.writeInt(x);
 			frame.out.writeInt(y);
 			frame.out.writeInt(z);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return frame.bytes();
+	}
+
+	public static byte[] clearQ(String bot) {
+		final Frame frame = new Frame(CLEAR_Q);
+
+		try {
+			writeString(frame.out, bot);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

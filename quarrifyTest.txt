@@ -1,0 +1,58 @@
+Prueba de Quarrify en dev (runClient + AutoStart, solo debug).
+
+Cómo corre:
+- `./gradlew -p versions/1.12.2 runClient`, en background. AutoStart (versions/1.12.2/src/debug) hace todo solo:
+  abre el mundo y LAN, conecta los bots de bot_profiles.tsv y, cuando todos mandaron su primer inventario,
+  arma el área del test, los tepea arriba, les limpia el inventario, mata los items del suelo y les da el kit:
+  el pico (unbreaking 200) y 64 de cobblestone (para los primeros escalones, soportes, rellenos
+  y puentes, antes de picar nada), y los cura y sacia (el server guarda la vida de la corrida anterior).
+  Cuando terminó ese setUp y cada uno mandó su inventario con el kit solo, larga `#quarrify <test>`.
+  No hay que mandar nada a mano.
+- El test es el área nombrada en run/mapmcbot/debug/qtest (una línea: qtest, qtest1 o qtest2); sin el
+  archivo, qtest. Las tres áreas están en el AreaStore del mundo (sp-New_World/overworld/areas.tsv).
+- qtest: x 58..90, y 58..100, z -24..-9. Es una torre que sobresale unos 30 bloques del terreno: salir del
+  área por el borde es una caída mortal. Se llena de piedra con cajas de MIX (tierra, grava, arena, menas,
+  granito/diorita/andesita, obsidiana, arcilla...) al azar, con semilla fija: el mismo contenido cada corrida.
+- qtest1 (líquidos): x 58..77, y 51..68, z 5..20. Piedra con bolsones sellados de agua y lava (LIQUIDS):
+  uno que cruza el piso de una capa, uno arriba de todo abierto al aire, una columna de 6, uno en el fondo.
+- qtest2 (islas): x 58..81, y 57..68, z 30..53. Aire con torres de tres alturas, una losa y un bloque
+  flotando y un pilar de 1 (ISLANDS): las esquinas (escaleras) en el aire. Los bots arrancan en la esquina
+  de la placa, no arriba del área (que es aire).
+- qtest1 y qtest2 se arman sobre una placa de piedra que sobresale 3 alrededor y por debajo, con 8 de
+  aire arriba: quedan al ras del suelo (y 68), sin caídas por el borde salvo adentro de qtest2 (12).
+
+Cómo saber cómo terminó (versions/1.12.2/run/logs/latest.log):
+- `quarrify: BOT dug out <test>`: ese bot terminó. No hay señal de "terminaron todos": es una línea por bot
+  (16 con los perfiles de ahora).
+- `quarrify_err: ...`: falló. El cliente se cierra solo y deja el crash en run/crash-reports/.
+- `BOT fell from a high place` (o cualquier mensaje de muerte): un bot murió; después sale como
+  `canceled by death`.
+- Filtro para Monitor: `quarrify_err|dug out|Stopping!|fell from`. No filtrar por "Exception": el arranque
+  siempre loguea `ClassNotFoundException: net/minecraft/class_2164$1` (Mixin) y el error de Realms, que son
+  inofensivos.
+- Progreso: las líneas `[quarrify trace]` (una por prim que manda el mod). La y del `end` de los break_wsrpa
+  es la capa activa. También: `bridge: ...` (por qué hay o no puente en qtest2) y `... : picking again` (una
+  prim que falló porque el mundo cambió en el medio, arena/grava o un bot en el spot, y se vuelve a elegir).
+- Duraciones de referencia (16 bots): qtest ~15 min, qtest1 ~5 min, qtest2 ~4 min.
+
+Al terminar bien el cliente NO se cierra: matarlo antes de relanzar, con `pkill -f '[d]evlaunchinjector'`
+(el corchete evita que pkill mate al shell que lo corre), y esperar a que salga (guarda el mundo).
+
+Diagnóstico:
+- El crash report; run/mapmcbot/bot/fleet.log (se pisa en cada corrida); fleet-relay*.log si hay relays.
+- DebugBridge no tiene cliente en el repo: `nc localhost $(cat versions/1.12.2/run/mapmcbot/debug/port)`,
+  una línea por comando y una de respuesta: `status BOT`, `pos BOT`, `inv BOT`, `blocks x1 y1 z1 x2 y2 z2`,
+  `cstate BOT x y z`, `area NAME x1 y1 z1 x2 y2 z2`, `#comando`, `/comando del server`.
+- Los logs de corridas anteriores: run/logs/*.log.gz (latest.log se rota en cada arranque).
+
+Lo que trababa el arranque (arreglado, por si vuelve):
+- AutoStart espera el pico solo en cada inventario: un item de más (drops de la corrida anterior) lo frena.
+  Por eso mata los items después del fill.
+- El nombre del item viene completo (`minecraft:diamond_pickaxe`).
+- Los listeners de inventario son una lista (BotRegistry.addInventoryListener): abrir el BotScreen ya no
+  pisa el de AutoStart.
+
+Al terminar bien el área queda vacía salvo los escalones de las 4 escaleras (uno por altura cada una;
+en qtest 4 x 43 = 172), que quedan a propósito.
+
+Errores encontrados en las corridas: quarrifyErrors.txt.

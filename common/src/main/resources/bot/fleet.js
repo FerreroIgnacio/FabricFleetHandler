@@ -499,6 +499,9 @@ function onFrame (frame) {
     case protocol.TYPES.TRADE_SELECT:
       bots.get(message.bot)?.worker.postMessage({ type: 'trade', bot: message.bot, trade: message.trade })
       break
+    case protocol.TYPES.CLEAR_Q:
+      bots.get(message.bot)?.worker.postMessage({ type: 'clear_q', bot: message.bot })
+      break
     case protocol.TYPES.ALLOWED_PLACE:
       bots.get(message.bot)?.worker.postMessage({ type: 'allowed_place', bot: message.bot, blocks: message.blocks })
       break

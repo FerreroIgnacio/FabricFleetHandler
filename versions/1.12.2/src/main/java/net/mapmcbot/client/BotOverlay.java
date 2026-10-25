@@ -21,6 +21,7 @@ public final class BotOverlay {
 	private static final int CARD_PADDING = 3;
 	private static final int CARD_BACKGROUND = 0xA0101216;
 	private static final int DIM = 0xFF8A919C;
+	private static final int HIGHLIGHT_ALPHA = 0x80;
 
 	/** Where a fleet's own rows are in its report: the mod's own fleet (rid 0) and each relay (rid 1, 2, ...) are profiled the same way. */
 	private static final String MAIN_SCOPE = "node";
@@ -40,11 +41,19 @@ public final class BotOverlay {
 		final List<String> names = new ArrayList<String>(bots.getBots());
 		Collections.sort(names);
 
+		final String selected = AreaRenderer.selected();
 		int y = MARGIN;
 
 		for (String name : names) {
 			final String line = client.textRenderer.trimToWidth(name + " " + bots.getStatus(name), window.getWidth() / 2);
-			client.textRenderer.drawWithShadow(line, window.getWidth() - MARGIN - client.textRenderer.getStringWidth(line), y, 0xFFFFFF);
+			final int x = window.getWidth() - MARGIN - client.textRenderer.getStringWidth(line);
+
+			// The bot of the render mode (see AreaRenderer.nextMode), on its colour.
+			if (name.equals(selected)) {
+				DrawableHelper.fill(x - 2, y - 1, window.getWidth() - MARGIN + 2, y + client.textRenderer.fontHeight + 1, HIGHLIGHT_ALPHA << 24 | MapMcBotClient.colorOf(name).getRgb());
+			}
+
+			client.textRenderer.drawWithShadow(line, x, y, 0xFFFFFF);
 			y += client.textRenderer.fontHeight + 2;
 		}
 

@@ -59,7 +59,7 @@ import net.mapmcbot.profile.ProfileReport;
 public final class BotManager implements FleetChannel {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "profiler.js", "protocol.js", "states.js", "relaySupervisor.js", "columnSerializer.js", "package.json", "package-lock.json"};
+	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "look.js", "profiler.js", "protocol.js", "states.js", "relaySupervisor.js", "columnSerializer.js", "package.json", "package-lock.json"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 
@@ -228,6 +228,11 @@ public final class BotManager implements FleetChannel {
 	@Override
 	public void allowedPlace(String bot, List<String> blocks) {
 		send(FleetProtocol.allowedPlace(bot, blocks));
+	}
+
+	@Override
+	public void clearQ(String bot) {
+		send(FleetProtocol.clearQ(bot));
 	}
 
 	@Override

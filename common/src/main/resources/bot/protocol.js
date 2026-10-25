@@ -26,6 +26,8 @@ const TYPES = {
   CHEST: 31,
   COLUMN_GONE: 32,
   LOG: 33,
+  VIS: 54,
+  CLEAR_Q: 55,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
@@ -325,6 +327,65 @@ function path (bot, target, nodes) {
   return w.frame()
 }
 
+// What a wsr primitive shows (see actions.js show), null to clear it: { kind (break | place), target,
+// phase, failure ('' for none), aim: { eyes, point, ray (the point it misses off), box ([min, max] on the face: as far as it misses each side), block, face (FACES' index), missed }, spot: { block,
+// feet, crouch }, end, partial, walk: [block], run: [block], takeover }; aim, spot (its feet), end,
+// partial and takeover null when not there.
+function vis (bot, v) {
+  const w = new Writer(TYPES.VIS)
+  w.str(bot)
+  w.u8(v ? 1 : 0)
+  if (!v) return w.frame()
+  const block = b => {
+    w.i32(Math.floor(b.x))
+    w.i32(Math.floor(b.y))
+    w.i32(Math.floor(b.z))
+  }
+  const point = p => {
+    w.f64(p.x)
+    w.f64(p.y)
+    w.f64(p.z)
+  }
+  const optional = b => {
+    w.u8(b ? 1 : 0)
+    if (b) block(b)
+  }
+  const blocks = list => {
+    w.i32(list.length)
+    list.forEach(block)
+  }
+  w.u8(v.kind === 'break' ? 0 : 1)
+  block(v.target)
+  w.str(v.phase)
+  w.bytes(Buffer.from(v.failure, 'utf8'))
+  w.u8(v.aim ? 1 : 0)
+  if (v.aim) {
+    point(v.aim.eyes)
+    point(v.aim.point)
+    point(v.aim.ray)
+    point(v.aim.box[0])
+    point(v.aim.box[1])
+    block(v.aim.block)
+    w.u8(v.aim.face)
+    w.u8(v.aim.missed ? 1 : 0)
+  }
+  w.u8(v.spot ? 1 : 0)
+  if (v.spot) {
+    block(v.spot.block)
+    w.u8(v.spot.feet ? 1 : 0)
+    if (v.spot.feet) {
+      point(v.spot.feet)
+      w.u8(v.spot.crouch ? 1 : 0)
+    }
+  }
+  optional(v.end)
+  optional(v.partial)
+  blocks(v.walk)
+  blocks(v.run)
+  optional(v.takeover)
+  return w.frame()
+}
+
 // The bot's inventory, as its own window holds it: `held` the hotbar slot in its hand (0-8),
 // `lastClick` the id of the mod's last click done (0 before any), the item on its cursor and every
 // slot by window id (46 from 1.9, 45 before). An item is u8 present,
@@ -517,6 +578,7 @@ function decode (frame) {
       message = { type, bot: r.str(), host: r.str(), port: r.i32() }
       break
     case TYPES.QUIT:
+    case TYPES.CLEAR_Q:
       message = { type, bot: r.str() }
       break
     case TYPES.PROFILE_REQUEST:
@@ -679,4 +741,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, vis, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }

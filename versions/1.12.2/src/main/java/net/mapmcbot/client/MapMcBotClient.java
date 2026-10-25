@@ -63,6 +63,7 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static KeyBinding areasKey;
 	private static KeyBinding profilerKey;
 	private static KeyBinding botsKey;
+	private static KeyBinding renderKey;
 
 	private static AreaStore areas;
 	private static String areasWorldId;
@@ -83,6 +84,7 @@ public class MapMcBotClient implements ClientModInitializer {
 		areasKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.areas", Keyboard.KEY_V, CATEGORY));
 		profilerKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.profiler", Keyboard.KEY_Z, CATEGORY));
 		botsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.bots", Keyboard.KEY_B, CATEGORY));
+		renderKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.mapmcbot.render", Keyboard.KEY_BACK, CATEGORY));
 		ClientTickEvents.END_CLIENT_TICK.register(MapMcBotClient::tick);
 	}
 
@@ -133,6 +135,10 @@ public class MapMcBotClient implements ClientModInitializer {
 			client.setScreen(new BotScreen());
 		}
 
+		while (renderKey.wasPressed()) {
+			AreaRenderer.nextMode();
+		}
+
 		AreaPick.tick(client);
 		glowBots(client);
 	}
@@ -142,13 +148,14 @@ public class MapMcBotClient implements ClientModInitializer {
 		return botsKey.getCode();
 	}
 
-	/** Every bot glows through walls, coloured by the scoreboard team it is put on. */
+	/** Every bot glows through walls, coloured by the scoreboard team it is put on; in a bot's render mode that one alone. */
 	private static void glowBots(MinecraftClient client) {
 		if (bots == null || bots.getBots().isEmpty()) {
 			return;
 		}
 
 		final Scoreboard scoreboard = client.world.getScoreboard();
+		final String selected = AreaRenderer.selected();
 
 		for (PlayerEntity player : client.world.playerEntities) {
 			final String name = player.getEntityName();
@@ -170,7 +177,7 @@ public class MapMcBotClient implements ClientModInitializer {
 				scoreboard.addPlayerToTeam(name, teamName);
 			}
 
-			player.setGlowing(true);
+			player.setGlowing(selected == null || selected.equals(name));
 		}
 	}
 

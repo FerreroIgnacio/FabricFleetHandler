@@ -44,6 +44,9 @@ public interface FleetChannel {
 	/** The bot walks to stand at x, y, z. */
 	void gotoSpot(String bot, int x, int y, int z);
 
+	/** The bot's primitives dropped, the running one and the ones it holds (see FleetProtocol#CLEAR_Q). */
+	void clearQ(String bot);
+
 	/** A primitive for the bot, as JSON (see FleetProtocol#primitive). */
 	void action(String bot, String json);
 

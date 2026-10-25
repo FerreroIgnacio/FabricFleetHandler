@@ -46,6 +46,9 @@ public final class BotRegistry implements BotListener {
 	/** The path each walking bot is on, from its PATH frames. */
 	private final Map<String, int[]> paths = new ConcurrentHashMap<String, int[]>();
 
+	/** What each bot's wsr primitive shows, from its VIS frames. */
+	private final Map<String, BotVis> visuals = new ConcurrentHashMap<String, BotVis>();
+
 	/** What each bot is doing, from its STATE frames. */
 	private final Map<String, BotStatus> statuses = new ConcurrentHashMap<String, BotStatus>();
 
@@ -215,6 +218,15 @@ public final class BotRegistry implements BotListener {
 			throw new IllegalStateException(bot + " is not in the world yet to order " + json);
 		}
 
+		// One from the UI does not chain: what the bot runs or holds goes first.
+		if (!internal) {
+			if (rid == 0) {
+				channel.clearQ(bot);
+			} else {
+				relays.clearQ(rid, bot);
+			}
+		}
+
 		if (rid == 0) {
 			channel.action(bot, json);
 		} else {
@@ -312,6 +324,11 @@ public final class BotRegistry implements BotListener {
 	/** The paths being walked, by bot: {target x, y, z, node x, y, z, ...}. */
 	public Map<String, int[]> getPaths() {
 		return Collections.unmodifiableMap(paths);
+	}
+
+	/** What each bot's wsr primitive shows, by bot. */
+	public Map<String, BotVis> getVisuals() {
+		return Collections.unmodifiableMap(visuals);
 	}
 
 	/**
@@ -480,6 +497,15 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
+	public void onVis(String bot, BotVis vis) {
+		if (vis == null) {
+			visuals.remove(bot);
+		} else {
+			visuals.put(bot, vis);
+		}
+	}
+
+	@Override
 	public void onGone(String bot) {
 		if (bots.remove(bot)) {
 			names.give(bot);
@@ -490,6 +516,7 @@ public final class BotRegistry implements BotListener {
 
 		spawned.remove(bot);
 		paths.remove(bot);
+		visuals.remove(bot);
 		inventories.remove(bot);
 		clicksSent.remove(bot);
 		statuses.remove(bot);
@@ -527,6 +554,7 @@ public final class BotRegistry implements BotListener {
 			serverOf.remove(bot);
 			spawned.remove(bot);
 			paths.remove(bot);
+			visuals.remove(bot);
 			inventories.remove(bot);
 			clicksSent.remove(bot);
 			statuses.remove(bot);
@@ -545,6 +573,7 @@ public final class BotRegistry implements BotListener {
 		serverOf.clear();
 		spawned.clear();
 		paths.clear();
+		visuals.clear();
 		inventories.clear();
 		clicksSent.clear();
 		statuses.clear();

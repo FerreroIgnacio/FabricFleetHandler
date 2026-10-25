@@ -63,6 +63,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     name,
     log,
     publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message, bot.entity?.position)),
+    draw: v => out(protocol.vis(name, v)),
     walk: goal => {
       setSearching(true)
       log(`goto ${spot(goal)} from ${at()}`)
@@ -135,6 +136,12 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   chunks.attach(bot, name, world, tag => reportBlockEntity({ x: tag.value.x.value, y: tag.value.y.value, z: tag.value.z.value }, tag), meter)
 
   bot.loadPlugin(pathfinder)
+  // A dig's end writes no air of its own: mineflayer's finishDigging sets the block to air as it tells
+  // the server, before the server answers, and the column is shared: every bot and the mod would take
+  // that guess for the world, and a break's expect would settle on it. The server's block_change sets
+  // it (blocks.js keeps its own function for its packets; finishDigging is the only caller of this one).
+  // Once the plugins are in, which set it.
+  bot.once('login', () => { bot._updateBlockState = () => {} })
   // Pathfinder's time per tick, in ms, once the pool thread has shared its own out (see poolThread.js).
   let tickTimeout = null
   bot.once('spawn', () => {
@@ -146,6 +153,11 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // No jumps over gaps: one missed, by a quarrify's edge, is a fall of the whole height.
     movements.allowParkour = false
     movements.scafoldingBlocks = []
+    // No walk into a liquid: water lands it in a hole it cannot jump out of (a quarrify's pockets, a
+    // block over one dug), lava kills it. The pathfinder avoids still lava alone.
+    for (const name of ['water', 'flowing_water', 'lava', 'flowing_lava']) {
+      if (bot.registry.blocksByName[name]) movements.blocksToAvoid.add(bot.registry.blocksByName[name].id)
+    }
     bot.pathfinder.setMovements(movements)
     if (tickTimeout !== null) bot.pathfinder.tickTimeout = tickTimeout
     // Never a timeout: pathfinder walks a timed out search's best path and never searches again,
@@ -712,6 +724,11 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     // The blocks it may place, as the mod keys them (see actions.js holdAllowed).
     setAllowedPlace (blocks) {
       act.setAllowedPlace(blocks)
+    },
+
+    // The running primitive ended and the ones held dropped, from the mod (see actions.js).
+    clearQ () {
+      act.clearQ()
     },
 
     // A primitive from the mod (see actions.js).
