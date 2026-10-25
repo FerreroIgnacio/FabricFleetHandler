@@ -2,24 +2,31 @@ package net.mapmcbot.debug;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.mapmcbot.area.Area;
+import net.mapmcbot.bot.BotInventory;
+import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.client.MapMcBotClient;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.world.SelectWorldScreen;
 import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.PlayerManager;
 import net.minecraft.world.GameMode;
 
 /**
  * Debug only, loaded by runClient alone (its own source set, never in the mod's jar): clicks through
  * Singleplayer and the first world as a player would, opens it to LAN in survival as soon as it is
- * up, then adds the bot profiles' bots on the LAN port. Removing it is deleting src/debug and its block in
- * build.gradle.
+ * up, then adds the bot profiles' bots on the LAN port. Once every bot has sent its first inventory, it
+ * fills QUARRY with stone, puts the bots standing on its top (not in it, suffocating), clears their
+ * inventories and gives each the PICK; once each has the pick alone, #quarrify QUARRY. Removing it is
+ * deleting src/debug and its block in build.gradle.
  */
 public class AutoStart implements ClientModInitializer {
 	/** The LAN's player limit, vanilla's 8 being too few for the player and every bot. */
@@ -29,16 +36,26 @@ public class AutoStart implements ClientModInitializer {
 	private static final int SINGLEPLAYER = 1;
 	private static final int PLAY_SELECTED = 1;
 
+	/** The area the bots dig out, filled with stone first. */
+	private static final String QUARRY = "qtest";
+
+	/** What each bot digs it with, alone in its inventory: efficiency (id 32) 5, unbreaking (id 34) 200. */
+	private static final String PICK = "minecraft:diamond_pickaxe 1 0 {ench:[{id:32s,lvl:5s},{id:34s,lvl:200s}]}";
+
 	/** Ticks between two bots joining, and before each click (a screen builds its buttons first). */
 	private static final int BOT_GAP_TICKS = 10;
 	private static final int SETTLE_TICKS = 10;
 
-	private enum Step { TITLE, PICK_WORLD, PLAY, LOADING, BOTS, DONE }
+	/** JOINING and ARMING go on by the bots' inventories (see onInventory), not by ticks. */
+	private enum Step { TITLE, PICK_WORLD, PLAY, LOADING, BOTS, JOINING, ARMING, DONE }
 
 	private Step step = Step.TITLE;
 	private int wait = SETTLE_TICKS;
 	private int nextBot;
 	private int port;
+	private final List<String> fleet = new ArrayList<String>();
+	/** Each bot's inventory as it comes, onto the client thread (see onInventory). */
+	private final BotRegistry.InventoryListener inventoryListener = (bot, inventory) -> MinecraftClient.getInstance().submit(() -> onInventory(MinecraftClient.getInstance()));
 
 	@Override
 	public void onInitializeClient() {
@@ -47,7 +64,7 @@ public class AutoStart implements ClientModInitializer {
 	}
 
 	private void tick(MinecraftClient client) {
-		if (step == Step.DONE || --wait > 0) {
+		if (step.compareTo(Step.JOINING) >= 0 || --wait > 0) {
 			return;
 		}
 
@@ -83,6 +100,7 @@ public class AutoStart implements ClientModInitializer {
 					if (opened != null) {
 						raisePlayerLimit(client.getServer().getPlayerManager());
 						port = Integer.parseInt(opened);
+						MapMcBotClient.bots().addInventoryListener(inventoryListener);
 
 						step = Step.BOTS;
 					}
@@ -90,15 +108,104 @@ public class AutoStart implements ClientModInitializer {
 				break;
 
 			case BOTS:
-				MapMcBotClient.bots().create("localhost", port);
+				fleet.add(MapMcBotClient.bots().create("localhost", port));
 				nextBot++;
 				wait = BOT_GAP_TICKS;
-				step = nextBot < MapMcBotClient.botProfiles().getProfiles().size() ? Step.BOTS : Step.DONE;
+				step = nextBot < MapMcBotClient.botProfiles().getProfiles().size() ? Step.BOTS : Step.JOINING;
 				break;
 
 			default:
 				break;
 		}
+	}
+
+	/**
+	 * A bot's inventory came: once every bot has its first (it comes after its spawn), the set up; once
+	 * each has the pick alone (the inventories after the set up, the bots idle), the quarrify.
+	 */
+	private void onInventory(MinecraftClient client) {
+		if (step == Step.JOINING) {
+			for (String bot : fleet) {
+				if (MapMcBotClient.bots().getInventory(bot) == null) {
+					return;
+				}
+			}
+
+			step = Step.ARMING;
+			setUp(client);
+		} else if (step == Step.ARMING) {
+			for (String bot : fleet) {
+				if (!pickAlone(MapMcBotClient.bots().getInventory(bot))) {
+					return;
+				}
+			}
+
+			step = Step.DONE;
+			MapMcBotClient.bots().removeInventoryListener(inventoryListener);
+
+			if (!MapMcBotClient.command("#quarrify " + QUARRY)) {
+				throw new IllegalStateException("debug autostart: #quarrify is not a comando");
+			}
+		}
+	}
+
+	/** On the server thread: the bots on QUARRY's top, their inventories cleared, QUARRY filled, the items lying round killed, the pick given. */
+	private void setUp(MinecraftClient client) {
+		Area area = null;
+
+		for (Area one : MapMcBotClient.areas().getAreas()) {
+			if (one.getName().equals(QUARRY)) {
+				area = one;
+			}
+		}
+
+		if (area == null) {
+			throw new IllegalStateException("debug autostart: no area named " + QUARRY);
+		}
+
+		final String top = (area.getMinX() + area.getMaxX() + 1) / 2.0 + " " + (area.getMaxY() + 1) + " " + (area.getMinZ() + area.getMaxZ() + 1) / 2.0;
+		final String fill = "fill " + area.getMinX() + " " + area.getMinY() + " " + area.getMinZ() + " " + area.getMaxX() + " " + area.getMaxY() + " " + area.getMaxZ() + " minecraft:stone";
+		final List<String> bots = new ArrayList<String>(fleet);
+		final MinecraftServer server = client.getServer();
+
+		server.submit(() -> {
+			// clear and fill do nothing (0) on an empty inventory or an area of stone already: not checked.
+			for (String bot : bots) {
+				run(server, "tp " + bot + " " + top, true);
+				run(server, "clear " + bot, false);
+			}
+
+			run(server, fill, false);
+			// The drops of the quarrify before, still lying round QUARRY: a bot picking one up never has the pick alone.
+			run(server, "kill @e[type=item]", false);
+
+			for (String bot : bots) {
+				run(server, "give " + bot + " " + PICK, true);
+			}
+		});
+	}
+
+	private static void run(MinecraftServer server, String command, boolean checked) {
+		if (server.getCommandManager().execute(server, command) == 0 && checked) {
+			throw new IllegalStateException("debug autostart: /" + command + " failed");
+		}
+	}
+
+	/** Whether the inventory holds the pick and nothing else. */
+	private static boolean pickAlone(BotInventory inventory) {
+		BotInventory.Item only = null;
+
+		for (BotInventory.Item item : inventory.getSlots()) {
+			if (item != null) {
+				if (only != null) {
+					return false;
+				}
+
+				only = item;
+			}
+		}
+
+		return only != null && only.getName().equals("minecraft:diamond_pickaxe");
 	}
 
 	/** Vanilla keeps the integrated server at 8 players; its field is protected and set once. */

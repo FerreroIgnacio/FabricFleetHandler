@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -33,20 +34,23 @@ import net.minecraft.item.ItemStack;
  * primitives, each sent as the one before ends, by the bot's state: nothing timed.
  *
  * Done for now only for areas wider and deeper than 5 (the rest fail, not done yet): a region with a
- * staircase in each corner, its 2x2, and an active layer, shared by the bots on it. The active layer
- * is the highest one with something to dig (the staircases' steps and the bots' supports left out: the
- * rest of a staircase is dug with its layer, by whichever bot is nearest); once it is empty it goes down
- * to the next with something, never up: a block placed over it is left there. Each time a bot goes off
- * a layer it takes the nearest staircase to where it got to, shared with the others there: a block of
- * it one of them is on, it waits for.
+ * staircase in each corner, its 2x2, and an active layer, shared by the bots on it. The layers are
+ * slabs of LAYER blocks high from the area's top (the lowest one what is left); the active layer is the
+ * highest with something to dig (the staircases' steps and the bots' supports left out: the rest of a
+ * staircase is dug with its layer, by whichever bot is nearest); once it is empty it goes down to the
+ * next with something, never up: a block placed over it is left there. Each time a bot goes off
+ * a layer it takes the nearest staircase to where it got to, the ones the others took counting as
+ * farther (see nearest), shared with the others there: a block of it one of them is on, it waits for.
  *
  * A bot walks first to the nearest spot the pathfinder finds in the area or a block round it, at any
  * height from its bottom to standing on its top. From there it goes down (or up) its staircase,
  * carving and building it as it goes (break_wsrp and place_wsrp, ending each on the step it goes on to),
- * to stand on the active layer's floor: its feet in the layer. There it digs the layer with break_wsr,
- * of the blocks at a local minimum or maximum of the layer's in x and in z (see pick) the nearest to it,
- * one no other bot is digging. With none left but the ones other bots dig, it waits
- * for theirs to end. The layer empty, it goes down its staircase to the next.
+ * to stand on the active layer's floor: its feet in the layer's bottom. Nothing under that floor is
+ * dug while the layer is active, the staircase's step under it made solid: the floor is what the ends of
+ * the others' digs stand on. There it digs the layer with break_wsrpa, ending where it is with the block
+ * in reach, else 1 from it (see stand), of the blocks of the least depth (see depth) the nearest to it
+ * and farthest from the others (see pick), one no other bot is digging. With none left but the ones
+ * other bots dig, it waits on the layer for theirs. The layer empty, it goes down its staircase to the next.
  *
  * A staircase is a spiral down its 2x2, one step a layer, each the next column round from the one over
  * it, so each column has a step every 4 layers with 3 of air over it. A step that is not solid is placed
@@ -57,10 +61,18 @@ import net.minecraft.item.ItemStack;
 final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, BotRegistry.ActionListener {
 	/** The narrowest an area with four staircases is, along x and along z: one past two 2x2 and a column between. */
 	private static final int CORNERS_MIN = 6;
+	/** How high a layer is, in blocks: dug standing on its floor. */
+	private static final int LAYER = 4;
 	/** The break's deadline when its dig takes less than half of it (actions.js DEFAULT_DEADLINE), in ms. */
 	private static final int DEADLINE = 5000;
 	/** How high the eyes are over the feet. */
 	private static final double EYES = 1.62;
+	/** Half the width of a player's hitbox. */
+	private static final double HALF_WIDTH = 0.3;
+	/** How far from the block of the layer it digs the bot tries to end its break_wsrpa when out of reach of it, in blocks. */
+	private static final int REACH_END = 1;
+	/** How far the eyes reach a block (actions.js REACH_BLOCK). */
+	private static final double REACH = 4.5;
 	/** The first slot of the inventory (window numbering): the tool a break holds is any of it, hotbar included. */
 	private static final int INVENTORY_FIRST = 9;
 	private static final int INVENTORY_LAST = 44;
@@ -74,12 +86,16 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		final int[][][] stairs;
 		/** The bots on the region. */
 		final Set<String> bots = new LinkedHashSet<String>();
-		/** The layer being dug; under the area's bottom, done. */
+		/** The bottom of the layer being dug, where the feet go; under the area's bottom, done. */
 		int active;
+		/** The top of the layer being dug. */
+		int top;
 		/** The block each bot is digging or placing, by key(). */
 		final Map<String, Long> claims = new HashMap<String, Long>();
 		/** The bots with nothing to do but what the others are on, until a primitive of theirs ends. */
 		final Set<String> waiting = new LinkedHashSet<String>();
+		/** The blocks of the active layer at the last pick on it with their depth (see depth), {x, y, z, depth}, drawn on them. */
+		List<int[]> depths = new ArrayList<int[]>();
 
 		Region(Area area) {
 			this.area = area;
@@ -93,7 +109,21 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 				{{w, n}, {w, n + 1}, {w + 1, n + 1}, {w + 1, n}},
 				{{w, s}, {w + 1, s}, {w + 1, s - 1}, {w, s - 1}},
 				{{e, s}, {e, s - 1}, {e - 1, s - 1}, {e - 1, s}}};
-			active = area.getMaxY();
+			top = area.getMaxY();
+			active = Math.max(top - LAYER + 1, area.getMinY());
+		}
+
+		/** Whether the column is of a staircase's 2x2. */
+		boolean inStair(int x, int z) {
+			for (int[][] stair : stairs) {
+				for (int[] cell : stair) {
+					if (cell[0] == x && cell[1] == z) {
+						return true;
+					}
+				}
+			}
+
+			return false;
 		}
 
 		/** Whether the block is the layer's step of a staircase. */
@@ -122,6 +152,8 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		final Deque<JsonObject> queue = new ArrayDeque<JsonObject>();
 		/** The block its feet are in, as its last state told. */
 		int[] feet;
+		/** Its feet as they are, as its last state told: anywhere in that block. */
+		double[] position;
 		/** The supports placed under or over a step, to break once it stands: {x, y, z, the step's y}. */
 		final List<int[]> supports = new ArrayList<int[]>();
 		int dug;
@@ -129,6 +161,8 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		String doing = "walk";
 		/** A primitive sent and not yet seen going: an idle before that is the end of the one before it, not of this. */
 		boolean starting;
+		/** The block the primitive sent walks it to (its end), {x, y, z}; null with none. */
+		int[] end;
 		/** The blocks of the active layer its last pick had to choose from, drawn green. */
 		List<int[]> eligible = new ArrayList<int[]>();
 
@@ -158,12 +192,25 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		return new JsonParser().parse(json).getAsJsonObject().get("action").getAsString().equals("quarrify");
 	}
 
-	/** The blocks each quarrify going on had to choose from at its last pick (see pick), to draw. */
+	/** The blocks each quarrify going on had to choose from at its last pick (see pick), each once, to draw. */
 	synchronized List<int[]> eligible() {
-		final List<int[]> out = new ArrayList<int[]>();
+		final Map<Long, int[]> out = new LinkedHashMap<Long, int[]>();
 
 		for (Plan plan : plans.values()) {
-			out.addAll(plan.eligible);
+			for (int[] cell : plan.eligible) {
+				out.put(key(cell[0], cell[1], cell[2]), cell);
+			}
+		}
+
+		return new ArrayList<int[]>(out.values());
+	}
+
+	/** The blocks of each region's active layer at the last pick on it with their depth, {x, y, z, depth}, to draw. */
+	synchronized List<int[]> depths() {
+		final List<int[]> out = new ArrayList<int[]>();
+
+		for (Region region : regions.values()) {
+			out.addAll(region.depths);
 		}
 
 		return out;
@@ -234,6 +281,7 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 		if (status.hasFeet()) {
 			plan.feet = status.getFeet();
+			plan.position = status.getPosition();
 		}
 
 		if (status.getKind() == BotStatus.Kind.DOING) {
@@ -280,22 +328,36 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 		plan.region = region;
 		region.bots.add(bot);
-		plan.corner = nearest(region, plan.feet);
+		plan.corner = nearest(bot, region, plan.feet);
 	}
 
-	/** The region's staircase nearest to the feet. */
-	private static int nearest(Region region, int[] feet) {
+	/**
+	 * Of the region's staircases the ones the fewest other bots of it took, the nearest to the feet:
+	 * the bots spread evenly over them, none bound to one.
+	 */
+	private int nearest(String bot, Region region, int[] feet) {
 		int best = -1;
-		long bestDistance = Long.MAX_VALUE;
+		int bestTaken = Integer.MAX_VALUE;
+		double bestDistance = Double.MAX_VALUE;
 
 		for (int i = 0; i < region.stairs.length; i++) {
 			final int[] cell = region.stairs[i][0];
-			final long dx = cell[0] - feet[0];
-			final long dz = cell[1] - feet[2];
+			int taken = 0;
 
-			if (dx * dx + dz * dz < bestDistance) {
+			for (Map.Entry<String, Plan> other : plans.entrySet()) {
+				final Plan them = other.getValue();
+
+				if (!other.getKey().equals(bot) && them.region == region && them.corner == i) {
+					taken++;
+				}
+			}
+
+			final double distance = Math.hypot(cell[0] - feet[0], cell[1] - feet[2]);
+
+			if (taken < bestTaken || taken == bestTaken && distance < bestDistance) {
 				best = i;
-				bestDistance = dx * dx + dz * dz;
+				bestTaken = taken;
+				bestDistance = distance;
 			}
 		}
 
@@ -361,170 +423,468 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 			return false;
 		}
 
+		final int layer = active;
+		final int top = region.top;
 		final int feet = plan.feet[1];
 
-		if (feet != active && plan.dugLayer) {
-			// Off the layer: by the nearest staircase, all carved with the layers.
-			plan.corner = nearest(region, plan.feet);
+		if (feet != layer && plan.dugLayer) {
+			// Off the layer: by the nearest staircase (see nearest), all carved with the layers.
+			plan.corner = nearest(bot, region, plan.feet);
 			plan.dugLayer = false;
 		}
 
-		if (feet > active) {
-			return down(bot, plan, active);
+		if (feet > layer) {
+			return down(bot, plan, layer);
 		}
 
-		if (feet < active) {
-			return up(bot, plan, active);
+		if (feet < layer) {
+			return up(bot, plan, layer);
 		}
 
 		plan.dugLayer = true;
-		final int[] cell = pick(bot, plan, active);
+		final int[] cell = pick(bot, plan, layer, top);
 
 		if (cell == null) {
+			// Waiting on the others' digs, or failed.
 			return plans.get(bot) == plan;
 		}
 
 		region.claims.put(bot, key(cell[0], cell[1], cell[2]));
-		return dig(bot, plan, cell, null);
+		final int[] end = stand(bot, plan, cell, layer);
+		return end != null && dig(bot, plan, cell, end, true);
 	}
 
 	/**
-	 * The region's active layer, gone down past the empty ones: the highest with something to dig
-	 * (the steps and supports left out), never over the one it was. Null when a state was missing (failed).
+	 * The bottom of the region's active layer, gone down past the empty ones: the highest with something
+	 * to dig (the steps and supports left out), never over the one it was. Null when a state was missing (failed).
 	 */
 	private Integer active(String bot, Plan plan) {
 		final Region region = plan.region;
 		final Area area = plan.area;
 
-		for (; region.active >= area.getMinY(); region.active--) {
-			for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
-				for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
-					if (leftOut(region, x, region.active, z)) {
-						continue;
-					}
+		for (; region.top >= area.getMinY(); region.top = region.active - 1, region.active = Math.max(region.top - LAYER + 1, area.getMinY())) {
+			for (int y = region.top; y >= region.active; y--) {
+				for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
+					for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
+						if (leftOut(region, x, y, z)) {
+							continue;
+						}
 
-					final BlockState state = state(bot, plan, x, region.active, z);
+						final BlockState state = state(bot, plan, x, y, z);
 
-					if (state == null) {
-						return null;
-					}
+						if (state == null) {
+							return null;
+						}
 
-					if (!air(state)) {
-						return region.active;
+						if (!air(state)) {
+							return region.active;
+						}
 					}
 				}
 			}
 		}
 
-		return region.active;
+		return area.getMinY() - 1;
 	}
 
 	/**
-	 * The block of the active layer to dig: of the ones no other bot digs, next to something not solid,
-	 * the ones at a local minimum or maximum in x and in z are the ones to dig (the layer's block at x - 1
-	 * or at x + 1 gone, and the one at z - 1 or at z + 1: the steps, the supports and the rest of the area count as
-	 * gone, the ones other bots dig as there), and of those the nearest to the bot's eyes. Null
-	 * when it waits on the others' digs, or failed (a state missing, or all sealed in).
+	 * The block of the bot's layer (bottom..top) to dig: of the ones no other bot digs, seen from the layer
+	 * (see seen), the ones whose column (x, z: left while any block of it is) is of the least depth (see depth: the
+	 * steps, the supports and the rest of the area count as gone, the ones other bots dig as there) are
+	 * the ones to dig; of those the ones with a spot walked to
+	 * round them first (see reached), then the one whose distance from the bot's eyes, less the nearest
+	 * other bot's of the region, is the least: the bots spread over the layer. Null when it waits on the
+	 * others' digs, or failed (a state missing, or nothing it
+	 * can dig with every other bot of the region waiting: see stalled).
 	 */
-	private int[] pick(String bot, Plan plan, int y) {
+	private int[] pick(String bot, Plan plan, int bottom, int top) {
 		final Region region = plan.region;
 		final Area area = plan.area;
-		final double ex = plan.feet[0] + 0.5;
-		final double ey = plan.feet[1] + EYES;
-		final double ez = plan.feet[2] + 0.5;
-		final List<int[]> open = new ArrayList<int[]>();
-		final Set<Long> left = new HashSet<Long>();
-		int[] sealed = null;
+		final Choice here = choose(bot, plan, bottom, top);
 
-		for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
-			for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
-				if (leftOut(region, x, y, z)) {
-					continue;
-				}
-
-				final BlockState state = state(bot, plan, x, y, z);
-
-				if (state == null) {
-					return null;
-				}
-
-				if (air(state)) {
-					continue;
-				}
-
-				left.add(key(x, y, z));
-
-				if (region.claims.containsValue(key(x, y, z))) {
-					continue;
-				}
-
-				final Boolean seen = open(bot, plan, x, y, z);
-
-				if (seen == null) {
-					return null;
-				}
-
-				if (!seen) {
-					sealed = new int[] {x, y, z};
-					continue;
-				}
-
-				open.add(new int[] {x, y, z});
-			}
-		}
-
-		int[] best = null;
-		double bestEyes = Double.MAX_VALUE;
-		final List<int[]> eligibles = new ArrayList<int[]>();
-
-		for (int[] cell : open) {
-			final int x = cell[0];
-			final int z = cell[2];
-			final boolean eligible = (!left.contains(key(x - 1, y, z)) || !left.contains(key(x + 1, y, z)))
-					&& (!left.contains(key(x, y, z - 1)) || !left.contains(key(x, y, z + 1)));
-
-			final double dx = cell[0] + 0.5 - ex;
-			final double dy = cell[1] + 0.5 - ey;
-			final double dz = cell[2] + 0.5 - ez;
-			final double eyes = dx * dx + dy * dy + dz * dz;
-
-			if (eligible) {
-				eligibles.add(cell);
-			}
-
-			if (eligible && eyes < bestEyes) {
-				best = cell;
-				bestEyes = eyes;
-			}
-		}
-
-		plan.eligible = eligibles;
-
-		if (best != null) {
-			return best;
-		}
-
-		if (region.claims.isEmpty() && sealed != null) {
-			fail(bot, plan, plan.listener, "quarrify: expected a block of layer " + y + " of " + area.getName() + " next to something not solid, to dig it from there, found them all sealed in (" + at(sealed[0], sealed[1], sealed[2]) + " one)");
+		if (here == null) {
 			return null;
 		}
 
-		// The others' digs left: picked again as one ends.
+		plan.eligible = here.eligible;
+		region.depths = here.depths;
+
+		// None with a spot walked to round it: the others' digs open the floor to them, waited on; with none, from where it stands.
+		if (here.best != null && (here.reached || region.claims.isEmpty())) {
+			return here.best;
+		}
+
+		// No other bot digging, and every one waiting too: none of them ever opens the rest.
+		if (region.claims.isEmpty() && stalled(bot, plan)) {
+			if (here.sealed != null) {
+				fail(bot, plan, plan.listener, "quarrify: expected a block of the layer " + bottom + ".." + top + " of " + area.getName() + " next to something not solid, to dig it from there, found them all sealed in or seen from nowhere it walks to (" + at(here.sealed[0], here.sealed[1], here.sealed[2]) + " one), and every other bot of it waiting");
+			} else {
+				fail(bot, plan, plan.listener, "quarrify: expected a block of the layer " + bottom + ".." + top + " of " + area.getName() + " to dig, or another bot of it digging or on its way, found none: " + here.left + " left, every bot waiting");
+			}
+
+			return null;
+		}
+
+		// The others' digs left: picked again as one ends, or as a bot leaves the region.
 		region.waiting.add(bot);
 		plan.doing = "waiting on the others' digs";
 		return null;
 	}
 
+	/** What a layer has for a bot (see choose): the block to dig and whether a spot walked to is round it, one sealed in, how many are left. */
+	private static final class Choice {
+		int[] best;
+		boolean reached;
+		int[] sealed;
+		int left;
+		List<int[]> eligible;
+		List<int[]> depths;
+	}
+
+	/** The block of the layer (bottom..top) pick takes for the bot; null when a state was missing (failed). */
+	private Choice choose(String bot, Plan plan, int bottom, int top) {
+		final Region region = plan.region;
+		final Area area = plan.area;
+		final double ex = plan.position[0];
+		final double ey = plan.position[1] + EYES;
+		final double ez = plan.position[2];
+		final List<int[]> open = new ArrayList<int[]>();
+		final Set<Long> left = new HashSet<Long>();
+		int[] sealed = null;
+		final Set<Long> walkable = walkable(bot, plan, bottom);
+
+		if (walkable == null) {
+			return null;
+		}
+
+		for (int y = top; y >= bottom; y--) {
+			for (int z = area.getMinZ(); z <= area.getMaxZ(); z++) {
+				for (int x = area.getMinX(); x <= area.getMaxX(); x++) {
+					if (leftOut(region, x, y, z)) {
+						continue;
+					}
+
+					final BlockState state = state(bot, plan, x, y, z);
+
+					if (state == null) {
+						return null;
+					}
+
+					if (air(state)) {
+						continue;
+					}
+
+					left.add(key(x, y, z));
+
+					if (region.claims.containsValue(key(x, y, z)) || standsOn(bot, region, x, y, z)) {
+						continue;
+					}
+
+					final Boolean seen = seen(bot, plan, x, y, z, bottom, walkable);
+
+					if (seen == null) {
+						return null;
+					}
+
+					if (!seen) {
+						sealed = new int[] {x, y, z};
+						continue;
+					}
+
+					open.add(new int[] {x, y, z});
+				}
+			}
+		}
+
+		// The depth by columns of the layer: one is left while any of its blocks is, so a column is dug
+		// out its whole height before the ones next to it.
+		final Set<Long> columns = new HashSet<Long>();
+
+		for (long key : left) {
+			columns.add(key((int) (key >> 38) << 6 >> 6, bottom, (int) (key << 38 >> 38)));
+		}
+
+		final List<int[]> depths = new ArrayList<int[]>();
+		int least = Integer.MAX_VALUE;
+
+		for (long key : left) {
+			final int x = (int) (key >> 38) << 6 >> 6;
+			final int y = (int) (key << 26 >> 52);
+			final int z = (int) (key << 38 >> 38);
+			depths.add(new int[] {x, y, z, depth(columns, x, bottom, z)});
+		}
+
+		for (int[] cell : open) {
+			least = Math.min(least, depth(columns, cell[0], bottom, cell[2]));
+		}
+
+		int[] best = null;
+		boolean bestReached = false;
+		double bestCost = Double.MAX_VALUE;
+		final List<int[]> eligibles = new ArrayList<int[]>();
+
+		for (int[] cell : open) {
+			if (depth(columns, cell[0], bottom, cell[2]) != least) {
+				continue;
+			}
+
+			eligibles.add(cell);
+			final double cx = cell[0] + 0.5;
+			final double cy = cell[1] + 0.5;
+			final double cz = cell[2] + 0.5;
+			double others = Double.MAX_VALUE;
+
+			for (Map.Entry<String, Plan> other : plans.entrySet()) {
+				final double[] p = other.getValue().position;
+
+				if (other.getKey().equals(bot) || other.getValue().region != region || p == null) {
+					continue;
+				}
+
+				others = Math.min(others, Math.sqrt((cx - p[0]) * (cx - p[0]) + (cy - p[1] - EYES) * (cy - p[1] - EYES) + (cz - p[2]) * (cz - p[2])));
+			}
+
+			final double cost = Math.sqrt((cx - ex) * (cx - ex) + (cy - ey) * (cy - ey) + (cz - ez) * (cz - ez)) - (others == Double.MAX_VALUE ? 0 : others);
+			// The ones with a spot walked to round them first (see stand): the others end where the bot stands.
+			final boolean reached = reached(walkable, bottom, cell);
+
+			if (reached && !bestReached || reached == bestReached && cost < bestCost) {
+				best = cell;
+				bestReached = reached;
+				bestCost = cost;
+			}
+		}
+
+		final Choice out = new Choice();
+		out.best = best;
+		out.reached = bestReached;
+		out.sealed = sealed;
+		out.left = left.size();
+		out.eligible = eligibles;
+		out.depths = depths;
+		return out;
+	}
+
 	/**
-	 * Down the staircase to stand with its feet in the layer: the layers round its feet carved, then
-	 * on the step under them, then each layer under it carved, ending on its step, one a time.
+	 * Whether every other bot quarrifying the plan's area waits on the others' digs (see wake): none of
+	 * them has a primitive going, which is what wakes a bot waiting. One still walking to it is on its way.
+	 */
+	private boolean stalled(String bot, Plan plan) {
+		for (Map.Entry<String, Plan> other : plans.entrySet()) {
+			final Plan them = other.getValue();
+
+			if (!other.getKey().equals(bot) && them.area.getId().equals(plan.area.getId()) && !plan.region.waiting.contains(other.getKey())) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether the layer's block (its bottom at bottom) is seen from where the bot walks on the layer's
+	 * floor (walkable): in the area, the column next to it to a side a spot of walkable and not solid
+	 * up to its height, or, over the eyes on the floor, its own column one and not solid up to under it;
+	 * over it is seen from nowhere on the floor. Null when a state was missing (failed).
+	 */
+	private Boolean seen(String bot, Plan plan, int x, int y, int z, int bottom, Set<Long> walkable) {
+		for (int[] face : FACES) {
+			// Its bottom face is seen from under it alone: the block over the eyes on the floor.
+			if (face[1] > 0 || face[1] < 0 && y < bottom + EYES || !plan.area.contains(x + face[0], y + face[1], z + face[2])) {
+				continue;
+			}
+
+			// Seen from there standing in that column, walked to.
+			if (!walkable.contains(key(x + face[0], bottom, z + face[2]))) {
+				continue;
+			}
+
+			final int from = bottom;
+			final int to = face[1] < 0 ? y - 1 : y;
+			boolean clear = true;
+
+			for (int h = from; h <= to && clear; h++) {
+				final BlockState there = state(bot, plan, x + face[0], h, z + face[2]);
+
+				if (there == null) {
+					return null;
+				}
+
+				clear = !solid(there);
+			}
+
+			if (clear) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * How far the block is from being a local minimum or maximum of the layer's in x or in z: of each
+	 * axis the blocks of the layer's left between it and the nearest gone one, the fewer of the two.
+	 */
+	private static int depth(Set<Long> left, int x, int y, int z) {
+		return Math.min(Math.min(run(left, x, y, z, -1, 0), run(left, x, y, z, 1, 0)),
+				Math.min(run(left, x, y, z, 0, -1), run(left, x, y, z, 0, 1)));
+	}
+
+	/** The blocks of the layer's left past the block along the way, up to the first gone one. */
+	private static int run(Set<Long> left, int x, int y, int z, int dx, int dz) {
+		int n = 0;
+
+		while (left.contains(key(x + (n + 1) * dx, y, z + (n + 1) * dz))) {
+			n++;
+		}
+
+		return n;
+	}
+
+	/**
+	 * Where the bot ends the dig of the block of its layer (bottom y): where it stands with the block in reach (REACH from its eyes) and no other bot's (see taken); else of the spots of the layer it stands on (air at
+	 * its feet and head, solid under them) round the block, walked to from its feet (see walkable), out of
+	 * the staircases' 2x2 but on their steps, and no other bot's, the one nearest to REACH_END away from
+	 * it, the nearest to the bot of those; with none, where it stands.
+	 * Null when a state was missing (failed).
+	 */
+	private int[] stand(String bot, Plan plan, int[] cell, int y) {
+		// In reach from where it is (its eyes to the block's nearest point): it digs it from there.
+		final double ex = plan.position[0];
+		final double ey = plan.position[1] + EYES;
+		final double ez = plan.position[2];
+		final double nx = Math.max(cell[0], Math.min(ex, cell[0] + 1)) - ex;
+		final double ny = Math.max(cell[1], Math.min(ey, cell[1] + 1)) - ey;
+		final double nz = Math.max(cell[2], Math.min(ez, cell[2] + 1)) - ez;
+
+		if (plan.feet[1] == y && nx * nx + ny * ny + nz * nz <= REACH * REACH && !taken(bot, plan.region, plan.feet[0], y, plan.feet[2])) {
+			return plan.feet.clone();
+		}
+
+		final Set<Long> walkable = walkable(bot, plan, y);
+
+		if (walkable == null) {
+			return null;
+		}
+
+		int[] best = null;
+		double bestOff = Double.MAX_VALUE;
+		double bestBot = Double.MAX_VALUE;
+
+		for (int dz = -REACH_END; dz <= REACH_END; dz++) {
+			for (int dx = -REACH_END; dx <= REACH_END; dx++) {
+				final int x = cell[0] + dx;
+				final int z = cell[2] + dz;
+
+				// In a staircase's 2x2 on what is not its step: carved with the staircase, the floor going.
+				if (dx == 0 && dz == 0 || !walkable.contains(key(x, y, z)) || plan.region.inStair(x, z) && !plan.region.step(x, y - 1, z) || taken(bot, plan.region, x, y, z)) {
+					continue;
+				}
+
+				final double off = Math.abs(Math.sqrt(dx * dx + dz * dz) - REACH_END);
+				final double bx = x + 0.5 - plan.position[0];
+				final double bz = z + 0.5 - plan.position[2];
+				final double toBot = bx * bx + bz * bz;
+
+				if (off < bestOff || off == bestOff && toBot < bestBot) {
+					best = new int[] {x, y, z};
+					bestOff = off;
+					bestBot = toBot;
+				}
+			}
+		}
+
+		return best == null ? plan.feet.clone() : best;
+	}
+
+	/** Whether another bot of the region has its feet in the block, or its primitive's end there: two pushing each other in one, neither gets to it. */
+	private boolean taken(String bot, Region region, int x, int y, int z) {
+		for (Map.Entry<String, Plan> other : plans.entrySet()) {
+			final Plan them = other.getValue();
+
+			if (other.getKey().equals(bot) || them.region != region) {
+				continue;
+			}
+
+			if (them.feet != null && them.feet[0] == x && them.feet[1] == y && them.feet[2] == z) {
+				return true;
+			}
+
+			if (them.end != null && them.end[0] == x && them.end[1] == y && them.end[2] == z) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Whether a spot of walkable but the block's own is REACH_END or less from it along x and z, at the layer's bottom y. */
+	private static boolean reached(Set<Long> walkable, int y, int[] cell) {
+		for (int dz = -REACH_END; dz <= REACH_END; dz++) {
+			for (int dx = -REACH_END; dx <= REACH_END; dx++) {
+				if ((dx != 0 || dz != 0) && walkable.contains(key(cell[0] + dx, y, cell[2] + dz))) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The spots of its layer (bottom y) in the area the bot stands on (air at its feet and head, solid under them)
+	 * walked to from its feet one side to the next, by key(); its feet's block among them. In a staircase's
+	 * 2x2 too, the ones over what is not its step: the layer is seen and walked to from there as the bot
+	 * gets to it, though they are no end to stand on (see stand). Null when a state was missing (failed).
+	 */
+	private Set<Long> walkable(String bot, Plan plan, int y) {
+		final Set<Long> out = new HashSet<Long>();
+		final Deque<int[]> next = new ArrayDeque<int[]>();
+		out.add(key(plan.feet[0], y, plan.feet[2]));
+		next.add(new int[] {plan.feet[0], plan.feet[2]});
+
+		while (!next.isEmpty()) {
+			final int[] at = next.poll();
+
+			for (int[] face : FACES) {
+				final int x = at[0] + face[0];
+				final int z = at[1] + face[2];
+
+				if (face[1] != 0 || !plan.area.contains(x, y, z) || out.contains(key(x, y, z))) {
+					continue;
+				}
+
+				final BlockState feet = state(bot, plan, x, y, z);
+				final BlockState head = feet == null ? null : state(bot, plan, x, y + 1, z);
+				final BlockState under = head == null ? null : state(bot, plan, x, y - 1, z);
+
+				if (under == null) {
+					return null;
+				}
+
+				if (!air(feet) || solid(head) || !solid(under)) {
+					continue;
+				}
+
+				out.add(key(x, y, z));
+				next.add(new int[] {x, z});
+			}
+		}
+
+		return out;
+	}
+
+	/**
+	 * Down the staircase to stand with its feet in the layer's bottom: the layers round its feet carved,
+	 * then on the step under them, then each layer under it carved, ending on its step, one a time; of
+	 * the one under the layer's floor its step alone.
 	 */
 	private boolean down(String bot, Plan plan, int active) {
 		final int feet = plan.feet[1];
 
 		for (int y = feet + 1; y >= feet - 1; y--) {
 			if (y >= active - 1 && carvable(plan, y)) {
-				final Boolean queued = carve(bot, plan, y, null, -1);
+				final Boolean queued = carve(bot, plan, y, null, -1, false);
 
 				if (queued == null || queued) {
 					return queued != null;
@@ -541,7 +901,8 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		final int[] next = stepTop(plan, feet - 2);
 
 		if (carvable(plan, feet - 2)) {
-			final Boolean queued = carve(bot, plan, feet - 2, next, -1);
+			// Under the active layer's floor its step alone: the rest is the floor the others' ends stand on.
+			final Boolean queued = carve(bot, plan, feet - 2, next, -1, feet - 2 < active);
 
 			if (queued == null || queued) {
 				return queued != null;
@@ -560,7 +921,7 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 		for (int y = feet; y <= feet + 1; y++) {
 			if (carvable(plan, y)) {
-				final Boolean queued = carve(bot, plan, y, null, -1);
+				final Boolean queued = carve(bot, plan, y, null, -1, false);
 
 				if (queued == null || queued) {
 					return queued != null;
@@ -610,10 +971,10 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 	/**
 	 * The next primitive of the layer of its staircase queued: its supports, its step made solid, the
 	 * supports broken after, then its three other blocks dug (the column first first, if any), the one
-	 * the bot stands on last. With end, each a wsrp ending there. True when one was queued, false with
-	 * the layer carved, null when it failed.
+	 * the bot stands on last. With end, each a wsrp ending there; with stepOnly, its step and supports
+	 * alone. True when one was queued, false with the layer carved, null when it failed.
 	 */
-	private Boolean carve(String bot, Plan plan, int y, int[] end, int first) {
+	private Boolean carve(String bot, Plan plan, int y, int[] end, int first, boolean stepOnly) {
 		final int[][] stair = plan.region.stairs[plan.corner];
 		final int k = stepIndex(plan.area, y);
 		final int[] step = {stair[k][0], y, stair[k][1]};
@@ -648,6 +1009,10 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 			if (!air(there)) {
 				return !claim(bot, plan, support) || dig(bot, plan, support, end) ? Boolean.TRUE : null;
 			}
+		}
+
+		if (stepOnly) {
+			return Boolean.FALSE;
 		}
 
 		final List<int[]> cells = new ArrayList<int[]>();
@@ -774,6 +1139,32 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 	}
 
 	/**
+	 * Whether another bot of the region stands on the block: its hitbox (HALF_WIDTH to each side of its
+	 * position) over the block's column, its feet on the block's top or falling from it; or the block is
+	 * under the end its primitive walks it to. Dug from under it, it drops off the path it follows.
+	 */
+	private boolean standsOn(String bot, Region region, int x, int y, int z) {
+		for (Map.Entry<String, Plan> other : plans.entrySet()) {
+			final double[] p = other.getValue().position;
+			final int[] end = other.getValue().end;
+
+			if (other.getKey().equals(bot) || other.getValue().region != region || p == null) {
+				continue;
+			}
+
+			if (end != null && end[0] == x && end[1] - 1 == y && end[2] == z) {
+				return true;
+			}
+
+			if ((int) Math.ceil(p[1]) - 1 == y && p[0] + HALF_WIDTH > x && p[0] - HALF_WIDTH < x + 1 && p[2] + HALF_WIDTH > z && p[2] - HALF_WIDTH < z + 1) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * The block taken for the bot's next primitive; false when another bot is on it, the bot waiting
 	 * for that one's to end (see wake).
 	 */
@@ -849,6 +1240,11 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 	/** The block broken from a spot it is seen from (break_wsr), with end ending there (break_wsrp). False when it failed. */
 	private boolean dig(String bot, Plan plan, int[] cell, int[] end) {
+		return dig(bot, plan, cell, end, false);
+	}
+
+	/** As dig, with async breaking it on the way to end (break_wsrpa). */
+	private boolean dig(String bot, Plan plan, int[] cell, int[] end, boolean async) {
 		final int x = cell[0];
 		final int y = cell[1];
 		final int z = cell[2];
@@ -879,7 +1275,7 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 			return false;
 		}
 
-		final JsonObject a = search(plan, end == null ? "break_wsr" : "break_wsrp", cell, end);
+		final JsonObject a = search(plan, end == null ? "break_wsr" : async ? "break_wsrpa" : "break_wsrp", cell, end);
 		// Twice its dig and 2 s, when that is past the default: an obsidian one takes longer than it.
 		final int ms = hardness == 0 ? 0 : (int) Math.ceil(hardness / speed(stack, block)) * 50;
 
@@ -1023,6 +1419,7 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 
 	private void send(String bot, Plan plan, JsonObject a) {
 		plan.starting = true;
+		plan.end = a.has("end") ? new int[] {a.getAsJsonObject("end").get("x").getAsInt(), a.getAsJsonObject("end").get("y").getAsInt(), a.getAsJsonObject("end").get("z").getAsInt()} : null;
 		System.out.println("[quarrify trace] " + bot + " feet " + java.util.Arrays.toString(plan.feet) + " " + plan.doing + " " + a);
 		bots.actionInternal(bot, a.toString());
 	}
@@ -1056,14 +1453,16 @@ final class Quarrify implements JobRunner.Resolver, BotRegistry.StateListener, B
 		}
 
 		plan.region = null;
-		final boolean released = region.claims.remove(bot) != null;
+		region.claims.remove(bot);
 		region.waiting.remove(bot);
 
 		region.bots.remove(bot);
 
+		// Its claim gone, or its standing in the way: the ones waiting pick again, its leaving told
+		// (none of them would be woken by it otherwise).
 		if (region.bots.isEmpty()) {
 			regions.remove(plan.area.getId(), region);
-		} else if (released) {
+		} else {
 			wake(region);
 		}
 	}

@@ -198,6 +198,10 @@ public final class FleetProtocol {
 	public static final int BREAK_WSRP = 50;
 	/** bot name, as PLACE_WSR's with i32 x, y, z of the spot it ends standing in after the radius. */
 	public static final int PLACE_WSRP = 51;
+	/** bot name, as BREAK_WSRP's. */
+	public static final int BREAK_WSRPA = 52;
+	/** bot name, as PLACE_WSRP's. */
+	public static final int PLACE_WSRPA = 53;
 
 	private static final int MAX_FRAME = 64 * 1024 * 1024;
 
@@ -256,6 +260,8 @@ public final class FleetProtocol {
 			case ALLOWED_PLACE: return "ALLOWED_PLACE";
 			case BREAK_WSRP: return "BREAK_WSRP";
 			case PLACE_WSRP: return "PLACE_WSRP";
+			case BREAK_WSRPA: return "BREAK_WSRPA";
+			case PLACE_WSRPA: return "PLACE_WSRPA";
 			default: throw new IllegalArgumentException("unknown frame type " + type);
 		}
 	}
@@ -486,14 +492,16 @@ public final class FleetProtocol {
 					final int kind = in.readUnsignedByte();
 					final String primitive = readString(in);
 					final String message = new String(readBytes(in), StandardCharsets.UTF_8);
-					final int[] feet = in.readBoolean() ? new int[] {in.readInt(), in.readInt(), in.readInt()} : null;
+					final boolean stands = in.readBoolean();
+					final int[] feet = stands ? new int[] {in.readInt(), in.readInt(), in.readInt()} : null;
+					final double[] position = stands ? new double[] {in.readDouble(), in.readDouble(), in.readDouble()} : null;
 					end(in, type);
 
 					if (kind > BotStatus.Kind.values().length - 1) {
 						throw new IOException("bad state kind " + kind + " for " + bot);
 					}
 
-					bots.onState(bot, new BotStatus(BotStatus.Kind.values()[kind], primitive, message, feet));
+					bots.onState(bot, new BotStatus(BotStatus.Kind.values()[kind], primitive, message, feet, position));
 					break;
 				}
 
@@ -815,10 +823,11 @@ public final class FleetProtocol {
 
 				case "break_wsr":
 				case "break_wsrp":
+				case "break_wsrpa":
 					writePos(out, field(a, "target").getAsJsonObject());
 					out.writeInt(field(a, "radius").getAsInt());
 
-					if (name.equals("break_wsrp")) {
+					if (name.startsWith("break_wsrp")) {
 						writePos(out, field(a, "end").getAsJsonObject());
 					}
 
@@ -829,13 +838,14 @@ public final class FleetProtocol {
 				case "place":
 				case "place_wsr":
 				case "place_wsrp":
+				case "place_wsrpa":
 					writePos(out, field(a, "target").getAsJsonObject());
 
 					if (!name.equals("place")) {
 						out.writeInt(field(a, "radius").getAsInt());
 					}
 
-					if (name.equals("place_wsrp")) {
+					if (name.startsWith("place_wsrp")) {
 						writePos(out, field(a, "end").getAsJsonObject());
 					}
 
@@ -976,6 +986,10 @@ public final class FleetProtocol {
 				return BREAK_WSRP;
 			case "place_wsrp":
 				return PLACE_WSRP;
+			case "break_wsrpa":
+				return BREAK_WSRPA;
+			case "place_wsrpa":
+				return PLACE_WSRPA;
 			default:
 				throw new IllegalArgumentException("no primitive named " + name + " for the fleet");
 		}

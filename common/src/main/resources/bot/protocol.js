@@ -54,7 +54,9 @@ const TYPES = {
   BREAK_WSR: 47,
   PLACE_WSR: 48,
   BREAK_WSRP: 50,
-  PLACE_WSRP: 51
+  PLACE_WSRP: 51,
+  BREAK_WSRPA: 52,
+  PLACE_WSRPA: 53
 }
 
 // The primitive each of its types is, as actions.js names it.
@@ -64,7 +66,7 @@ const PRIMITIVES = new Map([
   [TYPES.WAIT_SLOT, 'wait_slot'], [TYPES.HOTBAR, 'hotbar'], [TYPES.SELECT_TRADE, 'select_trade'],
   [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop'],
   [TYPES.BREAK_WSR, 'break_wsr'], [TYPES.PLACE_WSR, 'place_wsr'], [TYPES.BREAK_WSRP, 'break_wsrp'],
-  [TYPES.PLACE_WSRP, 'place_wsrp']
+  [TYPES.PLACE_WSRP, 'place_wsrp'], [TYPES.BREAK_WSRPA, 'break_wsrpa'], [TYPES.PLACE_WSRPA, 'place_wsrpa']
 ])
 
 class Writer {
@@ -90,6 +92,12 @@ class Writer {
   i32 (value) {
     const b = Buffer.allocUnsafe(4)
     b.writeInt32BE(value)
+    this.parts.push(b)
+  }
+
+  f64 (value) {
+    const b = Buffer.allocUnsafe(8)
+    b.writeDoubleBE(value)
     this.parts.push(b)
   }
 
@@ -344,8 +352,9 @@ function item (w, it) {
 }
 
 // What the bot is doing: kind 0 idle, 1 doing `primitive`, 2 error in `primitive` with `message`
-// (what was expected and what was found), and where it stands then: u8 present and its feet's block
-// (i32 x, y, z), none before it is in the world. The bot stays in an error until its next primitive.
+// (what was expected and what was found), and where it stands then: u8 present, its feet's block
+// (i32 x, y, z) and its feet as they are (f64 x, y, z), none before it is in the world. The bot stays
+// in an error until its next primitive.
 function state (bot, kind, primitive, message, feet) {
   const w = new Writer(TYPES.STATE)
   w.str(bot)
@@ -354,9 +363,12 @@ function state (bot, kind, primitive, message, feet) {
   w.bytes(Buffer.from(message, 'utf8'))
   w.u8(feet ? 1 : 0)
   if (feet) {
-    w.i32(feet.x)
-    w.i32(feet.y)
-    w.i32(feet.z)
+    w.i32(Math.floor(feet.x))
+    w.i32(Math.floor(feet.y))
+    w.i32(Math.floor(feet.z))
+    w.f64(feet.x)
+    w.f64(feet.y)
+    w.f64(feet.z)
   }
   return w.frame()
 }
@@ -584,21 +596,23 @@ function primitive (r, type) {
       break
     case TYPES.BREAK_WSR:
     case TYPES.BREAK_WSRP:
-      // i32 x, y, z, i32 radius, break_wsrp's i32 x, y, z it ends in, deadline, turn speed.
+    case TYPES.BREAK_WSRPA:
+      // i32 x, y, z, i32 radius, break_wsrp's and break_wsrpa's i32 x, y, z it ends in, deadline, turn speed.
       a.target = r.pos()
       a.radius = r.i32()
-      if (type === TYPES.BREAK_WSRP) a.end = r.pos()
+      if (type !== TYPES.BREAK_WSR) a.end = r.pos()
       r.deadline(a)
       r.turnSpeed(a)
       break
     case TYPES.PLACE:
     case TYPES.PLACE_WSR:
     case TYPES.PLACE_WSRP:
-      // i32 x, y, z, place_wsr's and place_wsrp's i32 radius, place_wsrp's i32 x, y, z it ends in, u8 state
+    case TYPES.PLACE_WSRPA:
+      // i32 x, y, z, place_wsr's, place_wsrp's and place_wsrpa's i32 radius, place_wsrp's and place_wsrpa's i32 x, y, z it ends in, u8 state
       // present and the state the block takes, deadline, turn speed.
       a.target = r.pos()
       if (type !== TYPES.PLACE) a.radius = r.i32()
-      if (type === TYPES.PLACE_WSRP) a.end = r.pos()
+      if (type === TYPES.PLACE_WSRP || type === TYPES.PLACE_WSRPA) a.end = r.pos()
       if (r.u8()) a.state = r.str()
       r.deadline(a)
       r.turnSpeed(a)

@@ -1,0 +1,36 @@
+Tolerancia al ruido (reglas del repo, "Tolerante al ruido").
+
+Objetivo: cuando estén todas las features (estable 1), prod le mete ruido al bot para que no se note
+que es un bot: dónde termina dentro del bloque, offset por nodo del camino, variación del turn speed,
+overshoot. En dev todo eso queda en 0, pero el código tiene que andar igual con ruido.
+
+Regla:
+- Nada supone al bot en el medio de su bloque ni con ángulos perfectos. Alcance, línea de vista, aim y
+  elección de spot salen de la posición y rotación reales.
+- Al planear sobre bloques futuros (donde todavía no está), se toma el peor caso dentro del bloque
+  (posesIn, SLACK de LookGoal), no el centro.
+- Identidad por bloque (goals, claims, end, "llegó") se compara con floored(): eso no cambia con ruido
+  dentro del bloque.
+- El ruido va a vivir en un solo lugar (un módulo noise), las prims no saben si está prendido. Con seed
+  logueada, para reproducir. Probarlo en dev de vez en cuando (comando de debug), si no los bugs de
+  "supuse el centro" aparecen recién en prod.
+
+Auditoría (2026-10-24):
+
+Pendientes (suponen el centro o no tienen la posición real):
+1. sightRun (actions.js, sees y middle): elige el tramo con vista desde el medio de cada move futuro.
+   followable después simula desde la posición real y lo re-verifica, así que no rompe hoy; pero con
+   offset por nodo, waypoint (actions.js) lleva al bot al middle de cada move: ahí es donde entra el
+   ruido del camino y sees tiene que pasar a peor caso del bloque (como SightGoal con posesIn).
+
+Ya tolerantes:
+- STATE: manda también la posición real de los pies (f64), BotStatus.getPosition.
+- Quarrify.pick y Quarrify.stand: ojos y cercanía desde plan.position, la posición real.
+- LookGoal.isEnd: desde el medio del nodo pero con alcance REACH_BLOCK - SLACK (peor caso, √½).
+- SightGoal.isEnd: posesIn sobre todo el bloque.
+- withSearch: el pose final sale de posesIn desde la posición real (bot.entity.position).
+- steer / followable: desde bot.entity.position y la rotación real de la cabeza.
+- withSearchFromEnd, furthestAfter, waypoint: comparan bloques con floored(), identidad.
+- firstBlock, aim (pos.offset(0.5, 0.5, 0.5)): el 0.5 es el centro del target, no del bot.
+- MapMcBotClient (pairs): distancia jugador-spot, el centro es del spot.
+- AreaRenderer: dibujo.

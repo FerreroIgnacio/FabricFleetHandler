@@ -110,6 +110,8 @@ public class BotScreen extends HandledScreen {
 			{"Place WSR", "#placewsr %s"},
 			{"Break WSRP", "#breakwsrp %s"},
 			{"Place WSRP", "#placewsrp %s"},
+			{"Break WSRPA", "#breakwsrpa %s"},
+			{"Place WSRPA", "#placewsrpa %s"},
 	};
 	/** The rows the primitives' buttons take, three to a row. */
 	private static final int ACTION_ROWS = (ACTIONS.length + 2) / 3;
@@ -288,12 +290,22 @@ public class BotScreen extends HandledScreen {
 	private final BotRegistry bots;
 	/** The hotbar slot in the selected bot's hand, -1 before its first inventory. */
 	private int held = -1;
+	/**
+	 * Each inventory as it comes, onto the client thread; only the selected bot's is shown, and only
+	 * once it has the clicks sent done.
+	 */
+	private final BotRegistry.InventoryListener inventoryListener;
 
 	public BotScreen() {
 		super(new PlayerScreenHandler(new PlayerInventory(MinecraftClient.getInstance().player), false, MinecraftClient.getInstance().player));
 		screenHandler.syncId = SYNC_ID;
 		inventoryHandler = screenHandler;
 		bots = MapMcBotClient.bots();
+		inventoryListener = (bot, inventory) -> client.submit(() -> {
+			if (client.currentScreen == this && bot.equals(selected) && screenHandler == inventoryHandler && bots.getWindow(bot) == null && bots.coversClicks(bot, inventory)) {
+				show(inventory);
+			}
+		});
 	}
 
 	@Override
@@ -305,13 +317,7 @@ public class BotScreen extends HandledScreen {
 		super.init();
 		place();
 
-		// Each inventory as it comes, onto the client thread; only the selected bot's is shown, and only
-		// once it has the clicks sent done.
-		bots.setInventoryListener((bot, inventory) -> client.submit(() -> {
-			if (client.currentScreen == this && bot.equals(selected) && screenHandler == inventoryHandler && bots.getWindow(bot) == null && bots.coversClicks(bot, inventory)) {
-				show(inventory);
-			}
-		}));
+		bots.addInventoryListener(inventoryListener);
 
 		baseY = y;
 		final int top = y + backgroundHeight + 6;
@@ -394,7 +400,7 @@ public class BotScreen extends HandledScreen {
 
 	@Override
 	public void removed() {
-		bots.setInventoryListener(null);
+		bots.removeInventoryListener(inventoryListener);
 		// The bot's cursor is not the player's: emptied before the screen handler would drop it, and
 		// the player's own window back as the one open. Closed by a disconnect the player is already gone,
 		// and nothing of its is left to drop the cursor.

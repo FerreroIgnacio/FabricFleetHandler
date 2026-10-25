@@ -60,7 +60,7 @@ public final class BotRegistry implements BotListener {
 		void onInventory(String bot, BotInventory inventory);
 	}
 
-	private volatile InventoryListener inventoryListener;
+	private final CopyOnWriteArrayList<InventoryListener> inventoryListeners = new CopyOnWriteArrayList<InventoryListener>();
 
 	/** Hears each state as it comes; called on the channel's thread. */
 	public interface StateListener {
@@ -242,9 +242,13 @@ public final class BotRegistry implements BotListener {
 		return inventories.get(bot);
 	}
 
-	/** The one listener of the inventories as they come, null for none. */
-	public void setInventoryListener(InventoryListener listener) {
-		inventoryListener = listener;
+	/** A listener of the inventories as they come; added again, it is still heard once. */
+	public void addInventoryListener(InventoryListener listener) {
+		inventoryListeners.addIfAbsent(listener);
+	}
+
+	public void removeInventoryListener(InventoryListener listener) {
+		inventoryListeners.remove(listener);
 	}
 
 	/** How many bots the fleet runs (0 the mod's own, else a relay's rid), those still connecting too. */
@@ -422,9 +426,8 @@ public final class BotRegistry implements BotListener {
 	@Override
 	public void onInventory(String bot, BotInventory inventory) {
 		inventories.put(bot, inventory);
-		final InventoryListener listener = inventoryListener;
 
-		if (listener != null) {
+		for (InventoryListener listener : inventoryListeners) {
 			listener.onInventory(bot, inventory);
 		}
 	}

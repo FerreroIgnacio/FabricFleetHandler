@@ -5,3 +5,5 @@ Puntos débiles de diseño conocidos, aceptados por ahora.
 2. Click rechazado = bot caído: si el server rechaza un click crudo, se rechaza la promesa y el bot se cae, igual que con los clicks de mineflayer. Un rechazo del inicio o de un slot del drag llega antes de que el fin lo espere y sale como unhandled rejection. (bot.js, rawClick / click)
 
 3. Window sin lastClick: el estado de la window que manda el bot no dice qué clicks ya hizo, así que BotScreen lo aplica apenas llega, aunque haya clicks pendientes. Un reporte viejo puede pisar un rato la predicción local hasta que llega el del último click. El inventario sí lo filtra (coversClicks). (BotScreen.refreshWindow)
+
+4. Camino de las wsrp sin reservar: break_wsrp/place_wsrp chequean el camino a end antes de romper o poner (reachableAfter), pero no lo reservan; break_wsrpa/place_wsrpa ni lo chequean (el pathfinder retoma después). Si después cambia el mundo y el pathfinder no encuentra otro, la prim falla con el bloque ya roto o puesto y el bot fuera de end. (actions.js, withSearch / withSearchAsync)

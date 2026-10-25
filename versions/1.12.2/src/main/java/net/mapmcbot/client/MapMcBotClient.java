@@ -181,8 +181,8 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	/**
 	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
-	 * #formation sends every bot in the world to a spot around the player, #quarrify AREA has PandaBot1
-	 * dig out the area. False when it is not one.
+	 * #formation sends every bot in the world to a spot around the player, #quarrify AREA has every bot in
+	 * the world dig out the area. False when it is not one.
 	 */
 	public static boolean command(String line) {
 		if (line.equals("#relays")) {
@@ -219,9 +219,8 @@ public class MapMcBotClient implements ClientModInitializer {
 		return false;
 	}
 
-	/** PandaBot1 digs out the area named (see Quarrify), as an order from outside; its end told in chat. */
+	/** Every bot in the world digs out the area named (see Quarrify), as an order from outside; each one's end told in chat. */
 	private static void quarrify(MinecraftClient client, String name) {
-		final String bot = NAME_PREFIX + 1;
 		Area area = null;
 
 		for (Area one : areas().getAreas()) {
@@ -235,8 +234,11 @@ public class MapMcBotClient implements ClientModInitializer {
 			return;
 		}
 
-		if (!bots().getSpawned().contains(bot)) {
-			chat(client, "quarrify_err: no bot named " + bot + " in the world");
+		final List<String> fleet = new ArrayList<String>(bots().getSpawned());
+		Collections.sort(fleet);
+
+		if (fleet.isEmpty()) {
+			chat(client, "quarrify_err: no bots in the world");
 			return;
 		}
 
@@ -244,20 +246,40 @@ public class MapMcBotClient implements ClientModInitializer {
 		a.addProperty("action", "quarrify");
 		a.addProperty("area", area.getId());
 		final String dug = area.getName();
-		job().ordered(bot, a.toString());
-		quarrify().start(bot, a.toString(), new JobRunner.Listener() {
-			@Override
-			public void done() {
-				client.submit(() -> chat(client, "quarrify: " + bot + " dug out " + dug));
-			}
 
-			@Override
-			public void failed() {
-				final String why = quarrify.status(bot);
-				// Its blocks clickable: highlighted in the world.
-				client.submit(() -> client.inGameHud.getChatHud().addMessage(BlockLinks.text("quarrify_err: " + (why == null ? bot + " taken over" : why))));
-			}
-		});
+		for (String bot : fleet) {
+			job().ordered(bot, a.toString());
+			quarrify().start(bot, a.toString(), new JobRunner.Listener() {
+				@Override
+				public void done() {
+					client.submit(() -> chat(client, "quarrify: " + bot + " dug out " + dug));
+				}
+
+				@Override
+				public void failed() {
+					final String why = quarrify.status(bot);
+					// Its blocks clickable: highlighted in the world.
+					client.submit(() -> client.inGameHud.getChatHud().addMessage(BlockLinks.text("quarrify_err: " + (why == null ? bot + " taken over" : why))));
+
+					// A failure ends the client right there, its crash report written and the world saved as it
+					// left it: stopped as a quit, not by crash(), whose exit from the game loop leaves the shutdown
+					// hook waiting for ever on the integrated server's thread, gone by then.
+					if (why != null) {
+						client.submit(() -> {
+							final net.minecraft.util.crash.CrashReport report = client.addSystemDetailsToCrashReport(new net.minecraft.util.crash.CrashReport("quarrify of " + bot + " failed", new IllegalStateException(why)));
+							final java.io.File file = new java.io.File(new java.io.File(client.runDirectory, "crash-reports"), "crash-" + new java.text.SimpleDateFormat("yyyy-MM-dd_HH.mm.ss").format(new java.util.Date()) + "-client.txt");
+
+							if (!report.writeToFile(file)) {
+								throw new IllegalStateException("could not write the crash report of " + bot + "'s quarrify to " + file);
+							}
+
+							System.out.println(report.asString());
+							client.scheduleStop();
+						});
+					}
+				}
+			});
+		}
 	}
 
 	/**

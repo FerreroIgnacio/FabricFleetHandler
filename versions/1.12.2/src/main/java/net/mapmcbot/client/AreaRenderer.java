@@ -32,6 +32,8 @@ public final class AreaRenderer {
 
 	/** Pulled in a hair so the outline does not z-fight with the faces of the blocks. */
 	private static final double EXPANSION = -0.01;
+	/** A block's number 8 px of text half its side tall. */
+	private static final float NUMBER_SCALE = 1.0F / 16;
 	private static final int EDGE_ALPHA = 0xFF;
 	private static final int FILL_ALPHA = 0x20;
 
@@ -56,8 +58,9 @@ public final class AreaRenderer {
 		final List<BlockPos> highlighted = BlockLinks.highlighted();
 		final Quarrify quarrify = MapMcBotClient.quarrifyOrNull();
 		final List<int[]> eligible = quarrify == null ? Collections.<int[]>emptyList() : quarrify.eligible();
+		final List<int[]> depths = quarrify == null ? Collections.<int[]>emptyList() : quarrify.depths();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty() && highlighted.isEmpty() && eligible.isEmpty()) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && chests.isEmpty() && highlighted.isEmpty() && eligible.isEmpty() && depths.isEmpty()) {
 			return;
 		}
 
@@ -136,6 +139,17 @@ public final class AreaRenderer {
 			drawBox(block[0], block[1], block[2], block[0] + 1, block[1] + 1, block[2] + 1, 0x00FF00, camX, camY, camZ);
 		}
 
+		// Each block of the active layer's depth (see Quarrify.depth), on its top and sides.
+		if (!depths.isEmpty()) {
+			GlStateManager.enableTexture();
+
+			for (int[] block : depths) {
+				drawNumber(client, block, camX, camY, camZ);
+			}
+
+			GlStateManager.disableTexture();
+		}
+
 		// The blocks clicked in chat (see BlockLinks), over everything.
 		GlStateManager.disableDepthTest();
 
@@ -152,6 +166,28 @@ public final class AreaRenderer {
 		GlStateManager.enableTexture();
 		GlStateManager.disableBlend();
 		GlStateManager.popMatrix();
+	}
+
+	/** The block's number {x, y, z, number} written on its top and its 4 sides, just off them. */
+	private static void drawNumber(MinecraftClient client, int[] block, double camX, double camY, double camZ) {
+		final String text = String.valueOf(block[3]);
+		final int width = client.textRenderer.getStringWidth(text);
+
+		for (int face = 0; face < 5; face++) {
+			GlStateManager.pushMatrix();
+			GlStateManager.translate(block[0] + 0.5 - camX, block[1] + 0.5 - camY, block[2] + 0.5 - camZ);
+
+			if (face == 4) {
+				GlStateManager.rotate(-90.0F, 1.0F, 0.0F, 0.0F);
+			} else {
+				GlStateManager.rotate(face * 90.0F, 0.0F, 1.0F, 0.0F);
+			}
+
+			GlStateManager.translate(0.0, 0.0, 0.5 - EXPANSION);
+			GlStateManager.scale(NUMBER_SCALE, -NUMBER_SCALE, NUMBER_SCALE);
+			client.textRenderer.draw(text, -width / 2, -4, 0xFFFFFF);
+			GlStateManager.popMatrix();
+		}
 	}
 
 	/** The nodes of a path {target x, y, z, node x, y, z, ...} as a line through the block centres, over everything. */

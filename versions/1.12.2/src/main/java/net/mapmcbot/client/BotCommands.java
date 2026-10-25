@@ -44,6 +44,11 @@ import net.minecraft.util.math.BlockPos;
  * #placewsrp X Y Z EX EY EZ [N]       as #placewsr X Y Z, then to EX EY EZ, as #breakwsrp
  * #breakwsrp BOT [N]                  as #breakwsr BOT, then BOT walks onto the second block clicked
  * #placewsrp BOT [N]                  as #placewsr BOT, then BOT walks onto the second block clicked
+ * #breakwsrpa X Y Z EX EY EZ [N]      PandaBot1 walks to EX EY EZ breaking the block at X Y Z on the way without
+ *                                      stopping; arrived without that, as #breakwsrp
+ * #placewsrpa X Y Z EX EY EZ [N]      as #breakwsrpa, putting a block it may place at X Y Z
+ * #breakwsrpa BOT [N]                 as #breakwsrp BOT, as #breakwsrpa
+ * #placewsrpa BOT [N]                 as #placewsrp BOT, as #placewsrpa
  * </pre>
  *
  * A mistake in a command is told in chat and nothing is sent.
@@ -57,7 +62,7 @@ final class BotCommands {
 		final String[] words = line.trim().split("\\s+");
 		final String command = words[0];
 
-		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#shiftmove", "#stop", "#status", "#breakwsr", "#placewsr", "#breakwsrp", "#placewsrp").contains(command)) {
+		if (!Arrays.asList("#goto", "#interact", "#break", "#place", "#close", "#move", "#itemfill", "#waitslot", "#hotbar", "#trade", "#lookat", "#drop", "#shiftmove", "#stop", "#status", "#breakwsr", "#placewsr", "#breakwsrp", "#placewsrp", "#breakwsrpa", "#placewsrpa").contains(command)) {
 			return false;
 		}
 
@@ -296,11 +301,14 @@ final class BotCommands {
 	/**
 	 * break_wsr or place_wsr: on PandaBot1, its target and radius in the line; or on the bot named, its
 	 * target clicked in the world as #break's and #place's. break_wsrp and place_wsrp: also the block it
-	 * ends in, after the target in the line, or the one on top of the block clicked second.
+	 * ends in, after the target in the line, or the one on top of the block clicked second; break_wsrpa and
+	 * place_wsrpa as those.
 	 */
 	private static void withSearch(MinecraftClient client, BotRegistry bots, String command, String[] w) {
 		final boolean place = command.startsWith("#placewsr");
-		final boolean ends = command.endsWith("p");
+		// "", "p" or "pa": the primitive's name after break_wsr or place_wsr.
+		final String suffix = command.substring(command.indexOf("wsr") + 3);
+		final boolean ends = !suffix.isEmpty();
 		final boolean picked = w.length >= 2 && !w[1].matches("-?[0-9]+");
 		final int given = picked ? 2 : ends ? 7 : 4;
 
@@ -315,7 +323,7 @@ final class BotCommands {
 		}
 
 		final JsonObject a = new JsonObject();
-		a.addProperty("action", (place ? "place_wsr" : "break_wsr") + (ends ? "p" : ""));
+		a.addProperty("action", (place ? "place_wsr" : "break_wsr") + suffix);
 		a.addProperty("radius", w.length > given ? number(w[given], "N") : 5);
 
 		if (picked) {
