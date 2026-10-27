@@ -2,7 +2,9 @@ package net.mapmcbot.chunk;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.DataInput;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -24,12 +26,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import net.mapmcbot.fleet.FleetProtocol;
+import net.mapmcbot.fleet.types.SocketProtocolType;
 
 /**
  * The last state of every chunk that left the registry, one file each under
  * root/server/dimension/x.z.chunk: magic, format version, save time (epoch ms), mcVersion, server,
- * dimension, chunk x, chunk z, then the data as {@link FleetProtocol#writeData} writes it.
+ * dimension, chunk x, chunk z, then the data as writeData writes it.
  *
  * FORMAT_VERSION goes up with every change to this layout or to the data; snapshots of any other
  * version are deleted when the store opens.
@@ -66,13 +68,13 @@ public final class ChunkSnapshotStore {
 	}
 
 	/**
-	 * The chunk in `slot` of the fleet's columns file (see FleetProtocol), its state ids named by
+	 * The chunk in `slot` of the fleet's columns file (see ChunkRegistry), its state ids named by
 	 * `names`. Only the block entities still on a block of their type are kept: the block changed
 	 * since drops them, as the game does.
 	 */
 	public void saveSlot(ChunkKey key, String mcVersion, ByteBuffer columns, int slot, String[] names,
 			Collection<ChunkData.BlockEntity> blockEntities) {
-		final int base = slot * FleetProtocol.COLUMN_SLOT_SIZE + FleetProtocol.COLUMN_STATES;
+		final int base = slot * ChunkRegistry.COLUMN_SLOT_SIZE + ChunkRegistry.COLUMN_STATES;
 		final int sectionCount = 16;
 		final List<ChunkData.Section> sections = new ArrayList<ChunkData.Section>(sectionCount);
 		// State id -> its index in the palette of the section being read, -1 while not in it.
@@ -159,12 +161,12 @@ public final class ChunkSnapshotStore {
 				out.writeInt(MAGIC);
 				out.writeInt(FORMAT_VERSION);
 				out.writeLong(System.currentTimeMillis());
-				FleetProtocol.writeString(out, mcVersion);
-				FleetProtocol.writeString(out, key.getServer());
-				FleetProtocol.writeString(out, key.getDimension());
+				SocketProtocolType.STRING.write(out, mcVersion);
+				SocketProtocolType.STRING.write(out, key.getServer());
+				SocketProtocolType.STRING.write(out, key.getDimension());
 				out.writeInt(key.getX());
 				out.writeInt(key.getZ());
-				FleetProtocol.writeData(out, data);
+				writeData(out, data);
 			}
 
 			synchronized (swapLock) {
@@ -189,15 +191,15 @@ public final class ChunkSnapshotStore {
 			}
 
 			final Instant savedAt = Instant.ofEpochMilli(in.readLong());
-			final String mcVersion = FleetProtocol.readString(in);
-			final ChunkKey stored = new ChunkKey(FleetProtocol.readString(in), FleetProtocol.readString(in),
+			final String mcVersion = SocketProtocolType.STRING.read(in);
+			final ChunkKey stored = new ChunkKey(SocketProtocolType.STRING.read(in), SocketProtocolType.STRING.read(in),
 					in.readInt(), in.readInt());
 
 			if (!stored.equals(key)) {
 				throw new IllegalStateException(file + " holds " + stored + ", not " + key);
 			}
 
-			final ChunkData data = FleetProtocol.readData(in);
+			final ChunkData data = readData(in);
 
 			if (in.read() != -1) {
 				throw new IllegalStateException("stray bytes at the end of " + file);
@@ -295,5 +297,102 @@ public final class ChunkSnapshotStore {
 		public ChunkData getData() {
 			return data;
 		}
+	}
+
+	/*
+	 * Chunk data: i32 minY, i32 height, then height/16 sections bottom up, each a u16 palette size, the
+	 * palette strings and, unless the palette has a single state, 4096 indices (u8 while the palette
+	 * fits in 256, u16 past that) in y, z, x order. Then i32 block entity count, each u8 x, i32 y, u8 z
+	 * (local), type string, i32 NBT length and the NBT.
+	 */
+
+	private static void writeData(DataOutput out, ChunkData data) throws IOException {
+		out.writeInt(data.getMinY());
+		out.writeInt(data.getHeight());
+
+		for (int s = 0; s < data.getSectionCount(); s++) {
+			final ChunkData.Section section = data.getSection(s);
+			final List<String> palette = section.getPalette();
+			out.writeShort(palette.size());
+
+			for (String state : palette) {
+				SocketProtocolType.STRING.write(out, state);
+			}
+
+			if (palette.size() == 1) {
+				continue;
+			}
+
+			final boolean wide = palette.size() > 256;
+
+			for (int i = 0; i < ChunkData.SECTION_VOLUME; i++) {
+				if (wide) {
+					out.writeShort(section.getIndex(i));
+				} else {
+					out.writeByte(section.getIndex(i));
+				}
+			}
+		}
+
+		out.writeInt(data.getBlockEntities().size());
+
+		for (ChunkData.BlockEntity entity : data.getBlockEntities()) {
+			out.writeByte(entity.getX());
+			out.writeInt(entity.getY());
+			out.writeByte(entity.getZ());
+			SocketProtocolType.STRING.write(out, entity.getType());
+			final byte[] nbt = entity.getNbt();
+			out.writeInt(nbt.length);
+			out.write(nbt);
+		}
+	}
+
+	private static ChunkData readData(DataInput in) throws IOException {
+		final int minY = in.readInt();
+		final int height = in.readInt();
+
+		if (height <= 0 || height % ChunkData.SECTION_HEIGHT != 0) {
+			throw new IOException("bad chunk height " + height);
+		}
+
+		final List<ChunkData.Section> sections = new ArrayList<ChunkData.Section>(height / ChunkData.SECTION_HEIGHT);
+
+		for (int s = 0; s < height / ChunkData.SECTION_HEIGHT; s++) {
+			final int size = in.readUnsignedShort();
+			final List<String> palette = new ArrayList<String>(size);
+
+			for (int i = 0; i < size; i++) {
+				palette.add(SocketProtocolType.STRING.read(in));
+			}
+
+			final char[] indices = new char[ChunkData.SECTION_VOLUME];
+
+			if (size > 1) {
+				final boolean wide = size > 256;
+
+				for (int i = 0; i < indices.length; i++) {
+					indices[i] = (char) (wide ? in.readUnsignedShort() : in.readUnsignedByte());
+				}
+			}
+
+			sections.add(new ChunkData.Section(palette, indices));
+		}
+
+		final int count = in.readInt();
+
+		if (count < 0) {
+			throw new IOException("bad block entity count " + count);
+		}
+
+		final List<ChunkData.BlockEntity> entities = new ArrayList<ChunkData.BlockEntity>(count);
+
+		for (int i = 0; i < count; i++) {
+			final int x = in.readUnsignedByte();
+			final int y = in.readInt();
+			final int z = in.readUnsignedByte();
+			entities.add(new ChunkData.BlockEntity(x, y, z, SocketProtocolType.STRING.read(in), SocketProtocolType.BYTES.read(in)));
+		}
+
+		return new ChunkData(minY, height, sections, entities);
 	}
 }

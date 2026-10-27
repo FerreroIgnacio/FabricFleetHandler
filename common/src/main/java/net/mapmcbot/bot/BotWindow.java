@@ -54,6 +54,11 @@ public final class BotWindow {
 		return index < properties.length ? properties[index] : 0;
 	}
 
+	/** Every property the server set, by index. */
+	public int[] getProperties() {
+		return properties.clone();
+	}
+
 	/** A villager's trades as the server last listed them, empty for any other window. */
 	public List<Trade> getTrades() {
 		return trades;

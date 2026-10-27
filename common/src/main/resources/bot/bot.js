@@ -62,8 +62,9 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     bot,
     name,
     log,
-    publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message, bot.entity?.position)),
+    publish: (kind, primitive, message) => out(protocol.state(name, { idle: 0, doing: 1, error: 2 }[kind], primitive, message, bot.entity)),
     draw: v => out(protocol.vis(name, v)),
+    drawBands: boxes => out(protocol.bands(name, boxes)),
     walk: goal => {
       setSearching(true)
       log(`goto ${spot(goal)} from ${at()}`)
@@ -166,7 +167,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
     bot.pathfinder.thinkTimeout = Infinity
     log('spawned')
     out(protocol.botSpawned(name))
-    out(protocol.state(name, 0, '', '', bot.entity.position))
+    out(protocol.state(name, 0, '', '', bot.entity))
   })
   // Every spawn, the first and each respawn or change of dimension: the fleet keeps where each bot is.
   bot.on('spawn', () => report({ world: world() }))
@@ -284,7 +285,10 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   bot.on('error', err => log('error: ' + err.message, 'E'))
 
   bot.on('chunkColumnLoad', point => {
-    columns.set(`${point.x >> 4},${point.z >> 4}`, { server, dimension: dimension(), x: point.x >> 4, z: point.z >> 4 })
+    const key = { server, dimension: dimension(), x: point.x >> 4, z: point.z >> 4 }
+    columns.set(`${key.x},${key.z}`, key)
+    // The mod waits on it for what reads the column's blocks (see PrimTest).
+    out(protocol.columnIn(name, key))
   })
 
   bot.on('chunkColumnUnload', point => {
@@ -349,7 +353,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
   // -1 (mineflayer's count up from 1): mineflayer answers their transactions as ones it did not
   // send, accepted, which the server takes as nothing. Done once the server confirms it; a click it
   // rejects is fatal, as mineflayer's (its error rejected). Also the mod's other clicks and the
-  // fleet's shift clicks and throws, carrying item (see actions.js syncedClick). The server ignores a
+  // fleet's shift clicks and throws, carrying item (see lib/window.js syncedClick). The server ignores a
   // click on a window it has closed: one pending as its window closes fails then (its error closed),
   // when sent closable (the item carrying ones, each awaited; a drag's are not).
   let rawAction = 0
@@ -473,7 +477,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       done()
       return
     }
-    // The rest (0 to 4) rejected on purpose, the window the server's after each (see actions.js
+    // The rest (0 to 4) rejected on purpose, the window the server's after each (see lib/window.js
     // syncedClick): prismarine-windows' guess of a click is not the server's for most windows (a
     // crafting grid used up by taking its result, a shift click, a throw), and the server never
     // corrects one it accepted. A window closed before the server answered (it ignores the click
@@ -721,7 +725,7 @@ module.exports = function startBot ({ name, host, port, chunks, send, report, on
       })
     },
 
-    // The blocks it may place, as the mod keys them (see actions.js holdAllowed).
+    // The blocks it may place, as the mod keys them (see lib/hold.js holdAllowed).
     setAllowedPlace (blocks) {
       act.setAllowedPlace(blocks)
     },

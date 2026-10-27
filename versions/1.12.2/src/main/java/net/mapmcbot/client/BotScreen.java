@@ -611,10 +611,9 @@ public class BotScreen extends HandledScreen {
 		stopJobButton.active = running;
 		stopJobButton.method_891(client, mouseX, mouseY, tickDelta);
 
-		// The bot's whole state under the buttons: an error with its message; its grab's or quarrify's while it has one.
+		// The bot's whole state under the buttons: an error with its message; its grab's while it has one.
 		final String grabStatus = MapMcBotClient.grab().status(selected);
-		final String quarrifyStatus = MapMcBotClient.quarrify().status(selected);
-		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : quarrifyStatus != null ? quarrifyStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
+		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
 		drawPickPanel(top + ACTION_ROWS * 21 + JOB_ROW + 16, mouseX, mouseY);
 		drawMatchPanel(mouseX, mouseY);
 		drawJobPanel(mouseX, mouseY);
@@ -1901,9 +1900,7 @@ public class BotScreen extends HandledScreen {
 			fill(MARGIN, top, MARGIN + CARD_WIDTH, top + CARD_HEIGHT, name.equals(selected) ? CARD_SELECTED : CARD);
 			fill(MARGIN, top, MARGIN + 3, top + CARD_HEIGHT, 0xFF000000 | MapMcBotClient.colorOf(name).getRgb());
 			textRenderer.drawWithShadow(name, MARGIN + 7, top + 3, TEXT);
-			final Integer fleet = bots.getFleet(name);
-			final String where = fleet == null ? "" : fleet == 0 ? "local" : "relay " + fleet;
-			textRenderer.drawWithShadow(textRenderer.trimToWidth(bots.getStatus(name) + "  " + where, CARD_WIDTH - 14), MARGIN + 7, top + 13, DIM);
+			textRenderer.drawWithShadow(textRenderer.trimToWidth(bots.getStatus(name), CARD_WIDTH - 14), MARGIN + 7, top + 13, DIM);
 		}
 	}
 

@@ -1,0 +1,2289 @@
+diff -ruN a/common/build.gradle b/common/build.gradle
+--- a/common/build.gradle	2026-10-26 22:43:29.842825490 -0300
++++ b/common/build.gradle	2026-10-26 22:43:29.843825490 -0300
+@@ -25,3 +25,13 @@
+ 	it.options.release = 8
+ }
+ 
++// The commit the mod is built at, for the relays to be at the same one (see RelayHub).
++def commit = providers.exec { commandLine "git", "rev-parse", "HEAD" }.standardOutput.asText.map { it.trim() }
++
++processResources {
++	inputs.property "commit", commit
++	def out = destinationDir
++	doLast {
++		new File(out, "mapmcbot-commit.txt").text = commit.get()
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/bot/BotManager.java b/common/src/main/java/net/mapmcbot/bot/BotManager.java
+--- a/common/src/main/java/net/mapmcbot/bot/BotManager.java	2026-10-26 22:43:19.303248885 -0300
++++ b/common/src/main/java/net/mapmcbot/bot/BotManager.java	2026-10-26 22:43:29.840952042 -0300
+@@ -55,6 +55,7 @@
+ import net.mapmcbot.fleet.message.ColumnGone;
+ import net.mapmcbot.fleet.message.Inventory;
+ import net.mapmcbot.fleet.message.Load;
++import net.mapmcbot.fleet.message.Log;
+ import net.mapmcbot.fleet.message.Path;
+ import net.mapmcbot.fleet.message.Profile;
+ import net.mapmcbot.fleet.message.Ready;
+@@ -93,7 +94,7 @@
+ public final class BotManager implements FleetChannel {
+ 	private static final AtomicBoolean CREATED = new AtomicBoolean();
+ 
+-	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "look.js", "lookTraces.json", "profiler.js", "protocol.js", "states.js", "columnSerializer.js", "package.json", "package-lock.json"};
++	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "look.js", "lookTraces.json", "profiler.js", "protocol.js", "states.js", "relaySupervisor.js", "columnSerializer.js", "package.json", "package-lock.json"};
+ 
+ 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
+ 
+@@ -531,7 +532,7 @@
+ 	}
+ 
+ 	/** The types that come in floods (chunks, chests, inventories, profiles): socket.log counts them up instead of a line each. */
+-	private static final Set<Integer> CHATTY = new HashSet<Integer>(Arrays.asList(Claim.TYPE, Ready.TYPE, Changed.TYPE, BlockEntityUpdate.TYPE, Unload.TYPE, Path.TYPE, Load.TYPE, Profile.TYPE, Inventory.TYPE, State.TYPE, Window.TYPE, ChestLid.TYPE, Chest.TYPE, ColumnGone.TYPE, Vis.TYPE, Bands.TYPE, Release.TYPE, Loaded.TYPE, ProfileRequest.TYPE));
++	private static final Set<Integer> CHATTY = new HashSet<Integer>(Arrays.asList(Claim.TYPE, Ready.TYPE, Changed.TYPE, BlockEntityUpdate.TYPE, Unload.TYPE, Path.TYPE, Load.TYPE, Profile.TYPE, Inventory.TYPE, State.TYPE, Window.TYPE, ChestLid.TYPE, Chest.TYPE, ColumnGone.TYPE, Log.TYPE, Vis.TYPE, Bands.TYPE, Release.TYPE, Loaded.TYPE, ProfileRequest.TYPE));
+ 
+ 	/**
+ 	 * A frame into socket.log, by its type's name: one of a chatty type (see CHATTY) is
+diff -ruN a/common/src/main/java/net/mapmcbot/bot/BotRegistry.java b/common/src/main/java/net/mapmcbot/bot/BotRegistry.java
+--- a/common/src/main/java/net/mapmcbot/bot/BotRegistry.java	2026-10-26 22:43:19.303360074 -0300
++++ b/common/src/main/java/net/mapmcbot/bot/BotRegistry.java	2026-10-26 22:43:19.315833475 -0300
+@@ -25,13 +25,19 @@
+ 
+ 	private final FleetChannel channel;
+ 
++	/** The relays; their bots are run there, the orders go through it. */
++	private final RelayHub relays;
++
+ 	/** The names for the bots: the mod picks them, the fleets are only told. */
+ 	private final NameList names;
+ 
+ 	/** The bots spawned and not yet gone. */
+ 	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+ 
+-	/** The server each bot spawned and not yet gone joins: as the fleet keys its columns. */
++	/** The fleet running each bot spawned and not yet gone: 0 the mod's own, else a relay's rid. */
++	private final Map<String, Integer> fleetOf = new ConcurrentHashMap<String, Integer>();
++
++	/** The server each bot spawned and not yet gone joins: where another fleet sends it if its relay fails to start. */
+ 	private final Map<String, InetSocketAddress> serverOf = new ConcurrentHashMap<String, InetSocketAddress>();
+ 
+ 	/** The bots in the world (BOT_SPAWNED) and not yet gone. */
+@@ -128,7 +134,7 @@
+ 	/** The blocks each bot may place: sent to it as it spawns and again each change. */
+ 	private final PlaceBlocks placeBlocks;
+ 
+-	public BotRegistry(FleetChannel channel, NameList names, BotProfileStore profiles, PlaceBlocks placeBlocks) {
++	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names, BotProfileStore profiles, PlaceBlocks placeBlocks) {
+ 		if (!CREATED.compareAndSet(false, true)) {
+ 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
+ 		}
+@@ -136,8 +142,10 @@
+ 		this.channel = channel;
+ 		this.names = names;
+ 		this.profiles = profiles;
++		this.relays = relays;
+ 		this.placeBlocks = placeBlocks;
+ 		channel.setBotListener(this);
++		relays.setBots(this);
+ 		placeBlocks.setListener(() -> {
+ 			for (String bot : spawned) {
+ 				sendAllowedPlace(bot);
+@@ -149,13 +157,19 @@
+ 		return placeBlocks;
+ 	}
+ 
+-	/** The blocks the bot may place, on the fleet (see FleetSocketHandler). */
++	/** The blocks the bot may place, on the fleet running it (see FleetSocketHandler). */
+ 	private void sendAllowedPlace(String bot) {
+-		if (!bots.contains(bot)) {
++		final Integer rid = fleetOf.get(bot);
++
++		if (rid == null) {
+ 			throw new IllegalStateException("no bot named " + bot + " to send the blocks it may place to");
+ 		}
+ 
+-		channel.allowedPlace(bot, placeBlocks.allowed(bot));
++		if (rid == 0) {
++			channel.allowedPlace(bot, placeBlocks.allowed(bot));
++		} else {
++			relays.allowedPlace(rid, bot, placeBlocks.allowed(bot));
++		}
+ 	}
+ 
+ 	public Set<String> getBots() {
+@@ -186,7 +200,7 @@
+ 		return windows.get(bot);
+ 	}
+ 
+-	/** A primitive for the bot as JSON, on the fleet (see FleetSocketHandler). */
++	/** A primitive for the bot as JSON, on the fleet running it (see FleetSocketHandler). */
+ 	public void action(String bot, String json) {
+ 		send(bot, json, false);
+ 	}
+@@ -197,7 +211,9 @@
+ 	}
+ 
+ 	private void send(String bot, String json, boolean internal) {
+-		if (!bots.contains(bot)) {
++		final Integer rid = fleetOf.get(bot);
++
++		if (rid == null) {
+ 			throw new IllegalStateException("no bot named " + bot + " to order " + json);
+ 		}
+ 
+@@ -207,10 +223,18 @@
+ 
+ 		// One from the UI does not chain: what the bot runs or holds goes first.
+ 		if (!internal) {
+-			channel.clearQ(bot);
++			if (rid == 0) {
++				channel.clearQ(bot);
++			} else {
++				relays.clearQ(rid, bot);
++			}
+ 		}
+ 
+-		channel.action(bot, json);
++		if (rid == 0) {
++			channel.action(bot, json);
++		} else {
++			relays.action(rid, bot, json);
++		}
+ 
+ 		for (ActionListener listener : actionListeners) {
+ 			listener.onAction(bot, json, internal);
+@@ -242,22 +266,54 @@
+ 		inventoryListeners.remove(listener);
+ 	}
+ 
+-	/** A click on the bot's inventory window, on the fleet (see FleetSocketHandler). */
++	/** How many bots the fleet runs (0 the mod's own, else a relay's rid), those still connecting too. */
++	public int countOn(int rid) {
++		int count = 0;
++
++		for (int fleet : fleetOf.values()) {
++			if (fleet == rid) {
++				count++;
++			}
++		}
++
++		return count;
++	}
++
++	/** Where the bot runs: 0 the mod's own fleet, else a relay's rid; null for no such bot. */
++	public Integer getFleet(String bot) {
++		return fleetOf.get(bot);
++	}
++
++	/** A click on the bot's inventory window, on the fleet running it (see FleetSocketHandler). */
+ 	public void windowClick(String bot, int slot, int button, int mode) {
+-		if (!bots.contains(bot)) {
++		final Integer rid = fleetOf.get(bot);
++
++		if (rid == null) {
+ 			throw new IllegalStateException("no bot named " + bot + " to click slot " + slot + " of");
+ 		}
+ 
+-		channel.windowClick(bot, slot, button, mode, clicksSent.merge(bot, 1, Integer::sum));
++		final int id = clicksSent.merge(bot, 1, Integer::sum);
++
++		if (rid == 0) {
++			channel.windowClick(bot, slot, button, mode, id);
++		} else {
++			relays.windowClick(rid, bot, slot, button, mode, id);
++		}
+ 	}
+ 
+-	/** The villager trade the bot's open window shows, on the fleet (see FleetSocketHandler). */
++	/** The villager trade the bot's open window shows, on the fleet running it (see FleetSocketHandler). */
+ 	public void tradeSelect(String bot, int trade) {
+-		if (!bots.contains(bot)) {
++		final Integer rid = fleetOf.get(bot);
++
++		if (rid == null) {
+ 			throw new IllegalStateException("no bot named " + bot + " to pick trade " + trade + " for");
+ 		}
+ 
+-		channel.tradeSelect(bot, trade);
++		if (rid == 0) {
++			channel.tradeSelect(bot, trade);
++		} else {
++			relays.tradeSelect(rid, bot, trade);
++		}
+ 	}
+ 
+ 	/**
+@@ -284,7 +340,9 @@
+ 	}
+ 
+ 	/**
+-	 * Starts a bot that joins host:port in the background, named by the name list; returns the name.
++	 * Starts a bot that joins host:port in the background, named by the name list, on the fleet
++	 * (the mod's own or a relay, a starting one too) with the fewest bots; returns the name.
++	 * Synchronized with a relay failing or closing, so its rid is never picked as it goes.
+ 	 */
+ 	public synchronized String create(String host, int port) {
+ 		final String name = names.take();
+@@ -295,11 +353,12 @@
+ 			}
+ 
+ 			serverOf.put(name, InetSocketAddress.createUnresolved(host, port));
+-			channel.spawn(name, host, port);
++			spawnOn(leastLoadedFleet(), name);
+ 			final BotProfile profile = profiles.get(name);
+ 			profiles.recordJoin(name, host + ":" + port, profile.getDefaultCrackedPassword());
+ 		} catch (RuntimeException e) {
+ 			if (bots.remove(name)) {
++				fleetOf.remove(name);
+ 				serverOf.remove(name);
+ 				names.give(name);
+ 			}
+@@ -310,19 +369,68 @@
+ 		return name;
+ 	}
+ 
+-	/** The bot walks to stand at x, y, z, on the fleet. */
++	private void spawnOn(int rid, String name) {
++		final InetSocketAddress server = serverOf.get(name);
++		fleetOf.put(name, rid);
++
++		if (rid == 0) {
++			channel.spawn(name, server.getHostString(), server.getPort());
++		} else {
++			relays.spawn(rid, name, server.getHostString(), server.getPort());
++		}
++	}
++
++	/** The rid of the fleet running the fewest bots, the lowest on a tie: 0 is the mod's own. */
++	private int leastLoadedFleet() {
++		final Map<Integer, Integer> counts = new java.util.TreeMap<Integer, Integer>();
++		counts.put(0, 0);
++
++		for (int rid : relays.rids()) {
++			counts.put(rid, 0);
++		}
++
++		for (int rid : fleetOf.values()) {
++			if (counts.containsKey(rid)) {
++				counts.put(rid, counts.get(rid) + 1);
++			}
++		}
++
++		int best = 0;
++
++		for (Map.Entry<Integer, Integer> entry : counts.entrySet()) {
++			if (entry.getValue() < counts.get(best)) {
++				best = entry.getKey();
++			}
++		}
++
++		return best;
++	}
++
++	/** The bot walks to stand at x, y, z, on the fleet running it. */
+ 	public void gotoSpot(String bot, int x, int y, int z) {
+-		if (!bots.contains(bot)) {
++		final Integer rid = fleetOf.get(bot);
++
++		if (rid == null) {
+ 			throw new IllegalStateException("no bot named " + bot + " to send to " + x + "," + y + "," + z);
+ 		}
+ 
+-		channel.gotoSpot(bot, x, y, z);
++		if (rid == 0) {
++			channel.gotoSpot(bot, x, y, z);
++		} else {
++			relays.gotoSpot(rid, bot, x, y, z);
++		}
+ 	}
+ 
+ 	/** Each bot leaves; the fleet unloads each chunk once no bot holds it. The fleets stay up. */
+ 	public synchronized void stopAll() {
+ 		for (String bot : bots) {
+-			channel.quit(bot);
++			final int rid = fleetOf.get(bot);
++
++			if (rid == 0) {
++				channel.quit(bot);
++			} else {
++				relays.quit(rid, bot);
++			}
+ 		}
+ 
+ 		clear();
+@@ -420,6 +528,7 @@
+ 			names.give(bot);
+ 		}
+ 
++		fleetOf.remove(bot);
+ 		serverOf.remove(bot);
+ 
+ 		spawned.remove(bot);
+@@ -432,15 +541,54 @@
+ 		windows.remove(bot);
+ 	}
+ 
+-	/** The fleet is gone: its bots with it. */
++	/** The mod's own fleet is gone: its bots with it. */
+ 	@Override
+ 	public void onClosed() {
+-		clear();
++		clearFleet(0);
++	}
++
++	/** A relay failed before its WELCOME (the hub holding this registry's lock): its bots never got there and go to the fleet with the fewest. */
++	void onRelayFailed(int rid) {
++		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
++			if (entry.getValue() == rid) {
++				spawnOn(leastLoadedFleet(), entry.getKey());
++			}
++		}
++	}
++
++	/** A relay is gone: its bots with it. */
++	void onRelayClosed(int rid) {
++		clearFleet(rid);
++	}
++
++	private void clearFleet(int rid) {
++		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
++			if (entry.getValue() != rid) {
++				continue;
++			}
++
++			final String bot = entry.getKey();
++			fleetOf.remove(bot);
++			serverOf.remove(bot);
++			spawned.remove(bot);
++			paths.remove(bot);
++			visuals.remove(bot);
++		bands.remove(bot);
++			inventories.remove(bot);
++			clicksSent.remove(bot);
++			statuses.remove(bot);
++			windows.remove(bot);
++
++			if (bots.remove(bot)) {
++				names.give(bot);
++			}
++		}
+ 	}
+ 
+ 	private void clear() {
+ 		names.giveAll();
+ 		bots.clear();
++		fleetOf.clear();
+ 		serverOf.clear();
+ 		spawned.clear();
+ 		paths.clear();
+diff -ruN a/common/src/main/java/net/mapmcbot/bot/NameList.java b/common/src/main/java/net/mapmcbot/bot/NameList.java
+--- a/common/src/main/java/net/mapmcbot/bot/NameList.java	2026-10-26 22:43:19.302982507 -0300
++++ b/common/src/main/java/net/mapmcbot/bot/NameList.java	2026-10-26 22:43:19.315803932 -0300
+@@ -6,7 +6,7 @@
+ import java.util.Set;
+ 
+ /**
+- * The names the mod gives its bots, so the fleet does not have to pick one: the mod hands the
++ * The names the mod gives its bots, so no fleet (main or relay) has to pick one: the mod hands the
+  * name over in the SPAWN and takes it back when the bot is gone. A name is in use by one bot at a time.
+  *
+  * Thread-safe: the game thread takes, the channel thread gives back.
+diff -ruN a/common/src/main/java/net/mapmcbot/bot/RelayHub.java b/common/src/main/java/net/mapmcbot/bot/RelayHub.java
+--- a/common/src/main/java/net/mapmcbot/bot/RelayHub.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/bot/RelayHub.java	2026-10-26 22:43:29.839825487 -0300
+@@ -0,0 +1,546 @@
++package net.mapmcbot.bot;
++
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.UncheckedIOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardOpenOption;
++import java.net.Socket;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import net.mapmcbot.fleet.ChunkMessage;
++import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.message.SocketMessage;
++import net.mapmcbot.fleet.FleetSocketHandler;
++import net.mapmcbot.fleet.message.AllowedPlace;
++import net.mapmcbot.fleet.message.ClearQ;
++import net.mapmcbot.fleet.message.Crash;
++import net.mapmcbot.fleet.message.Goto;
++import net.mapmcbot.fleet.message.Hello;
++import net.mapmcbot.fleet.message.Log;
++import net.mapmcbot.fleet.message.Primitives;
++import net.mapmcbot.fleet.message.ProfileRequest;
++import net.mapmcbot.fleet.message.Quit;
++import net.mapmcbot.fleet.message.Spawn;
++import net.mapmcbot.fleet.message.TradeSelect;
++import net.mapmcbot.fleet.message.UpdateFailed;
++import net.mapmcbot.fleet.message.Updating;
++import net.mapmcbot.fleet.message.WindowClick;
++import net.mapmcbot.fleet.message.Welcome;
++import net.mapmcbot.profile.ProfileListener;
++
++/**
++ * The relays: fleets (fleet.js --relay) on other machines, left running, that the mod connects to
++ * when it starts to run more bots there. They are listed in a file, one host[:port] a line
++ * (relays.txt in the mod's folder, # for comments; the port is DEFAULT_PORT when left out). The
++ * mod only knocks: a relay that is up takes the connection, one that is not is said so in the log
++ * and skipped. Each relay connected gets a rid, 1, 2, ... (0 is the mod's own fleet), and talks the
++ * same {@link FleetSocketHandler} frames as that one, except the ones about columns: a relay's world is
++ * its own and none of it goes to the mod, so such a frame from a relay is a failure.
++ *
++ * The first frame to a relay is HELLO with the commit the mod was built at; it is not connected until
++ * it answers WELCOME. A relay at another commit says UPDATING and updates itself first (git fetch and
++ * reset --hard to it, then it restarts on the same connection, see bot/fleet.js), or answers
++ * UPDATE_FAILED when it cannot get to it (a commit not pushed, say) and stays up
++ * for the next knock; why is kept in its crash log. Until connected, its {@link #pending} state says
++ * which of these it is in. A relay is handed bots from the knock on, as one connected: their orders
++ * wait in it and go once it is WELCOME, and should it fail before that they go to another fleet.
++ *
++ * Connecting happens on the mod's start ({@link #start}) and when asked for again
++ * ({@link #connectMissing}), for a relay started later; never on a timer.
++ */
++public final class RelayHub {
++	/** The port a relay listens on, unless its line in the file says another. */
++	public static final int DEFAULT_PORT = 16767;
++
++	/** What the profiler hears of the relays, called on the relay's reader thread. */
++	public interface ProfileSink {
++		/** A relay's profile (same rows as the mod's own fleet's; see bot/profiler.js). */
++		void onRelayProfile(int rid, String reason, String text);
++
++		void onRelayGone(int rid);
++	}
++
++	private final File file;
++	/** The relays (host:port) being connected to or connected. */
++	private final Set<String> active = ConcurrentHashMap.newKeySet();
++	/** The relays knocked on and not failed, by rid: starting (connecting or updating) or connected. */
++	private final Map<Integer, Relay> relays = new ConcurrentHashMap<Integer, Relay>();
++	private final AtomicInteger nextRid = new AtomicInteger(1);
++	/** The relays (host:port) knocked on and not connected: connecting, updating, update failed or crashed. */
++	private final Map<String, String> pending = new ConcurrentHashMap<String, String>();
++
++	private volatile BotRegistry bots;
++	private volatile ProfileSink profiles;
++	private volatile boolean started;
++
++	public RelayHub(File file) {
++		this.file = file;
++	}
++
++	/** Once, before start. */
++	void setBots(BotRegistry bots) {
++		if (this.bots != null) {
++			throw new IllegalStateException("the relay hub already has a bot registry");
++		}
++
++		this.bots = bots;
++	}
++
++	/** Once, before start. */
++	public void setProfileSink(ProfileSink profiles) {
++		if (this.profiles != null) {
++			throw new IllegalStateException("the relay hub already has a profile sink");
++		}
++
++		this.profiles = profiles;
++	}
++
++	/** Connects to the relays listed, once the registries that hear them are set. */
++	public void start() {
++		if (bots == null || profiles == null) {
++			throw new IllegalStateException("the relay hub starts after its bot registry and profile sink are set");
++		}
++
++		if (started) {
++			throw new IllegalStateException("the relay hub already started");
++		}
++
++		started = true;
++		connectMissing();
++	}
++
++	/** Knocks on every relay listed that is not connected yet; each answers on its own thread. */
++	public void connectMissing() {
++		for (String address : addresses()) {
++			if (!active.add(address)) {
++				continue;
++			}
++
++			pending.put(address, "connecting");
++			final Relay relay = new Relay(nextRid.getAndIncrement(), address);
++			relays.put(relay.rid, relay);
++			final Thread connect = new Thread(() -> connect(relay), "mapmcbot-relay-connect-" + address);
++			connect.setDaemon(true);
++			connect.start();
++		}
++	}
++
++	/** The lines of the file as host:port; none when there is no file. */
++	private List<String> addresses() {
++		if (!file.isFile()) {
++			return Collections.emptyList();
++		}
++
++		final List<String> addresses = new ArrayList<String>();
++
++		try {
++			for (String line : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
++				final String entry = line.trim();
++
++				if (entry.isEmpty() || entry.startsWith("#")) {
++					continue;
++				}
++
++				final int colon = entry.lastIndexOf(':');
++
++				if (colon < 0) {
++					addresses.add(entry + ":" + DEFAULT_PORT);
++					continue;
++				}
++
++				try {
++					Integer.parseInt(entry.substring(colon + 1));
++				} catch (NumberFormatException e) {
++					throw new IllegalStateException(file + ": bad port in the line \"" + entry + "\"", e);
++				}
++
++				addresses.add(entry);
++			}
++		} catch (IOException e) {
++			throw new UncheckedIOException("could not read " + file, e);
++		}
++
++		return addresses;
++	}
++
++	private void connect(Relay relay) {
++		final String address = relay.address;
++		boolean welcomed = false;
++
++		try {
++			try {
++				relay.open();
++			} catch (IOException e) {
++				active.remove(address);
++				pending.remove(address);
++				System.out.println("[mapmcbot] relay " + address + " is not alive: " + e);
++				return;
++			}
++
++			// Blocks this thread until the relay runs the mod's commit, which may take it a reset and a restart.
++			relay.write(new Hello("", commit()));
++
++			if (!relay.awaitWelcome()) {
++				return;
++			}
++
++			pending.remove(address);
++			System.out.println("[mapmcbot] relay " + relay.rid + " (" + address + ") is alive and connected");
++			relay.welcome();
++			welcomed = true;
++			relay.startReading();
++		} catch (IOException e) {
++			throw new UncheckedIOException("could not talk to relay " + address, e);
++		} finally {
++			if (!welcomed) {
++				// Its bots never got there: another fleet runs them.
++				synchronized (bots) {
++					relays.remove(relay.rid);
++					bots.onRelayFailed(relay.rid);
++				}
++
++				relay.close();
++			}
++		}
++	}
++
++	/** The rids of the relays starting or connected, ascending: each takes bots. */
++	public List<Integer> rids() {
++		final List<Integer> rids = new ArrayList<Integer>(relays.keySet());
++		Collections.sort(rids);
++		return rids;
++	}
++
++	/** The commit the mod was built at (mapmcbot-commit.txt, written by the build). */
++	private static String commit() {
++		try (InputStream in = RelayHub.class.getResourceAsStream("/mapmcbot-commit.txt")) {
++			if (in == null) {
++				throw new IllegalStateException("missing /mapmcbot-commit.txt in the jar: the build writes it");
++			}
++
++			final ByteArrayOutputStream out = new ByteArrayOutputStream();
++			final byte[] buffer = new byte[64];
++			int read;
++
++			while ((read = in.read(buffer)) != -1) {
++				out.write(buffer, 0, read);
++			}
++
++			return new String(out.toByteArray(), StandardCharsets.UTF_8).trim();
++		} catch (IOException e) {
++			throw new UncheckedIOException("could not read /mapmcbot-commit.txt in the jar", e);
++		}
++	}
++
++	/** The relays knocked on and not connected yet, host:port -> what they are at; for the overlay. */
++	public Map<String, String> pending() {
++		return pending;
++	}
++
++	/**
++	 * "localhost" is the relay's own machine there: a server of this one is at the address the relay
++	 * reached the mod by, known once it is connected.
++	 */
++	public void spawn(int rid, String bot, String host, int port) {
++		final Relay relay = relay(rid);
++		relay.order(() -> new Spawn(bot, isLoopback(host) ? relay.socket.getLocalAddress().getHostAddress() : host, port));
++	}
++
++	private static boolean isLoopback(String host) {
++		return host.equalsIgnoreCase("localhost") || host.startsWith("127.") || host.equals("::1");
++	}
++
++	public void quit(int rid, String bot) {
++		relay(rid).send(new Quit(bot));
++	}
++
++	public void windowClick(int rid, String bot, int slot, int button, int mode, int id) {
++		relay(rid).send(new WindowClick(bot, slot, button, mode, id));
++	}
++
++	public void tradeSelect(int rid, String bot, int trade) {
++		relay(rid).send(new TradeSelect(bot, trade));
++	}
++
++	public void allowedPlace(int rid, String bot, List<String> blocks) {
++		relay(rid).send(new AllowedPlace(bot, blocks));
++	}
++
++	public void clearQ(int rid, String bot) {
++		relay(rid).send(new ClearQ(bot));
++	}
++
++	public void action(int rid, String bot, String json) {
++		relay(rid).send(Primitives.fromJson(bot, json));
++	}
++
++	public void gotoSpot(int rid, String bot, int x, int y, int z) {
++		relay(rid).send(Goto.spot(bot, x, y, z));
++	}
++
++	/** Asks every relay connected for its profile; each answers with a PROFILE the sink hears. */
++	public void requestProfile(String reason) {
++		for (Relay relay : relays.values()) {
++			relay.sendIfWelcomed(new ProfileRequest("", 0, reason));
++		}
++	}
++
++	private Relay relay(int rid) {
++		final Relay relay = relays.get(rid);
++
++		if (relay == null) {
++			throw new IllegalStateException("relay " + rid + " is neither starting nor connected");
++		}
++
++		return relay;
++	}
++
++	/** A frame put together when it goes: one waiting for the WELCOME may need the connection. */
++	private interface Order {
++		SocketMessage message();
++	}
++
++	private final class Relay {
++		private final int rid;
++		private final String address;
++		private final Object writeLock = new Object();
++		/** The orders given while it starts, in order; null once WELCOME sent them. Under writeLock. */
++		private List<Order> waiting = new ArrayList<Order>();
++
++		private volatile Socket socket;
++		private InputStream in;
++		private OutputStream out;
++
++		Relay(int rid, String address) {
++			this.rid = rid;
++			this.address = address;
++		}
++
++		void open() throws IOException {
++			final int colon = address.lastIndexOf(':');
++			final Socket opened = new Socket(address.substring(0, colon), Integer.parseInt(address.substring(colon + 1)));
++			opened.setTcpNoDelay(true);
++			in = new BufferedInputStream(opened.getInputStream());
++			out = new BufferedOutputStream(opened.getOutputStream());
++			socket = opened;
++		}
++
++		/** Sent now when connected, else once it is. */
++		void order(Order order) {
++			synchronized (writeLock) {
++				if (waiting != null) {
++					waiting.add(order);
++					return;
++				}
++
++				write(order.message());
++			}
++		}
++
++		void send(SocketMessage message) {
++			order(() -> message);
++		}
++
++		/** Dropped while it starts: for what only makes sense now. */
++		void sendIfWelcomed(SocketMessage message) {
++			synchronized (writeLock) {
++				if (waiting == null) {
++					write(message);
++				}
++			}
++		}
++
++		/** The orders that waited go, and the next ones straight away. */
++		void welcome() {
++			synchronized (writeLock) {
++				for (Order order : waiting) {
++					write(order.message());
++				}
++
++				waiting = null;
++			}
++		}
++
++		void close() {
++			if (socket == null) {
++				return;
++			}
++
++			try {
++				socket.close();
++			} catch (IOException e) {
++				throw new UncheckedIOException("could not close the connection to relay " + rid, e);
++			}
++		}
++
++		/**
++		 * The relay's answer to HELLO: true on WELCOME, after any UPDATING; false on UPDATE_FAILED, the
++		 * relay up but not at the mod's commit. Anything else is no relay of this mod's, a failure.
++		 */
++		boolean awaitWelcome() throws IOException {
++			SocketMessage message;
++
++			while ((message = FleetSocketHandler.readFromSocket(in)) instanceof Updating) {
++				pending.put(address, "updating");
++				System.out.println("[mapmcbot] relay " + rid + " (" + address + ") is updating: " + ((Updating) message).text);
++			}
++
++			if (message instanceof Welcome) {
++				return true;
++			}
++
++			active.remove(address);
++
++			if (message instanceof UpdateFailed) {
++				pending.put(address, "update failed");
++				keepCrash(((UpdateFailed) message).text);
++				socket.close();
++				return false;
++			}
++
++			// The relay stays up whatever went wrong: this knock is over, the next one tries again.
++			if (message instanceof Crash) {
++				pending.put(address, "error");
++				keepCrash(((Crash) message).text);
++				socket.close();
++				return false;
++			}
++
++			pending.put(address, "crashed");
++
++			if (message == null) {
++				throw new IllegalStateException("relay " + rid + " (" + address + ") closed its connection before its WELCOME");
++			}
++
++			throw new IllegalStateException("relay " + rid + " (" + address + ") answered HELLO with " + FleetSocketHandler.Type.of(message.type()).name() + ", not WELCOME");
++		}
++
++		void write(SocketMessage message) {
++			synchronized (writeLock) {
++				try {
++					FleetSocketHandler.writeToSocket(message, out);
++					out.flush();
++				} catch (IOException e) {
++					throw new UncheckedIOException("could not write to relay " + rid, e);
++				}
++			}
++		}
++
++		void startReading() {
++			final Thread reader = new Thread(this::read, "mapmcbot-relay-reader-" + rid);
++			reader.setDaemon(true);
++			reader.start();
++		}
++
++		/** The relay's errors, next to relays.txt and one after the other, for whoever debugs them: the relay's own terminal is on another machine. */
++		/** What the relay wrote, all but the bots' info lines to the game log, and each line with its time, to fleet-relay<N>.log beside the mod's fleet.log of its own. */
++		private void keepLog(String text) {
++			final File log = new File(file.getAbsoluteFile().getParentFile(), "bot/fleet-relay" + rid + ".log");
++			final StringBuilder lines = new StringBuilder();
++
++			for (String line : text.split("\r?\n")) {
++				if (line.isEmpty()) {
++					continue;
++				}
++
++				// As the mod's own fleet's: a bot's info line ("[name] ...") stays in the file.
++				if (!line.startsWith("[")) {
++					System.out.println("[mapmcbot relay " + rid + "] " + line);
++				}
++
++				lines.append(java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"))).append(' ').append(line).append('\n');
++			}
++
++			try {
++				Files.write(log.toPath(), lines.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++			} catch (IOException e) {
++				throw new UncheckedIOException("could not write " + log, e);
++			}
++		}
++
++		private void keepCrash(String text) {
++			final File crash = new File(file.getAbsoluteFile().getParentFile(), "crash-relay" + rid + ".log");
++
++			try {
++				Files.write(crash.toPath(), (java.time.LocalDateTime.now() + " relay " + rid + " (" + address + "):\n" + text + "\n").getBytes(StandardCharsets.UTF_8),
++						StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++			} catch (IOException e) {
++				throw new UncheckedIOException("could not write " + crash, e);
++			}
++
++			System.out.println("[mapmcbot] relay " + rid + " had an error, it is in " + crash);
++		}
++
++		private void read() {
++			final ProfileListener listener = new ProfileListener() {
++				@Override
++				public void onProfile(int id, String reason, String text) {
++					profiles.onRelayProfile(rid, reason, text);
++				}
++
++				@Override
++				public void onFrame() {
++				}
++			};
++
++			IOException failure = null;
++
++			try {
++				SocketMessage message;
++
++				while ((message = FleetSocketHandler.readFromSocket(in)) != null) {
++
++					if (message instanceof Crash) {
++						keepCrash(((Crash) message).text);
++						continue;
++					}
++
++					if (message instanceof Log) {
++						keepLog(((Log) message).text);
++						continue;
++					}
++
++					if (message instanceof ChunkMessage) {
++						throw new IllegalStateException("relay " + rid + " sent a frame about columns (" + FleetSocketHandler.Type.of(message.type()).name() + "): a relay's world is its own");
++					}
++
++					if (!(message instanceof FromFleet)) {
++						throw new IllegalStateException("unexpected message type " + FleetSocketHandler.Type.of(message.type()).name() + " from relay " + rid);
++					}
++
++					((FromFleet) message).dispatch(null, bots, listener);
++				}
++			} catch (IOException e) {
++				failure = e;
++			} finally {
++				// However it ended, its bots are gone with it.
++				synchronized (bots) {
++					relays.remove(rid);
++					bots.onRelayClosed(rid);
++				}
++
++				active.remove(address);
++				profiles.onRelayGone(rid);
++			}
++
++			if (failure != null) {
++				throw new UncheckedIOException("lost the connection to relay " + rid, failure);
++			}
++
++			throw new IllegalStateException("relay " + rid + " closed its connection");
++		}
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/ChunkMessage.java b/common/src/main/java/net/mapmcbot/fleet/ChunkMessage.java
+--- a/common/src/main/java/net/mapmcbot/fleet/ChunkMessage.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/ChunkMessage.java	2026-10-26 22:43:19.316503541 -0300
+@@ -0,0 +1,5 @@
++package net.mapmcbot.fleet;
++
++/** A message about the columns of the mod's world: a relay's never are. */
++public interface ChunkMessage extends FromFleet {
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/FleetSocketHandler.java b/common/src/main/java/net/mapmcbot/fleet/FleetSocketHandler.java
+--- a/common/src/main/java/net/mapmcbot/fleet/FleetSocketHandler.java	2026-10-26 22:43:19.304013378 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/FleetSocketHandler.java	2026-10-26 22:43:19.316443686 -0300
+@@ -34,11 +34,16 @@
+ 		STATE_NAMES(StateNames.TYPE, StateNames::new),
+ 		LOAD(Load.TYPE, Load::new),
+ 		PROFILE(Profile.TYPE, Profile::new),
++		CRASH(Crash.TYPE, Crash::new),
++		WELCOME(Welcome.TYPE, Welcome::new),
++		UPDATING(Updating.TYPE, Updating::new),
++		UPDATE_FAILED(UpdateFailed.TYPE, UpdateFailed::new),
+ 		RELEASE(Release.TYPE, Release::new),
+ 		SPAWN(Spawn.TYPE, Spawn::new),
+ 		QUIT(Quit.TYPE, Quit::new),
+ 		LOADED(Loaded.TYPE, Loaded::new),
+ 		PROFILE_REQUEST(ProfileRequest.TYPE, ProfileRequest::new),
++		HELLO(Hello.TYPE, Hello::new),
+ 		GOTO(Goto.TYPE, Goto::new),
+ 		INVENTORY(Inventory.TYPE, Inventory::new),
+ 		WINDOW_CLICK(WindowClick.TYPE, WindowClick::new),
+@@ -48,6 +53,7 @@
+ 		CHEST_LID(ChestLid.TYPE, ChestLid::new),
+ 		CHEST(Chest.TYPE, Chest::new),
+ 		COLUMN_GONE(ColumnGone.TYPE, ColumnGone::new),
++		LOG(Log.TYPE, Log::new),
+ 		INTERACT(Interact.TYPE, Interact::new),
+ 		BREAK(Break.TYPE, Break::new),
+ 		PLACE(Place.TYPE, Place::new),
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/BlockEntityUpdate.java b/common/src/main/java/net/mapmcbot/fleet/message/BlockEntityUpdate.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/BlockEntityUpdate.java	2026-10-26 22:43:19.306558638 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/BlockEntityUpdate.java	2026-10-26 22:43:29.748023272 -0300
+@@ -11,11 +11,11 @@
+ import net.mapmcbot.bot.BotListener;
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: a block entity of the column set (type and NBT) or gone (type null). */
+-public final class BlockEntityUpdate extends SocketMessage implements FromFleet {
++public final class BlockEntityUpdate extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 4;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Changed.java b/common/src/main/java/net/mapmcbot/fleet/message/Changed.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Changed.java	2026-10-26 22:43:19.307292400 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Changed.java	2026-10-26 22:43:29.758883178 -0300
+@@ -11,11 +11,11 @@
+ import net.mapmcbot.bot.BotListener;
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: the readied column's blocks or block entities changed. */
+-public final class Changed extends SocketMessage implements FromFleet {
++public final class Changed extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 3;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Claim.java b/common/src/main/java/net/mapmcbot/fleet/message/Claim.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Claim.java	2026-10-26 22:43:19.306361334 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Claim.java	2026-10-26 22:43:29.763026777 -0300
+@@ -12,11 +12,11 @@
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkRegistry;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: the fleet's first bot got the column, once for the whole fleet, and loads it into the slot. */
+-public final class Claim extends SocketMessage implements FromFleet {
++public final class Claim extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 1;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Crash.java b/common/src/main/java/net/mapmcbot/fleet/message/Crash.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Crash.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Crash.java	2026-10-26 22:43:29.768320188 -0300
+@@ -0,0 +1,42 @@
++package net.mapmcbot.fleet.message;
++
++import static net.mapmcbot.fleet.types.MinecraftProtocolType.*;
++import static net.mapmcbot.fleet.types.SocketProtocolType.*;
++
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Relay to mod: the relay crashed, with the error text. */
++public final class Crash extends SocketMessage {
++	public static final int TYPE = 12;
++
++	public String text;
++
++	/** To deserialize. */
++	public Crash(String bot) {
++		super(bot);
++	}
++
++	public Crash(String bot, String text) {
++		super(bot);
++		this.text = text;
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++		TEXT.write(out, text);
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++		text = TEXT.read(in);
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Hello.java b/common/src/main/java/net/mapmcbot/fleet/message/Hello.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Hello.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Hello.java	2026-10-26 22:43:29.773787576 -0300
+@@ -0,0 +1,42 @@
++package net.mapmcbot.fleet.message;
++
++import static net.mapmcbot.fleet.types.MinecraftProtocolType.*;
++import static net.mapmcbot.fleet.types.SocketProtocolType.*;
++
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Mod to relay: the commit the mod was built at, the first frame; answered with Welcome once it is at it (updating itself first when not) or UpdateFailed. */
++public final class Hello extends SocketMessage {
++	public static final int TYPE = 22;
++
++	public String commit;
++
++	/** To deserialize. */
++	public Hello(String bot) {
++		super(bot);
++	}
++
++	public Hello(String bot, String commit) {
++		super(bot);
++		this.commit = commit;
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++		STRING.write(out, commit);
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++		commit = STRING.read(in);
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Load.java b/common/src/main/java/net/mapmcbot/fleet/message/Load.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Load.java	2026-10-26 22:43:19.306760901 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Load.java	2026-10-26 22:43:29.782876493 -0300
+@@ -12,11 +12,11 @@
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkRegistry;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: read the column's snapshot into the free slot; answered with Loaded. */
+-public final class Load extends SocketMessage implements FromFleet {
++public final class Load extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 10;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Log.java b/common/src/main/java/net/mapmcbot/fleet/message/Log.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Log.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Log.java	2026-10-26 22:43:29.784252804 -0300
+@@ -0,0 +1,42 @@
++package net.mapmcbot.fleet.message;
++
++import static net.mapmcbot.fleet.types.MinecraftProtocolType.*;
++import static net.mapmcbot.fleet.types.SocketProtocolType.*;
++
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Relay to mod: what the relay wrote to its output, a chunk of lines, once served. */
++public final class Log extends SocketMessage {
++	public static final int TYPE = 33;
++
++	public String text;
++
++	/** To deserialize. */
++	public Log(String bot) {
++		super(bot);
++	}
++
++	public Log(String bot, String text) {
++		super(bot);
++		this.text = text;
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++		TEXT.write(out, text);
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++		text = TEXT.read(in);
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Ready.java b/common/src/main/java/net/mapmcbot/fleet/message/Ready.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Ready.java	2026-10-26 22:43:19.306714107 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Ready.java	2026-10-26 22:43:29.804084501 -0300
+@@ -11,11 +11,11 @@
+ import net.mapmcbot.bot.BotListener;
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: the column is in its slot, to be read from now on. */
+-public final class Ready extends SocketMessage implements FromFleet {
++public final class Ready extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 2;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/StateNames.java b/common/src/main/java/net/mapmcbot/fleet/message/StateNames.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/StateNames.java	2026-10-26 22:43:19.306314540 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/StateNames.java	2026-10-26 22:43:29.817426250 -0300
+@@ -10,11 +10,11 @@
+ 
+ import net.mapmcbot.bot.BotListener;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: the name of each state id, once, first of all. */
+-public final class StateNames extends SocketMessage implements FromFleet {
++public final class StateNames extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 9;
+ 
+ 	/** By state id, 0x10000 of them; null for one not named. */
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Unload.java b/common/src/main/java/net/mapmcbot/fleet/message/Unload.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Unload.java	2026-10-26 22:43:19.306903030 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Unload.java	2026-10-26 22:43:29.820825471 -0300
+@@ -11,11 +11,11 @@
+ import net.mapmcbot.bot.BotListener;
+ import net.mapmcbot.chunk.ChunkKey;
+ import net.mapmcbot.chunk.ChunkListener;
+-import net.mapmcbot.fleet.FromFleet;
++import net.mapmcbot.fleet.ChunkMessage;
+ import net.mapmcbot.profile.ProfileListener;
+ 
+ /** Fleet to mod: the fleet's last bot let the column go; its slot waits on a Release. */
+-public final class Unload extends SocketMessage implements FromFleet {
++public final class Unload extends SocketMessage implements ChunkMessage {
+ 	public static final int TYPE = 5;
+ 
+ 	public ChunkKey key;
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/UpdateFailed.java b/common/src/main/java/net/mapmcbot/fleet/message/UpdateFailed.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/UpdateFailed.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/UpdateFailed.java	2026-10-26 22:43:29.823316813 -0300
+@@ -0,0 +1,42 @@
++package net.mapmcbot.fleet.message;
++
++import static net.mapmcbot.fleet.types.MinecraftProtocolType.*;
++import static net.mapmcbot.fleet.types.SocketProtocolType.*;
++
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Relay to mod: the relay could not get to the mod's commit, stays up and closes the connection; why in text. */
++public final class UpdateFailed extends SocketMessage {
++	public static final int TYPE = 15;
++
++	public String text;
++
++	/** To deserialize. */
++	public UpdateFailed(String bot) {
++		super(bot);
++	}
++
++	public UpdateFailed(String bot, String text) {
++		super(bot);
++		this.text = text;
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++		TEXT.write(out, text);
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++		text = TEXT.read(in);
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Updating.java b/common/src/main/java/net/mapmcbot/fleet/message/Updating.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Updating.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Updating.java	2026-10-26 22:43:29.824815557 -0300
+@@ -0,0 +1,42 @@
++package net.mapmcbot.fleet.message;
++
++import static net.mapmcbot.fleet.types.MinecraftProtocolType.*;
++import static net.mapmcbot.fleet.types.SocketProtocolType.*;
++
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Relay to mod: the relay is resetting to the mod's commit and restarting; Welcome or UpdateFailed follow. */
++public final class Updating extends SocketMessage {
++	public static final int TYPE = 14;
++
++	public String text;
++
++	/** To deserialize. */
++	public Updating(String bot) {
++		super(bot);
++	}
++
++	public Updating(String bot, String text) {
++		super(bot);
++		this.text = text;
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++		TEXT.write(out, text);
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++		text = TEXT.read(in);
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/fleet/message/Welcome.java b/common/src/main/java/net/mapmcbot/fleet/message/Welcome.java
+--- a/common/src/main/java/net/mapmcbot/fleet/message/Welcome.java	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/java/net/mapmcbot/fleet/message/Welcome.java	2026-10-26 22:43:29.828876951 -0300
+@@ -0,0 +1,28 @@
++package net.mapmcbot.fleet.message;
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++
++/** Relay to mod: the answer to Hello, its commit being the mod's; first of all. */
++public final class Welcome extends SocketMessage {
++	public static final int TYPE = 13;
++
++	public Welcome(String bot) {
++		super(bot);
++	}
++
++	@Override
++	public int type() {
++		return TYPE;
++	}
++
++	@Override
++	public void serialize(DataOutput out) throws IOException {
++	}
++
++	@Override
++	public void deserialize(DataInput in) throws IOException {
++	}
++}
+diff -ruN a/common/src/main/java/net/mapmcbot/profile/ProfileRegistry.java b/common/src/main/java/net/mapmcbot/profile/ProfileRegistry.java
+--- a/common/src/main/java/net/mapmcbot/profile/ProfileRegistry.java	2026-10-26 22:43:19.308578615 -0300
++++ b/common/src/main/java/net/mapmcbot/profile/ProfileRegistry.java	2026-10-26 22:43:19.319219705 -0300
+@@ -22,6 +22,7 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.Supplier;
+ 
++import net.mapmcbot.bot.RelayHub;
+ import net.mapmcbot.fleet.FleetChannel;
+ 
+ /**
+@@ -33,13 +34,14 @@
+  * asks for one (the screen opening, its refresh, the player leaving the world), and when the fleet
+  * takes one on an event of its own (a bot in a world or gone):
+  * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
+- * the mod's part alone.
++ * the mod's part alone. Each relay answers every request with its own, logged with its rows scoped
++ * "relay<rid>." before the fleet's own scopes.
+  *
+  * Thread-safe: the channel thread feeds it, anyone may read it.
+  *
+  * SINGLETON: one per game; a second registry throws.
+  */
+-public final class ProfileRegistry implements ProfileListener {
++public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileSink {
+ 	private static final AtomicBoolean CREATED = new AtomicBoolean();
+ 
+ 	/** Reports kept for the screen. */
+@@ -65,6 +67,10 @@
+ 	private static final java.time.format.DateTimeFormatter TIME = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss");
+ 
+ 	private final FleetChannel channel;
++	private final RelayHub relays;
++	/** Each relay's newest profile and the one its rates are worked out against (its own reports, apart from the mod's). */
++	private final java.util.Map<Integer, ProfileReport> relayLatest = new java.util.TreeMap<Integer, ProfileReport>();
++	private final java.util.Map<Integer, ProfileReport> relayBase = new java.util.HashMap<Integer, ProfileReport>();
+ 	/** Per bot that claimed them: {chunks, block entities, bytes of their NBT} held by the chunk registry. */
+ 	private final Supplier<Map<String, long[]>> chunksByBot;
+ 	/** Reopened on each rotation (see MAX_LOG). */
+@@ -84,7 +90,7 @@
+ 	/** The request whose profile has not arrived, 0 for none. */
+ 	private volatile int waitingFor;
+ 
+-	public ProfileRegistry(FleetChannel channel, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
++	public ProfileRegistry(FleetChannel channel, RelayHub relays, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
+ 		if (!CREATED.compareAndSet(false, true)) {
+ 			throw new IllegalStateException("ProfileRegistry is a singleton: one was already created");
+ 		}
+@@ -106,6 +112,7 @@
+ 		threads.setThreadAllocatedMemoryEnabled(true);
+ 
+ 		this.channel = channel;
++		this.relays = relays;
+ 		this.chunksByBot = chunksByBot;
+ 		this.logFile = logFile;
+ 
+@@ -116,6 +123,7 @@
+ 		openLog();
+ 
+ 		channel.setProfileListener(this);
++		relays.setProfileSink(this);
+ 
+ 		// Not an executor's: one would keep what the request throws to itself. Thrown here, it ends the
+ 		// thread with its trace, and the profiles with it.
+@@ -154,6 +162,9 @@
+ 	public void request(String reason) {
+ 		final int id;
+ 
++		// The relays answer on their own, each into its own report.
++		relays.requestProfile(reason);
++
+ 		synchronized (this) {
+ 			if (!channel.isRunning()) {
+ 				record(reason, new ArrayList<ProfileReport.Row>());
+@@ -172,6 +183,11 @@
+ 		return history.isEmpty() ? null : history.getLast();
+ 	}
+ 
++	/** The newest profile of the relay `rid`, null before its first or once it is gone. Its rows are scoped as the mod's own fleet's ("node"...). */
++	public synchronized ProfileReport getRelayLatest(int rid) {
++		return relayLatest.get(rid);
++	}
++
+ 	/** The profiles so far, oldest first. */
+ 	public synchronized List<ProfileReport> getHistory() {
+ 		return new ArrayList<ProfileReport>(history);
+@@ -186,6 +202,29 @@
+ 		}
+ 	}
+ 
++	@Override
++	public synchronized void onRelayProfile(int rid, String reason, String text) {
++		final long now = System.currentTimeMillis();
++		final ProfileReport latest = relayLatest.get(rid);
++		ProfileReport base = relayBase.get(rid);
++
++		// As for the mod's: rates against the newest report at least MIN_INTERVAL older.
++		if (latest != null && now - latest.getTime() >= MIN_INTERVAL) {
++			base = latest;
++			relayBase.put(rid, base);
++		}
++
++		final ProfileReport report = new ProfileReport(now, reason, ProfileReport.parse(text), base);
++		relayLatest.put(rid, report);
++		writeRelay(rid, report);
++	}
++
++	@Override
++	public synchronized void onRelayGone(int rid) {
++		relayLatest.remove(rid);
++		relayBase.remove(rid);
++	}
++
+ 	/** The profiles come once a second (see PROFILE_EVERY), not by frames. */
+ 	@Override
+ 	public void onFrame() {
+@@ -320,6 +359,22 @@
+ 			finish();
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException("could not write " + logFile, e);
++		}
++	}
++
++	/** A relay's report in the log as the mod's: its summary line, then its scopes, "relay<rid>." before each. */
++	private void writeRelay(int rid, ProfileReport report) {
++		final String time = time(report);
++		final String prefix = "relay" + rid + ".";
++
++		try {
++			line("# " + time + " " + prefix + " " + oneLine(report.getReason()) + ": " + String.format(Locale.ROOT, "node cpu %s, rss %s, bots %d%s",
++					cpu(report, "node", "cpu.user", "cpu.system"), megabytes(report.value("node", "mem.rss")), (int) report.value("node", "bots"),
++					report.hasRates() ? String.format(Locale.ROOT, " | over %.1f s", report.getInterval() / 1000.0) : ""));
++			rows(time, prefix, report);
++			finish();
++		} catch (IOException e) {
++			throw new UncheckedIOException("could not write " + logFile, e);
+ 		}
+ 	}
+ 
+diff -ruN a/common/src/main/resources/bot/fleet.js b/common/src/main/resources/bot/fleet.js
+--- a/common/src/main/resources/bot/fleet.js	2026-10-26 22:43:19.310315660 -0300
++++ b/common/src/main/resources/bot/fleet.js	2026-10-26 22:43:19.319808056 -0300
+@@ -2,7 +2,24 @@
+ // share their chunk columns (sharedChunks.js), driven by the mod over one socket (see protocol.js).
+ // The columns' blocks are not sent: they live in columns.bin, mapped by the threads and, for the
+ // mod's own fleet, the mod.
++//
++// A relay is this same fleet on another machine, left running: it listens, and a mod that starts
++// connects to it (see RelayHub.java). Its columns.bin is its own and the mod never sees its world
++// (no frame about columns goes to the mod). When the mod goes, its bots quit and the relay waits
++// for the next one.
++//
++// A relay runs the mod's commit: the mod's first frame is HELLO with it, answered WELCOME when it is
++// this relay's. When not, the relay tells the mod it is UPDATING, fetches and resets its checkout to
++// that commit by force, and restarts on it, the mod's connection and all (see update). When it cannot
++// get to it (not pushed, say) it says why (UPDATE_FAILED), closes that connection and stays up.
++//
++// A relay never goes down: any error of its own goes to the mod (CRASH, kept there in
++// crash-relay<N>.log) and it goes on; a pool thread that dies takes only its bots with it. What it
++// writes (its bots' lines too) goes to the mod as well once served (LOG, kept in fleet-relay<N>.log).
+ // Usage: node fleet.js <mod port> <columns.bin>
++//        node fleet.js --relay <port to listen on> <columns.bin>
++const { execSync } = require('child_process')
++const fs = require('fs')
+ const net = require('net')
+ const os = require('os')
+ const path = require('path')
+@@ -11,10 +28,29 @@
+ const states = require('./states')
+ const { threadProfiler, toText } = require('./profiler')
+ const { HEADER, SLOTS, SIZE, loadedHeader } = require('./sharedChunks')
++const { RESTART } = require('./relaySupervisor')
+ 
+-const socketPort = Number(process.argv[2])
+-const columnsFile = process.argv[3]
+-if (!Number.isInteger(socketPort) || !columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin>')
++const relay = process.argv[2] === '--relay'
++const socketPort = Number(relay ? process.argv[3] : process.argv[2])
++const columnsFile = relay ? process.argv[4] : process.argv[3]
++if (!Number.isInteger(socketPort) || !columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin> | node fleet.js --relay <port to listen on> <columns.bin>')
++
++// The relay started by hand is its supervisor (relaySupervisor.js), which runs this file again as
++// the relay itself, handing it the mod's connections.
++if (relay && !process.env.MAPMCBOT_RELAY_CHILD) {
++  require('./relaySupervisor')(socketPort)
++  return
++}
++
++// The commit this relay's checkout is at as it starts, the one it runs: a git reset later does not change it.
++const VERSION = relay ? execSync('git rev-parse HEAD', { cwd: __dirname }).toString().trim() : null
++
++// The mod makes the columns file of its own fleet; a relay makes its own, every slot zeros.
++if (relay) {
++  const fd = fs.openSync(columnsFile, 'w')
++  fs.ftruncateSync(fd, SLOTS * SIZE)
++  fs.closeSync(fd)
++}
+ 
+ const prof = threadProfiler('node.thread:fleet')
+ 
+@@ -102,6 +138,7 @@
+ // Columns ("server|dimension|cx,cz") to have in memory off their snapshot, as cached ones. Nothing
+ // asks for any yet.
+ function wantSnapshots (keys) {
++  if (relay) throw new Error('a relay has no snapshots: its world is its own, the mod has none of it')
+   for (const key of keys) {
+     if (columns.has(key) || noSnapshot.has(key) || loading.has(key)) continue
+     toLoad.add(key)
+@@ -210,7 +247,7 @@
+     const load = !column
+     if (load) {
+       const slot = takeSlot(request.acquire)
+-      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: true, ready: false }
++      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: !relay, ready: false }
+       columns.set(request.acquire, column)
+       slotColumns.set(slot, column)
+       send(protocol.claim(request.bot, column.chunk, column.claim, column.slot, request.version))
+@@ -259,7 +296,8 @@
+     bots.delete(report.bot)
+     worldOf.delete(report.bot)
+     thread.bots--
+-    if (closing && bots.size === 0) process.exit(0)
++    // A relay stays up for the next mod.
++    if (closing && bots.size === 0 && !relay) process.exit(0)
+     takeProfile(0, `${report.bot} gone`)
+   } else {
+     throw new Error('unknown report from a pool thread')
+@@ -287,12 +325,38 @@
+   })
+   thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
+   thread.worker.on('error', err => { throw err })
+-  thread.worker.on('exit', code => { throw new Error(`pool thread exited (code ${code})`) })
++  thread.worker.on('exit', code => {
++    if (!relay) throw new Error(`pool thread exited (code ${code})`)
++    dropThread(thread, code)
++  })
+   port1.on('message', message => onThreadMessage(thread, message))
+   threads.push(thread)
+   return thread
+ }
+ 
++// A relay's pool thread died: its bots and columns are let go, the profiles stop waiting on it, the
++// rest of the relay goes on. The error goes to the mod.
++function dropThread (thread, code) {
++  threads.splice(threads.indexOf(thread), 1)
++  const gone = []
++  for (const [name, t] of bots) {
++    if (t !== thread) continue
++    bots.delete(name)
++    worldOf.delete(name)
++    gone.push(name)
++    send(protocol.botGone(name))
++  }
++  for (const [key, column] of columns) {
++    if (!column.threads.delete(thread) || column.threads.size > 0) continue
++    changed.delete(key)
++    cached.set(key, column)
++  }
++  for (const [key, profile] of profiles) {
++    if (profile.waiting.delete(thread.worker)) finishProfile(key, profile)
++  }
++  throw new Error(`pool thread exited (code ${code}), its bots gone with it: ${gone.join(', ') || 'none'}`)
++}
++
+ // Profiles being put together: key -> { id, reason, waiting: the threads yet to send their rows,
+ // rows }. Every thread of the fleet sends its own (see profiler.js), the pool threads their bots'
+ // too; once all of them did, the profile goes to the mod. `id` is the mod's PROFILE_REQUEST's, 0
+@@ -371,13 +435,40 @@
+   return [...byKey.values()]
+ }
+ 
+-// Once closing the mod is gone: what the bots still report on their way out has nowhere to go.
+-let closing = false
++// Once closing the mod is gone: what the bots still report on their way out has nowhere to go. A
++// relay is closing too while no mod is connected.
++let closing = relay
+ let socket = null
+ 
++// A relay's error goes to the mod, which keeps it (crash-relay<N>.log): its terminal is on another
++// machine. The relay goes on, it never goes down; should it end anyway, its supervisor says so and
++// starts another.
++const relayFailed = err => {
++  console.error('E', err)
++  if (!relay) process.exit(1)
++  if (socket && !socket.destroyed) socket.write(protocol.crash(err?.stack ?? String(err)))
++}
++process.on('uncaughtException', relayFailed)
++process.on('unhandledRejection', relayFailed)
++
++// A relay's world stays with it: the frames about columns are left out.
+ const send = frame => {
+   if (closing || !socket) return
+-  socket.write(frame)
++  const out = relay ? protocol.withoutChunkFrames(frame) : frame
++  if (out) socket.write(out)
++}
++
++// A relay's output, its pool threads' with it (piped through this process's), goes to the mod too:
++// its terminal is on another machine. Only once the mod is served, after its WELCOME, which comes first.
++let served = null
++if (relay) {
++  for (const stream of [process.stdout, process.stderr]) {
++    const write = stream.write.bind(stream)
++    stream.write = (chunk, ...rest) => {
++      if (served && served === socket) send(protocol.log(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')))
++      return write(chunk, ...rest)
++    }
++  }
+ }
+ 
+ function onFrame (frame) {
+@@ -424,6 +515,8 @@
+     case protocol.TYPES.PROFILE_REQUEST:
+       takeProfile(message.id, message.reason)
+       break
++    case protocol.TYPES.HELLO:
++      throw new Error('the mod sent HELLO again, past its first frame')
+   }
+ }
+ 
+@@ -431,23 +524,121 @@
+ function close () {
+   if (closing) return
+   closing = true
+-  if (bots.size === 0) process.exit(0)
++  if (bots.size === 0) {
++    if (!relay) process.exit(0)
++    return
++  }
+   for (const [name, thread] of bots) thread.worker.postMessage({ type: 'quit', bot: name })
+ }
+ 
+-// The mod's connection, the fleet started with it.
++// The mod's connection: the mod's own fleet is started with it, a relay is handed it by its server.
+ function serve (connection) {
+   socket = connection
+   closing = false
+   connection.setNoDelay(true)
+-  connection.on('error', err => { throw err })
++  if (relay) send(protocol.welcome())
++  served = connection
++  connection.on('error', err => {
++    if (!relay) throw err
++    // A relay outlives the mod: a connection that fails ends that session, said loudly, and it waits for the next.
++    console.error(`E the mod's connection failed: ${err.message}`)
++  })
+   // First of all: the names of the state ids the slots hold.
+   send(protocol.stateNames(states.legacyNames()))
+   connection.on('data', protocol.frames(onFrame))
+   connection.on('close', close)
+ }
+ 
+-serve(net.connect(socketPort, '127.0.0.1'))
+-// The fleet lives and dies with the mod's process.
+-process.stdin.on('end', close)
+-process.stdin.resume()
++// A relay waits on the mod's HELLO: the same commit is served, another has it update.
++function hello (connection, id) {
++  // Taken until the mod is served or gone: another mod is refused meanwhile.
++  closing = false
++  socket = connection
++  const onClose = () => { closing = true }
++  const onError = err => console.error(`E the mod's connection failed before its HELLO: ${err.message}`)
++  const onData = protocol.frames(frame => {
++    const message = protocol.decode(frame)
++    if (message.type !== protocol.TYPES.HELLO) throw new Error(`the mod's first frame is type ${message.type}, not HELLO`)
++    // The mod sends nothing more until its WELCOME: whatever comes next is the served relay's to read.
++    connection.pause()
++    connection.off('data', onData)
++    connection.off('error', onError)
++    connection.off('close', onClose)
++    if (message.version === VERSION) {
++      connection.resume()
++      serve(connection)
++    } else {
++      update(connection, id, message.version)
++    }
++  })
++  connection.on('close', onClose)
++  connection.on('error', onError)
++  connection.on('data', onData)
++}
++
++// The mod runs another commit than this relay: its checkout is reset to it by force, whatever it had
++// (npm ci too when package-lock.json changed), and this relay ends for its supervisor to start a new
++// one on it, handed the same connection and the mod's commit to check once more.
++function update (connection, id, version) {
++  if (!/^[0-9a-f]{40}$/.test(version)) {
++    refuse(connection, `the mod sent ${JSON.stringify(version)} for its commit, not a commit hash`)
++    return
++  }
++  const text = `the mod runs commit ${version}, this relay ${VERSION}: git fetch, reset --hard and restart`
++  console.log(text)
++  send(protocol.updating(text))
++  const lockFile = path.join(__dirname, 'package-lock.json')
++  const lock = fs.readFileSync(lockFile)
++  try {
++    execSync('git fetch', { cwd: __dirname, stdio: 'inherit' })
++    execSync(`git reset --hard ${version}`, { cwd: __dirname, stdio: 'inherit' })
++    if (!fs.readFileSync(lockFile).equals(lock)) execSync('npm ci --no-audit --no-fund', { cwd: __dirname, stdio: 'inherit' })
++  } catch (err) {
++    refuse(connection, `the update failed: ${err.message}`)
++    return
++  }
++  // Said before it ends: the supervisor hands this connection to the next relay.
++  process.send({ type: 'restart', id, version }, () => process.exit(RESTART))
++}
++
++// The mod's commit is out of this relay's reach: the mod is told why and the relay waits for the next.
++function refuse (connection, text) {
++  console.error(`E ${text}`)
++  connection.on('error', err => console.error(`E the mod's connection failed while refused: ${err.message}`))
++  send(protocol.updateFailed(text))
++  closing = true
++  connection.end()
++}
++
++if (relay) {
++  // Each knock comes from the supervisor, which holds the port; `handoff` the mod's commit when the
++  // connection is one this relay's predecessor updated for, its HELLO already answered.
++  process.on('message', ({ type, id, handoff }, connection) => {
++    if (type !== 'connection' || !connection) throw new Error(`the supervisor sent ${JSON.stringify(type)} without a connection`)
++    connection.on('close', () => process.send({ type: 'done', id }))
++    if (handoff) {
++      socket = connection
++      closing = false
++      if (handoff !== VERSION) {
++        refuse(socket, `after its reset this relay is at commit ${VERSION}, the mod at ${handoff}`)
++      } else {
++        console.log(`updated to the mod's commit ${VERSION}`)
++        serve(socket)
++      }
++      return
++    }
++    // One mod at a time, and not while the last one's bots are still leaving.
++    if (!(closing && bots.size === 0)) {
++      console.error(`E refused ${connection.remoteAddress}: a mod is connected or its bots are still leaving`)
++      connection.destroy()
++      return
++    }
++    console.log(`mod connected from ${connection.remoteAddress}`)
++    hello(connection, id)
++  })
++} else {
++  serve(net.connect(socketPort, '127.0.0.1'))
++  // The mod's own fleet lives and dies with the mod's process.
++  process.stdin.on('end', close)
++  process.stdin.resume()
++}
+diff -ruN a/common/src/main/resources/bot/protocol.js b/common/src/main/resources/bot/protocol.js
+--- a/common/src/main/resources/bot/protocol.js	2026-10-26 22:43:19.310384525 -0300
++++ b/common/src/main/resources/bot/protocol.js	2026-10-26 22:43:19.319854082 -0300
+@@ -15,12 +15,17 @@
+   STATE_NAMES: 9,
+   LOAD: 10,
+   PROFILE: 11,
++  CRASH: 12,
++  WELCOME: 13,
++  UPDATING: 14,
++  UPDATE_FAILED: 15,
+   INVENTORY: 24,
+   STATE: 26,
+   WINDOW: 27,
+   CHEST_LID: 30,
+   CHEST: 31,
+   COLUMN_GONE: 32,
++  LOG: 33,
+   VIS: 54,
+   CLEAR_Q: 55,
+   BANDS: 58,
+@@ -30,6 +35,7 @@
+   SPAWN: 17,
+   QUIT: 18,
+   PROFILE_REQUEST: 21,
++  HELLO: 22,
+   WINDOW_CLICK: 25,
+   TRADE_SELECT: 29,
+   ALLOWED_PLACE: 49,
+@@ -464,7 +470,7 @@
+ 
+ // A block with an inventory (a chest, trapped chest, hopper, dispenser, dropper, furnace, brewing stand
+ // or shulker box: its type, "minecraft:chest"...) is at pos (world) in the column, or
+-// none is any more (type empty). The mod keeps the chests.
++// none is any more (type empty). Not a column frame: relays send it too, the mod keeps the chests.
+ function chest (bot, key, pos, type) {
+   const w = new Writer(TYPES.CHEST)
+   w.header(bot, key)
+@@ -475,7 +481,8 @@
+   return w.frame()
+ }
+ 
+-// The fleet let the column go: what the mod knows of its chests may go stale from here on.
++// The fleet let the column go: what the mod knows of its chests may go stale from here on. Not a
++// column frame: relays send it too.
+ function columnGone (bot, key) {
+   const w = new Writer(TYPES.COLUMN_GONE)
+   w.header(bot, key)
+@@ -508,6 +515,47 @@
+   return w.frame()
+ }
+ 
++// The fleet crashed: its error, for the mod to keep. Only a relay sends it (the mod has its own fleet's output). No bot: an empty name.
++function crash (text) {
++  const w = new Writer(TYPES.CRASH)
++  w.str('')
++  w.bytes(Buffer.from(text, 'utf8'))
++  return w.frame()
++}
++
++// What a relay wrote to its output, for the mod to keep (a chunk of lines). Only a relay sends it. No bot: an empty name.
++function log (text) {
++  const w = new Writer(TYPES.LOG)
++  w.str('')
++  w.bytes(Buffer.from(text, 'utf8'))
++  return w.frame()
++}
++
++// A relay's answer to the mod's HELLO: it runs the mod's scripts. No bot: an empty name.
++function welcome () {
++  const w = new Writer(TYPES.WELCOME)
++  w.str('')
++  return w.frame()
++}
++
++// A relay running other scripts than the mod's is pulling them and restarting; WELCOME or
++// UPDATE_FAILED follow. `text` says from what to what. No bot: an empty name.
++function updating (text) {
++  const w = new Writer(TYPES.UPDATING)
++  w.str('')
++  w.bytes(Buffer.from(text, 'utf8'))
++  return w.frame()
++}
++
++// The relay could not get to the mod's scripts (`text` why): it stays up on its own and closes this
++// connection. No bot: an empty name.
++function updateFailed (text) {
++  const w = new Writer(TYPES.UPDATE_FAILED)
++  w.str('')
++  w.bytes(Buffer.from(text, 'utf8'))
++  return w.frame()
++}
++
+ // The fleet's profile (see profiler.js): `id` the PROFILE_REQUEST's, 0 when the fleet took it on an
+ // event of its own, `reason` what it was taken for, `text` its rows. No bot: an empty name.
+ function profile (id, reason, text) {
+@@ -519,6 +567,22 @@
+   return w.frame()
+ }
+ 
++// The frames that carry columns of the mod's world: a relay's world is its own, none of them go to the mod.
++const CHUNK_TYPES = new Set([TYPES.CLAIM, TYPES.READY, TYPES.CHANGED, TYPES.BLOCK_ENTITY_UPDATE, TYPES.UNLOAD, TYPES.STATE_NAMES, TYPES.LOAD])
++
++// `buffer` holds whole frames, one after the other (length included); those about columns left out.
++// Null when none is left.
++function withoutChunkFrames (buffer) {
++  const kept = []
++  for (let offset = 0; offset < buffer.length;) {
++    const end = offset + 4 + buffer.readUInt32BE(offset)
++    if (end > buffer.length) throw new Error('truncated frame')
++    if (!CHUNK_TYPES.has(buffer[offset + 4])) kept.push(buffer.subarray(offset, end))
++    offset = end
++  }
++  return kept.length === 0 ? null : Buffer.concat(kept)
++}
++
+ // A mod -> fleet frame (without its length) as an object.
+ function decode (frame) {
+   const r = new Reader(frame)
+@@ -561,6 +625,10 @@
+       message = { type, bot, blocks: Array.from({ length: count }, () => r.str()) }
+       break
+     }
++    case TYPES.HELLO:
++      // version: the commit the mod was built at.
++      message = { type, bot: r.str(), version: r.str() }
++      break
+     default:
+       if (!PRIMITIVES.has(type)) throw new Error(`unknown message type ${type} from the mod`)
+       // A primitive for the bot: action as actions.js takes it.
+@@ -717,4 +785,4 @@
+   }
+ }
+ 
+-module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, vis, bands, inventory, state, chestLid, chest, columnGone, windowState, profile, decode, frames }
++module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, vis, bands, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+diff -ruN a/common/src/main/resources/bot/relaySupervisor.js b/common/src/main/resources/bot/relaySupervisor.js
+--- a/common/src/main/resources/bot/relaySupervisor.js	1969-12-31 21:00:00.000000000 -0300
++++ b/common/src/main/resources/bot/relaySupervisor.js	2026-10-26 22:43:19.319599786 -0300
+@@ -0,0 +1,94 @@
++// What `node fleet.js --relay` runs: the process that never goes down. It holds the port and the
++// mod's connections, and runs the relay itself (fleet.js) as a child, handing it each connection
++// over IPC. Whatever ends the child (an update, an error, a crash of any kind) this one stays: an
++// update has it start the child again on the new checkout with the same connection; anything else
++// is said to the mod (CRASH) on the connections the child had, those are closed, and a new child
++// takes the next knock. Kept small on purpose: an update never reloads it (only a restart by hand does).
++const { fork } = require('child_process')
++const net = require('net')
++const path = require('path')
++const protocol = require('./protocol')
++
++// The child's exit code after a git reset: started again, handed its connection back.
++const RESTART = 75
++
++module.exports = function supervise (port) {
++  // Connection id -> the mod's connection, from its knock until the child says it is done with it.
++  // Never read here (paused on connect): its bytes are the child's.
++  const held = new Map()
++  let nextId = 1
++  let child = null
++  // The update the child exits for: { id: the connection, version: the mod's commit }.
++  let restart = null
++
++  const crash = text => {
++    console.error(`E relay supervisor: ${text}`)
++    for (const connection of held.values()) {
++      if (!connection.destroyed) connection.write(protocol.crash(text))
++    }
++  }
++
++  // The last net under every error: said to the mod, never down.
++  process.on('uncaughtException', err => crash(`the relay supervisor failed: ${err.stack ?? err}`))
++  process.on('unhandledRejection', err => crash(`the relay supervisor failed: ${err?.stack ?? err}`))
++
++  function hand (id, handoff) {
++    child.send({ type: 'connection', id, handoff }, held.get(id), { keepOpen: true }, err => {
++      if (err) crash(`could not hand connection ${id} to the relay: ${err.stack ?? err}`)
++    })
++  }
++
++  function start (handoff) {
++    const started = fork(path.join(__dirname, 'fleet.js'), process.argv.slice(2), {
++      env: { ...process.env, MAPMCBOT_RELAY_CHILD: '1' },
++      stdio: ['inherit', 'inherit', 'inherit', 'ipc']
++    })
++    child = started
++    started.on('message', message => {
++      if (message.type === 'done') {
++        held.get(message.id)?.destroy()
++        held.delete(message.id)
++      } else if (message.type === 'restart') {
++        restart = { id: message.id, version: message.version }
++      } else {
++        crash(`unknown message from the relay: ${JSON.stringify(message)}`)
++      }
++    })
++    // Never started: no exit follows. The next knock tries again.
++    started.on('error', err => {
++      crash(`the relay could not start: ${err.stack ?? err}`)
++      if (child === started && started.pid === undefined) child = null
++    })
++    started.on('exit', (code, signal) => {
++      if (child === started) child = null
++      const update = restart
++      restart = null
++      if (code === RESTART && update && held.has(update.id)) {
++        console.log(`relay restarting on commit ${update.version}`)
++        start(update.version)
++        hand(update.id, update.version)
++        return
++      }
++      // Gone some other way: the mod hears it, its connections end, and the next knock gets a new relay.
++      crash(`the relay exited (code ${code}, signal ${signal})`)
++      for (const connection of held.values()) connection.destroy()
++      held.clear()
++    })
++    if (handoff === undefined) {
++      for (const id of held.keys()) hand(id)
++    }
++  }
++
++  const server = net.createServer({ pauseOnConnect: true }, connection => {
++    const id = nextId++
++    held.set(id, connection)
++    connection.on('error', err => console.error(`E relay supervisor: connection ${id} failed: ${err.message}`))
++    if (child) hand(id)
++    else start()
++  })
++  server.on('error', err => crash(`the relay's port failed: ${err.stack ?? err}`))
++  server.listen(port, () => console.log(`relay listening on port ${port}`))
++  start()
++}
++
++module.exports.RESTART = RESTART
+diff -ruN a/knownErrors.txt b/knownErrors.txt
+--- a/knownErrors.txt	2026-10-26 22:43:19.313735694 -0300
++++ b/knownErrors.txt	2026-10-26 22:43:19.323060468 -0300
+@@ -1,11 +1,18 @@
+ Errores conocidos sin arreglar (auditoría del repo). Los de diseño aceptados están en designWarnings.txt.
+ 
+-1. Clicks del mod y primitivas en paralelo: la cola de clicks del mod (bot.js, `clicks`) no se serializa con `act.run`, y las dos comparten los contadores globales `rejections`/`resyncs` (actions.js). Encima el server manda `set_slot -1 -1` en cada apertura de window (sendAllContents), que suma a `resyncs` sin rechazo. Un clickSlot/syncedClick puede seguir sin esperar su propio resync (lee la window vieja) o esperar `windowResync` para siempre.
++1. Commit del mod con el árbol sucio: el build manda a los relays `git rev-parse HEAD`, que ignora los cambios sin commitear. Un mod compilado con cambios locales corre scripts que el relay no tiene: los dos dicen el mismo commit y corren código distinto, sin error. (common/build.gradle, RelayHub.commit)
+ 
+-2. "Fallar fuerte" no llega a los hilos secundarios: una excepción en mapmcbot-fleet-output o mapmcbot-snapshot-sweep imprime el stacktrace y mata solo ese hilo; el juego sigue en un estado inconsistente. No hay UncaughtExceptionHandler. En JS, la cadena `clicks` de bot.js queda rechazada para siempre tras el primer rechazo: cada click siguiente es otro unhandled rejection.
++2. Clicks del mod y primitivas en paralelo: la cola de clicks del mod (bot.js, `clicks`) no se serializa con `act.run`, y las dos comparten los contadores globales `rejections`/`resyncs` (actions.js). Encima el server manda `set_slot -1 -1` en cada apertura de window (sendAllContents), que suma a `resyncs` sin rechazo. Un clickSlot/syncedClick puede seguir sin esperar su propio resync (lee la window vieja) o esperar `windowResync` para siempre.
+ 
+-3. Carrera en BotManager.shutdown: si el shutdown hook corre entre `fleet = process` y la asignación de `reader` en startFleet, `reader.join()` tira NPE.
++3. "Fallar fuerte" no llega a los hilos secundarios: una excepción en mapmcbot-relay-reader, mapmcbot-fleet-output o mapmcbot-snapshot-sweep imprime el stacktrace y mata solo ese hilo; el juego sigue en un estado inconsistente. No hay UncaughtExceptionHandler. En JS, la cadena `clicks` de bot.js queda rechazada para siempre tras el primer rechazo: cada click siguiente es otro unhandled rejection.
+ 
+-4. Menores:
++4. Relay sin autenticación: relaySupervisor.js escucha en todas las interfaces. Cualquiera en la red puede hacerle `reset --hard` a cualquier commit del remoto (el hash se valida, el origen no) y mandar bots a cualquier host.
++
++5. Carrera en BotManager.shutdown: si el shutdown hook corre entre `fleet = process` y la asignación de `reader` en startFleet, `reader.join()` tira NPE.
++
++6. Relays y el lock de npm: el relay solo corre `npm ci` al actualizarse (fleet.js, update), si el lock cambió. Uno que arranca ya en el commit (pull a mano, instalación nueva) no compara su node_modules con el lock, como sí hace el mod (BotManager, .mapmcbot-lock.json). Además node_modules/ no está en .gitignore: en el checkout de un relay un `git add -A` lo commitea, y un npm corrido en common/src/main/resources/bot lo mete en el jar.
++
++7. Menores:
++   - RelayHub: dos javadocs seguidos sobre keepLog; el primero ("The relay's errors...") es de keepCrash.
+    - actions.js (move): un mensaje de error en castellano ("faltaron") entre los demás en inglés.
+    - BotManager.send: un frame a un bot ya ido (después de BOT_GONE) vuelve a crear su entrada en `traffic`, que no se borra más.
+diff -ruN a/timingExceptions.txt b/timingExceptions.txt
+--- a/timingExceptions.txt	2026-10-26 22:43:19.313782488 -0300
++++ b/timingExceptions.txt	2026-10-26 22:43:19.323090500 -0300
+@@ -2,6 +2,6 @@
+ 
+ 1. Deadline de las primitivas con condición esperada (interact, break, place, wait_slot): solo sirve para fallar; el evento que confirma el efecto lo resuelve antes. (actions.js, deadline)
+ 
+-2. Profile una vez por segundo: ProfileRegistry pide un profile cada 1 s (PROFILE_EVERY) al fleet, salvo que el anterior no haya llegado. Antes se pedía cada 5000 frames del fleet local, y con los bots quietos no se pedía nunca (el CPU de los relays quedaba en "--"). (ProfileRegistry, hilo mapmcbot-profile-timer)
++2. Profile una vez por segundo: ProfileRegistry pide un profile cada 1 s (PROFILE_EVERY) al fleet local y a cada relay, salvo que el anterior no haya llegado. Antes se pedía cada 5000 frames del fleet local, y con los bots quietos no se pedía nunca (el CPU de los relays quedaba en "--"). (ProfileRegistry, hilo mapmcbot-profile-timer)
+ 
+ 3. Reintento de place cada PLACE_RETRY_MS (500 ms): un place que el server rechaza (`Server refused to place ...`) vuelve a hacer el click derecho desde donde está el bot, sin buscar otro spot ni otro tramo, hasta el deadline de la prim; ahí falla. (actions.js, place)
+diff -ruN a/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java b/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java	2026-10-26 22:43:19.312869860 -0300
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java	2026-10-26 22:43:19.322451164 -0300
+@@ -168,7 +168,8 @@
+ 			drawBox(entityTarget.minX, entityTarget.minY, entityTarget.minZ, entityTarget.maxX, entityTarget.maxY, entityTarget.maxZ, 0xFFFFFF, camX, camY, camZ);
+ 		}
+ 
+-		// TODO(world): a bot may be on another server or dimension than this client's, and its path is drawn here all the same. Needs the bot's world with its PATH, and only the paths of this world drawn.
++		// TODO(world): a bot may be on another server or dimension than this client's (a relay's, or a local
++		// fleet's), and its path is drawn here all the same. Needs the bot's world with its PATH, and only the paths of this world drawn.
+ 		for (Map.Entry<String, int[]> entry : paths.entrySet()) {
+ 			if (selected != null && !entry.getKey().equals(selected)) {
+ 				continue;
+diff -ruN a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java	2026-10-26 22:43:19.312265236 -0300
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java	2026-10-26 22:43:19.321941456 -0300
+@@ -4,6 +4,7 @@
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ 
+ import net.mapmcbot.area.ChestStore;
+ import net.mapmcbot.bot.BotRegistry;
+@@ -13,7 +14,7 @@
+ import net.minecraft.client.gui.DrawableHelper;
+ import net.minecraft.client.util.Window;
+ 
+-/** The bots and their status, top right of the HUD, and a card with a preview of the fleet's profile, top left. */
++/** The bots and their status, top right of the HUD, and a card per relay with a preview of its profile, top left. */
+ public final class BotOverlay {
+ 	private static final int MARGIN = 4;
+ 	private static final int CARD_WIDTH = 150;
+@@ -22,7 +23,7 @@
+ 	private static final int DIM = 0xFF8A919C;
+ 	private static final int HIGHLIGHT_ALPHA = 0x80;
+ 
+-	/** Where the fleet's own rows are in its report. */
++	/** Where a fleet's own rows are in its report: the mod's own fleet (rid 0) and each relay (rid 1, 2, ...) are profiled the same way. */
+ 	private static final String MAIN_SCOPE = "node";
+ 
+ 	private BotOverlay() {
+@@ -58,29 +59,55 @@
+ 
+ 		final ProfileRegistry profile = MapMcBotClient.profile();
+ 		final ProfileReport main = profile.getLatest();
++		int cardY = MARGIN;
+ 
+ 		if (main != null) {
+-			card(client, MARGIN, MARGIN, MAIN_SCOPE, main);
++			cardY += card(client, MARGIN, cardY, 0, MAIN_SCOPE, main) + MARGIN;
++		}
++
++		for (int rid : MapMcBotClient.relays().rids()) {
++			final ProfileReport report = profile.getRelayLatest(rid);
++
++			if (report != null) {
++				cardY += card(client, MARGIN, cardY, rid, MAIN_SCOPE, report) + MARGIN;
++			}
++		}
++
++		for (Map.Entry<String, String> relay : MapMcBotClient.relays().pending().entrySet()) {
++			cardY += pendingCard(client, MARGIN, cardY, relay.getKey(), relay.getValue()) + MARGIN;
+ 		}
+ 	}
+ 
+-	/** The fleet: its bots, CPU as % of the whole server, the server's RAM in use over its total, and under them the fleet's own. */
+-	private static int card(MinecraftClient client, int x, int y, String scope, ProfileReport report) {
++	/** A relay not connected yet: its address and what it is at (connecting, updating, update failed, crashed). */
++	private static int pendingCard(MinecraftClient client, int x, int y, String address, String state) {
++		final int line = client.textRenderer.fontHeight + 2;
++		final int height = CARD_PADDING * 2 + 2 * line - 2;
++		DrawableHelper.fill(x, y, x + CARD_WIDTH, y + height, CARD_BACKGROUND);
++		client.textRenderer.drawWithShadow(address, x + CARD_PADDING, y + CARD_PADDING, 0xFFFFFF);
++		client.textRenderer.drawWithShadow(state, x + CARD_PADDING, y + CARD_PADDING + line, DIM);
++		return height;
++	}
++
++	/** One relay: its bots, CPU as % of the whole server, the server's RAM in use over its total, and under them the relay's own. */
++	private static int card(MinecraftClient client, int x, int y, int rid, String scope, ProfileReport report) {
+ 		final int line = client.textRenderer.fontHeight + 2;
+ 		final double cores = report.value(scope, "cpu.count");
+ 		// ms rates are % of one core: over the server's cores, a share of all of it.
+ 		final double cpu = (report.rate(scope, "cpu.user") + report.rate(scope, "cpu.system")) / cores;
+ 		final double machine = 100 * report.rate(scope, "cpu.system.busy") / report.rate(scope, "cpu.system.all");
+ 		final List<String> lines = new ArrayList<String>();
+-		lines.add("bots " + MapMcBotClient.bots().getBots().size());
++		lines.add("rid=" + rid + (rid == 0 ? " (main)" : "") + "  bots " + MapMcBotClient.bots().countOn(rid));
+ 		lines.add("CPU " + (Double.isNaN(cpu) ? "--" : String.format(Locale.ROOT, "%.1f%%", cpu))
+ 			+ " / " + (Double.isNaN(machine) ? "--" : String.format(Locale.ROOT, "%.1f%%", machine)) + " total");
+ 		lines.add("RAM " + bytes(report.value(scope, "mem.system.used")) + " / " + bytes(report.value(scope, "mem.system.total")));
+ 		lines.add("columns " + bytes(report.value(scope, "mem.columns")));
+ 
+-		final ChestStore chests = MapMcBotClient.chests();
+-		lines.add("chests " + (chests == null ? "--" : bytes(chests.memoryBytes())));
+-		lines.add("fleet " + bytes(report.value(scope, "mem.rss")));
++		if (rid == 0) {
++			final ChestStore chests = MapMcBotClient.chests();
++			lines.add("chests " + (chests == null ? "--" : bytes(chests.memoryBytes())));
++		}
++
++		lines.add("relay " + bytes(report.value(scope, "mem.rss")));
+ 
+ 		final int height = CARD_PADDING * 2 + lines.size() * line - 2;
+ 		DrawableHelper.fill(x, y, x + CARD_WIDTH, y + height, CARD_BACKGROUND);
+diff -ruN a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java	2026-10-26 22:43:19.311846253 -0300
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java	2026-10-26 22:43:19.321812178 -0300
+@@ -1900,7 +1900,9 @@
+ 			fill(MARGIN, top, MARGIN + CARD_WIDTH, top + CARD_HEIGHT, name.equals(selected) ? CARD_SELECTED : CARD);
+ 			fill(MARGIN, top, MARGIN + 3, top + CARD_HEIGHT, 0xFF000000 | MapMcBotClient.colorOf(name).getRgb());
+ 			textRenderer.drawWithShadow(name, MARGIN + 7, top + 3, TEXT);
+-			textRenderer.drawWithShadow(textRenderer.trimToWidth(bots.getStatus(name), CARD_WIDTH - 14), MARGIN + 7, top + 13, DIM);
++			final Integer fleet = bots.getFleet(name);
++			final String where = fleet == null ? "" : fleet == 0 ? "local" : "relay " + fleet;
++			textRenderer.drawWithShadow(textRenderer.trimToWidth(bots.getStatus(name) + "  " + where, CARD_WIDTH - 14), MARGIN + 7, top + 13, DIM);
+ 		}
+ 	}
+ 
+diff -ruN a/versions/1.12.2/src/main/java/net/mapmcbot/client/ChestTracker.java b/versions/1.12.2/src/main/java/net/mapmcbot/client/ChestTracker.java
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/ChestTracker.java	2026-10-26 22:43:19.312473925 -0300
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/ChestTracker.java	2026-10-26 22:43:19.322213841 -0300
+@@ -34,7 +34,7 @@
+  * so. Such a chest is not checked and stays dirty until a bot opens it with no other in it, every
+  * frame of the others in by then (each fleet's close comes after its own changes).
+  *
+- * Where the chests are comes from the fleet (CHEST, COLUMN_GONE):
++ * Where the chests are comes from every fleet, the mod's and the relays' alike (CHEST, COLUMN_GONE):
+  * an index of the chests in the columns they hold, by column. Only chests inside an area are kept.
+  */
+ final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.WindowListener, BotRegistry.StateListener, BotRegistry.LidListener, BotRegistry.ChestListener {
+diff -ruN a/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java b/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java	2026-10-26 22:43:19.312937956 -0300
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java	2026-10-26 22:43:19.322505013 -0300
+@@ -22,6 +22,7 @@
+ import net.mapmcbot.bot.BotRegistry;
+ import net.mapmcbot.bot.NameList;
+ import net.mapmcbot.bot.PlaceBlocks;
++import net.mapmcbot.bot.RelayHub;
+ import net.mapmcbot.chunk.ChunkRegistry;
+ import net.mapmcbot.chunk.ChunkSnapshotStore;
+ import net.mapmcbot.job.JobRunner;
+@@ -70,6 +71,7 @@
+ 	private static BotRegistry bots;
+ 	private static JobRunner job;
+ 	private static BotProfileStore botProfiles;
++	private static RelayHub relays;
+ 	private static ChunkRegistry chunks;
+ 	private static ProfileRegistry profile;
+ 
+@@ -89,7 +91,7 @@
+ 			return;
+ 		}
+ 
+-		// In a world from the start, not at the first bot: the fleet is up before the first bot.
++		// In a world from the start, not at the first bot: the relays need the port open to connect.
+ 		bots();
+ 
+ 		boolean openAreas = false;
+@@ -182,9 +184,17 @@
+ 	}
+ 
+ 	/**
+-	 * A chat line for the mod: #formation sends every bot in the world to a spot around the player. False when it is not one.
++	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
++	 * #formation sends every bot in the world to a spot around the player. False when it is not one.
+ 	 */
+ 	public static boolean command(String line) {
++		if (line.equals("#relays")) {
++			// For a relay started after the game: knock on the ones listed that are not connected.
++			bots();
++			relays.connectMissing();
++			return true;
++		}
++
+ 		if (BotCommands.handle(MinecraftClient.getInstance(), line)) {
+ 			return true;
+ 		}
+@@ -437,15 +447,17 @@
+ 			final File directory = dataDirectory(MinecraftClient.getInstance());
+ 			final BotManager fleet = new BotManager(new File(directory, "bot"));
+ 			fleet.setReaderFailure(e -> MinecraftClient.getInstance().submit(() -> chat(MinecraftClient.getInstance(), "[MapMcBot] the fleet reader died, its bots' state is stale until restart: " + e.getMessage())));
++			relays = new RelayHub(new File(directory, "relays.txt"));
+ 			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
+ 			seedProfiles();
+ 			final PlaceBlocks placeBlocks = new PlaceBlocks(new File(directory, "place_blocks.txt"), PlaceCatalog.keys());
+-			bots = new BotRegistry(fleet, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles, placeBlocks);
++			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles, placeBlocks);
+ 			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
+ 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
+ 			grab = new Grab(bots, new ChestTracker(bots));
+ 			job.addResolver(grab);
+-			profile = new ProfileRegistry(fleet, new File(directory, "bot/profile.log"), chunks::chunksByBot);
++			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
++			relays.start();
+ 		}
+ 
+ 		return bots;
+@@ -468,6 +480,12 @@
+ 		}
+ 	}
+ 
++	/** The relays connected; created with the bots. */
++	public static RelayHub relays() {
++		bots();
++		return relays;
++	}
++
+ 	/** CPU and memory of the mod and the fleet (see ProfilerScreen); created with the bots. */
+ 	public static ProfileRegistry profile() {
+ 		bots();

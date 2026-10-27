@@ -14,7 +14,7 @@ import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtIo;
 
 /**
- * An item match as the fleet's itemMatcher takes it (actions.js, written by ItemFilter#toJson), tested
+ * An item match as the fleet's itemMatcher takes it (lib/items.js, written by ItemFilter#toJson), tested
  * here: by name, metadata, and the NBT tags listed in match (the reference's at each path) or all of
  * it but those in ignore.
  */

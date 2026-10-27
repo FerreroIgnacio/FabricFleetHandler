@@ -1,0 +1,113 @@
+Partición de actions.js (JS del bot, common/src/main/resources/bot/)
+
+Cómo estaba
+- actions.js: 3437 líneas, una sola función `actions({ bot, name, log, ... })` (bot.js la llama una vez
+  por bot). Todo vivía en su closure: estado (current, pending, allowedPlace, la cabeza, contadores de
+  clicks), listeners del bot, helpers y las 22 prims, más el mapa `primitives` y la API que usa bot.js
+  (windowType, cancel, setAllowedPlace, syncedClick, clearQ, currentId, run).
+- Cualquier función veía a cualquier otra; las dependencias no se veían.
+
+Cómo quedó
+- actions.js (~50 líneas): solo ensamblado. Arma `ctx`, crea las partes de lib/ en el orden de PARTS,
+  crea cada prim de prims/ en `ctx.primitives` y devuelve la misma API de antes (bot.js no cambió).
+- ctx: el objeto que reemplaza al closure. Arranca con lo que bot.js le pasa a actions() (bot, name,
+  log, publish, walk, draw, drawBands, blockStates, trades, selectTrade, rawClick) y cada parte le suma
+  lo que exporta. Cada archivo es `module.exports = ctx => { const { ...lo que usa } = ctx; ...; return {...} }`.
+- lib/, de abajo hacia arriba (cada una solo usa las de antes):
+  util.js        sin bot ni ctx: REACH_BLOCK, FACES, CONTROLS, PHYSICS_TIMESTEP, LOOK_SPEED, bare/full/at,
+                 required, turnSpeedOf, deadlineOf, describeItem. Se requiere directo, no va por ctx.
+  lifecycle.js   vida de una prim: begin/end/done/fail/listen/deadline/guard, la cola (run, start,
+                 clearQ, currentId, QUEUE), spend (ticks por actividad), el listener de death, y lo que se
+                 le dibuja al mod (show, showBands, sendVis).
+  path.js        pathfinder: physicsWorld, searched, movesTo, afterMovements, reachableAfter.
+  aim.js         geometría de mirada: eyes, eyesNext, lookTo, rayInto, aimsAt, blockAim, aimMissed,
+                 shapeOf, cellAt, checkLook, inReach, aimOf.
+  head.js        la cabeza del bot: el look.Head, headPoint, el listener de physicsTick que la gira y
+                 llama a spend, aimHead, stopHead, turnTo.
+  window.js      ventana y clicks: windowType, openWindow, slotWindow, slotOf, clickSlot, syncedClick,
+                 shiftClick, Rejected, contadores rejections/resyncs y sus listeners.
+  items.js       sin clicks: simulación del shift click del server (shiftStep, shiftSpread) e itemMatcher.
+  hold.js        qué tiene en la mano: allowedPlace + setAllowedPlace, holdAllowed, holdBestTool, hold,
+                 digMs, heldMs, digTicks (DIG_SLACK).
+  pose.js        poses en un bloque y vista desde ahí: posesIn, fits, seesFrom, poseSees, occupies.
+  steer.js       caminar por teclas: keysTo, keysWithin, steer, keepHead, followable, stepTo, sightRun.
+  walk.js        caminar con pathfinder: walkTo, stood, movesFrom, around.
+  blocks.js      interact/break/place desde donde está (interact, breakBlock, place, expect, ventanas por
+                 bloque, minecart), targetOf y drawn (lo que dibujan break/place y las wsr).
+  withSearch.js, withSearchFromEnd.js, withSearchAsync.js: las implementaciones de las wsr / wsrp / wsrpa
+                 (cada una sirve a dos prims, break y place).
+- prims/: un archivo por prim, con el nombre de la prim en el protocolo. Devuelve la función (action, a).
+  goto, interact, break, place, close_window, move, item_fill, wait_slot, hotbar, select_trade, look_at,
+  drop, shift_move, stop, break_wsr, place_wsr, break_wsrp, place_wsrp, break_wsrpa, place_wsrpa,
+  break_pac, band.
+- El código se movió verbatim (generado por script desde el AST, con eslint-scope para las
+  dependencias). Únicos cambios de código: ver "Qué se tocó a mano".
+
+Por qué así
+- Un archivo por prim: lo pidió el usuario; con el nombre del protocolo, buscar una prim es abrir
+  prims/<nombre>.js. Las que comparten implementación (break/place, *_wsr, *_wsrp, *_wsrpa) quedan de
+  2 líneas: `drawn(impl, 'break' | 'place')`; la implementación es librería porque la usan dos prims.
+  Separar las ramas de `kind` dentro de cada withSearch* sería reescribir, no mover: no se hizo.
+- head.js aparte y no dentro de aim: es estado con motor propio (un listener de physicsTick, una
+  sola cabeza por bot) que usan aim (turnTo), steer (keepHead, followable), band y look_at. Aim quedó
+  como geometría pura sobre el bot.
+- vis (show/showBands/sendVis) dentro de lifecycle y no en su archivo: showBands lee current y
+  pending, y begin/end/fail llaman a showBands/sendVis. Separarlos obligaba a getters en los dos
+  sentidos; es la misma vida de la prim.
+- La cola (run/start/clearQ) dentro de lifecycle: done arranca la siguiente de pending y start usa
+  begin/fail; separarlos era un ciclo.
+- Ubicaciones que salieron del grafo real (no de los nombres): sightSpot y SightGoal en withSearch
+  (rompían el ciclo walk -> steer -> pose -> walk; solo los usa withSearch); occupies en pose (lo usan
+  place, withSearch*, steer); searched/movesTo en path (los usan path, steer, withSearch*); around en
+  walk (walkTo y withSearch); describeItem en util (no usa el bot).
+- lib/walk.js y no lib/move.js: prims/move.js es la prim de ventana `move`.
+- Constantes con quien las usa; las compartidas en util.js.
+
+Qué se tocó a mano (lo único que no es movimiento)
+- lifecycle.js: start y run buscan la prim en `ctx.primitives` (actions.js lo setea después de crear
+  lifecycle, que es la primera parte); run, clearQ y currentId pasaron de la API de actions.js a
+  funciones de lifecycle, mismo código.
+- hold.js: setAllowedPlace pasó de la API de actions.js a hold (es dueño de allowedPlace).
+- head.js exporta `headPoint` como getter `() => headPoint`; steer.js keepHead lo llama `headPoint()`.
+- actions.js: si una parte exporta un nombre que ya está en ctx, tira error (Object.assign lo pisaría
+  en silencio).
+- Se borraron los encabezados de sección (`// --- A. movement`, etc.) del archivo viejo.
+- BotManager.java: RESOURCES lista cada archivo de lib/ y prims/, y extractScripts crea la carpeta
+  padre antes de escribir (Files.createDirectories).
+- Punteros "(actions.js ...)" de los .txt de referencia, de comentarios JS y de comentarios Java
+  (Band, Bands, ClearQ, BreakPac, BotVis, BotCommands, ItemSpec, ItemFilter, BandTest, AreaRenderer)
+  actualizados al archivo nuevo de cada símbolo.
+
+Peligros (leer antes de tocar)
+1. Archivo nuevo en lib/ o prims/ => agregarlo a RESOURCES en BotManager.java. Si no, no se extrae a
+   run/mapmcbot/bot/ y el require falla al arrancar la flota. El jar sí lo trae (resources/bot/**),
+   pero el bot corre desde la copia extraída.
+2. Orden de PARTS: cada parte desestructura ctx al crearse, así que solo ve lo de las anteriores. Usar
+   algo de una parte posterior da undefined en la desestructuración y recién rompe al llamarlo
+   ("x is not a function"). Si una parte nueva necesita algo de arriba, es señal de ciclo: mover la
+   función, no reordenar a ciegas.
+3. Nunca exportar un `let`: ctx guarda el valor del momento (una foto). Exportar un getter (como
+   headPoint) o una función que lo lea. Hoy los let compartidos son todos internos a su parte
+   (current/pending en lifecycle, allowedPlace en hold, headPoint/turned en head, rejections/resyncs/
+   clicking en window).
+4. Nombres únicos entre partes: actions.js tira error si dos exportan lo mismo. Los params de bot.js
+   también cuentan (hay `walk` param y lib/walk.js exporta walkTo: no chocan).
+5. ctx.primitives se lee en el momento (start/run), no al crear lifecycle: no desestructurarlo.
+6. Listeners del bot puestos al crear: death (lifecycle), physicsTick y spawn (head), spawn_entity
+   (blocks), transaction y set_slot (window). Cambió el orden de registro entre eventos distintos
+   (death antes que el resto), que no importa; el orden dentro de un mismo evento no cambió.
+7. Siguen grandes: prims/band.js (~435), prims/break_pac.js (~305), lib/aim.js (~360). Partir
+   breakBand/breakPac por fases es un paso aparte, no se hizo.
+8. Comentarios "(see X)" dentro del código movido nombran funciones que pueden estar en otro archivo
+   ahora; buscar el nombre con grep.
+9. withSearchAsync usa withSearch (se cae a la wsr desde end) y withSearchFromEnd también: un cambio
+   en withSearch afecta a las seis prims wsr/wsrp/wsrpa.
+
+Cómo se verificó
+- standard (npx cache) sobre actions.js, lib/ y prims/: mismos avisos que el actions.js viejo (solo
+  `along` sin usar en break_pac y `heldAt` prefer-const en band, que ya estaban); sin no-undef.
+- Cada línea del archivo viejo está en algún archivo nuevo; las diferencias son solo lo de arriba.
+- Chequeo del orden de PARTS: cada nombre que una parte saca de ctx lo exporta una anterior o es param.
+- Smoke test con un bot falso: construye, la API es la misma, run('stop') pasa por begin/fail, run de
+  una prim desconocida tira, un listener de cada uno.
+- No se probó en juego (runClient) ni se corrieron tests.

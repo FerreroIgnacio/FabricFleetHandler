@@ -17,7 +17,7 @@ import net.mapmcbot.bot.BotStatus;
  * bot's own reports drive it. A looping job that goes a whole lap with every step over as it was started
  * (a deposit with nothing to leave) has nothing left to do: it ends there instead of starting over.
  *
- * A step the fleet does not run (a plan: grab, deposit, index, quarrify) is the mod's: the Resolver that handles it does it on
+ * A step the fleet does not run (a plan: grab, deposit, index) is the mod's: the Resolver that handles it does it on
  * the bot with primitives of its own, and says when it is done or failed.
  *
  * A primitive ordered from outside to a bot running the job takes it over: the job ends there.

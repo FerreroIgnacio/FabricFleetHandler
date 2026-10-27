@@ -1,0 +1,115 @@
+Magic numbers y valores hardcodeados del repo.
+Formato: archivo:línea  NOMBRE = valor  — qué hace / por qué está.
+Sin nombre = literal suelto en el código (candidato a constante). Rutas JS relativas a
+common/src/main/resources/bot/, Java a common/src/main/java/net/mapmcbot/ o
+versions/1.12.2/src/{main,debug}/java/net/mapmcbot/.
+Se dejan afuera: ids de mensajes del protocolo (TYPE = n, protocol.js TYPES; tienen que coincidir
+Java<->JS), colores ARGB y layout en px de las pantallas, y aritmética de bits de chunks (>> 4,
+& 15, << 8) que es formato fijo de Minecraft.
+
+== Minecraft / física (valores del juego, no tunear) ==
+lib/util.js:6        REACH_BLOCK = 4.5        alcance de bloque de survival en 1.12.
+lib/blocks.js:6      REACH_ENTITY = 3         alcance a entidades de survival.
+lib/util.js:10       PHYSICS_TIMESTEP = 0.05  tick de física de mineflayer (s).
+look.js:15           TICK = 0.05              mismo tick, duplicado en look.js (podría venir de util).
+lib/aim.js:18        SNEAK_EYE_HEIGHT = 1.54  ojos agachado en 1.12 (0.08 debajo de parado).
+client/AreaRenderer.java:56-57  EYE_HEIGHT = 1.62 / SNEAK_EYE_HEIGHT = 1.54  ídem del lado Java (duplicado del JS).
+look.js:13           LOOK_STEP = fromNotchianPitch(0.15)  paso del mouse vanilla al 100% de sensibilidad.
+lib/hold.js:22,60 · prims/hotbar.js:10  9 / 8   tamaño del hotbar (índices 0..8).
+lib/items.js:73      slots 5..8               armadura en la ventana de inventario.
+lib/items.js:47      dye metadata 4           lapis (dye con meta 4).
+lib/blocks.js:23     MINECART_WINDOWS {1,5}   objectData del spawn de minecart: 1 cofre, 5 hopper.
+states.js:60         4095 / 15                rangos de id (12 bits) y meta (4 bits) de un state legacy.
+sharedChunks.js:26-29  SECTIONS = 16, VOLUME = 4096, MAX_BITS_PER_BLOCK = 8  formato de columna 1.9–1.12: secciones por columna, bloques por sección, bits de paleta antes de pasar a ids globales.
+sharedChunks.js:180,235  256                  altura del mundo en 1.12.
+sharedChunks.js:73,122   256                  biomas por columna (16x16).
+sharedChunks.js:447  '1.9'..'1.13'            versiones cuyo formato de chunk se entiende.
+chunk/ChunkData.java:21-22  SECTION_HEIGHT = 16, SECTION_VOLUME  ídem del lado Java.
+chunk/ChunkData.java:129    MAX_PALETTE = 0xFFFF  tope de paleta de una sección (u16).
+prims/close_window.js:10   slot -999          click fuera de la ventana (convención del protocolo).
+prims/drop.js:22     button 1, mode 4         click de tirar el stack entero (Q con ctrl).
+bot.js:373           -32768                   wrap del actionId (i16) de los clicks de ventana.
+bot.js:451,471       mode 5 / 6               modos de click de drag y doble click.
+prims/look_at.js:13  ±90                      rango válido de pitch.
+debug/AutoStart.java:291  FILL_LIMIT = 32768  máximo de bloques de /fill en vanilla.
+
+== Memoria compartida / protocolo ==
+sharedChunks.js:34-41  STATES = 16, BIOMES, SIZE, SLOTS = 4096, READY = 0, MASK = 1, HEADER = 8  layout del slot de columna en columns.bin (header, u16 por bloque, biomas) y cantidad de slots; tiene que coincidir con ChunkRegistry.
+chunk/ChunkRegistry.java:43-46  COLUMN_SLOTS = 4096, COLUMN_STATES = 16, COLUMN_BIOMES, COLUMN_SLOT_SIZE  espejo Java del layout de arriba (duplicado; si cambia uno cambia el otro).
+fleet.js:58          RESERVE = 256            slots que el cache de snapshots deja libres para los bots.
+chunk/ChunkSnapshotStore.java:44-47  FORMAT_VERSION = 1, MAGIC = 0x4D434348 ("MCCH"), SUFFIX ".chunk"  formato en disco de los snapshots de columna.
+fleet/types/SocketProtocolType.java:11  MAX_FRAME = 64 MiB  tope de un frame del socket; frena longitudes corruptas.
+protocol.js:75,93,99,130,710-715  4 / 8    tamaños de i32/f64 y del prefijo de longitud del frame.
+protocol.js:317-321 · bot.js:199-203  12 / 3  bytes / ints por nodo de path (x,y,z).
+protocol.js:600-602  expect 3/4/5             kinds de Expect en literal; duplican Expect.java CHANGED/FILLED/HURT (deberían ser constantes).
+fleet.js:450         '127.0.0.1'              el socket con el mod es siempre local.
+
+== Threads / CPU ==
+poolThread.js:24     TICK_BUDGET_MS = 30      ms por tick que un pool thread reparte entre los bots que buscan path.
+fleet.js:178         SERIALIZER_THREADS = 1   threads que parsean columnas a sus slots.
+fleet.js:273         MAX_THREADS = cpus - SERIALIZER_THREADS  pool threads: un core por thread, sin pisar al serializer.
+lib/lifecycle.js:8   QUEUE = 3                prims que un bot sostiene a la vez (la que corre + 2); una más es crash.
+
+== Tiempo (ver timingExceptions.txt) ==
+lib/util.js:13       DEFAULT_DEADLINE = 5000  deadline de una prim con condición esperada si la orden no trae uno.
+prims/wait_slot.js:19  3600000                deadline por defecto de wait_slot (1 h): una salida tarda lo que tarda.
+lib/blocks.js:10     PLACE_RETRY_MS = 500     reintento de un place rechazado hasta el deadline.
+lib/blocks.js:151    1000 / 1.5               expect de un break: 1.5x su dig, mínimo 1000 ms.
+profile/ProfileRegistry.java:52,55  MIN_INTERVAL = 1000, PROFILE_EVERY = 1000  profile cada 1 s; menos daría tasas de ruido.
+prims/band.js:11-12  HALT_TICKS = 6, LATE_MS = 100  solo diagnóstico: gap entre digs que se loguea y tick que cuenta como tarde.
+prims/band.js:324    400                      log de progreso de band cada 400 ticks.
+lib/steer.js:9       STOP_TICKS = 40          cota de ticks hasta frenar al soltar las teclas.
+debug/AutoStart.java:70-71  BOT_GAP_TICKS = 10, SETTLE_TICKS = 10  espera entre bots que entran y antes de cada click (la pantalla arma sus botones). Basado en ticks: no está en timingExceptions.txt.
+
+== Slacks / tolerancias (ver slackExceptions.txt) ==
+lib/hold.js:6        DIG_SLACK = 1.4          minecraft-data subestima dig times; un dig planeado en el camino usa 1.4x.
+prims/goto.js:29     SLACK = SQRT1_2          lo más que se alejan los ojos del centro del bloque de los pies, de costado (peor caso por ruido).
+prims/goto.js:61     REACH_BLOCK + 1          prefiltro de nodos de goto antes del aim exacto.
+lib/withSearch.js:198  REACH_BLOCK + 2        prefiltro de nodos "near" antes de posesIn/poseSees.
+lib/blocks.js:60     distance - 0.5           un bloque tapa la línea de vista a la entidad si está medio bloque antes que ella.
+bot.js:217,222       6 / 2.25                 al avanzar el path se miran los próximos 6 nodos y se acepta uno a ≤1.5 bloques (2.25 = 1.5²).
+lib/steer.js:7       STILL = 0.005            velocidad bajo la cual el bot cuenta como quieto.
+lib/pose.js:41-56    1e-6 / 1e-3              épsilons de borde de AABB al floorear.
+lib/aim.js:269       0.001                    punto de cara corrido adentro de la cara para que el ray la pegue.
+client/AreaRenderer.java:38  EXPANSION = -0.01   outline metido para no z-fightear con las caras.
+client/AreaRenderer.java:46  BAND_GROW = 0.05    caja de band salida para que se vean bordes contiguos.
+
+== Aim / look / poses ==
+lib/aim.js:14        GRID = 8                 cada cara se apunta en una grilla 8x8 de puntos.
+lib/aim.js:16        MISS_BOX = 0.6           máximo del miss del look provider por eje de cara (3/5 de bloque).
+lib/pose.js:8        OFFSETS = [0.5,0.3,0.7,0,1,-0.2,1.2]  posiciones probadas dentro del bloque y sobre sus bordes (0.1 de la caja sobre el bloque).
+lib/pose.js:10       CROUCH_OFFSETS = [-0.25,1.25]  más afuera agachado (0.05 sobre el bloque; sneak no deja caer).
+look.js:18           NOISE = 1                cuánto random va en la trayectoria de la cabeza (0 = dev, 1 = máximo).
+look.js:57-59        15/7/14/61, 4294967296   constantes del PRNG mulberry32 y 2^32 para normalizar.
+look.js:105          0.5                      moneda para el lado del giro.
+lib/util.js:15       LOOK_SPEED = 1.05 * HUMAN_SPEED  velocidad de cabeza por defecto: 5% más que el jugador usual.
+lib/head.js:7        DEFAULT_TURN_SPEED = 9   rad/s con que mineflayer gira solo (pathfinder).
+lib/blocks.js:8      AIMS = 3                 veces que un interact vuelve a apuntar si cambió lo que mira.
+
+== Bandas ==
+prims/band.js:7-8    BAND_DEPTH = 2, BAND_HEIGHT = 4  sección de una banda en slices.
+prims/band.js:37     16                       una banda ordena sus 16 bloques una vez cada uno (2x4x2).
+prims/band.js:26     31                       hash de nombre (estilo Java) para elegir el estilo de banda del bot.
+
+== Profiler / logs ==
+profile/ProfileRegistry.java:46  HISTORY = 120   reportes guardados para la pantalla (2 min a 1/s).
+profile/ProfileRegistry.java:58  MAX_LOG = 64 MiB  rotación del log de profile.
+profile/ProfileRegistry.java:61,63  TOP_EVERY = 10, TOP = 5  cada 10 reportes, los 5 que más CPU usaron.
+fleet/FleetSocketHandler.java:176  SOCKET_LOG_LINES = 1000  flush de socket.log cada 1000 líneas (flush por frame trababa el reader).
+lib/lifecycle.js:39  160                      recorte de los args de una prim en el log.
+profiler.js:98       toFixed(3)               decimales de los valores del profile.
+
+== Render / UI ==
+client/AreaRenderer.java:35  MAX_RENDER_DISTANCE_SQ = 512²  más lejos una caja son un par de píxeles.
+client/AreaRenderer.java:40-61  NUMBER_SCALE = 1/16, *_ALPHA, POINT = 0.05, BREAKING_STAGES = 10, LABEL_WIDTH = 0.9  escala de labels, transparencias, tamaño del marcador de punto, etapas de rotura vanilla, ancho máximo de label.
+client/BotScreen.java:72  SYNC_ID = -128        syncId propio para que los clicks de la ventana del bot no se confundan con la del jugador.
+client/MapMcBotClient.java:50,54  NAME_PREFIX "PandaBot", DEFAULT_CRACKED_PASSWORD "pandabot"  nombre de los bots y password por defecto en servers cracked.
+
+== Debug (solo runClient) ==
+debug/AutoStart.java:44  MAX_PLAYERS = 128      límite del LAN (vanilla 8 no alcanza para los bots).
+debug/AutoStart.java:51,53  BAND_TEST "qtest3", PRIM_TEST "primtest"  áreas de test por nombre.
+debug/AutoStart.java:55  STRIP_STEP = 4         separación en z de las tiras de qtest3 (2 de ancho + 2 de aire).
+debug/AutoStart.java:58-62  PICK/SHOVEL (efficiency 200, unbreaking 10), BLOCKS "cobblestone 64"  items que se les da a los bots.
+debug/AutoStart.java:66-67  PLATE = 3, CLEAR = 8   placa de piedra alrededor del test y aire arriba.
+debug/PrimTest.java:30-33  CELL = 6, LENGTH = 14, CLEAR = 10  geometría del test de prims.
+debug/BandTest.java:22   LENGTH = 8             largo del test de bandas.

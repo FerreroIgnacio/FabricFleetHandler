@@ -10,7 +10,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.mapmcbot.chunk.ChunkKey;
-import net.mapmcbot.fleet.FleetChannel;
+import net.mapmcbot.fleet.FleetSocketHandler;
 
 /**
  * The bots of the fleet and what each is doing, as the fleet reports it; the orders for them go
@@ -23,10 +23,7 @@ import net.mapmcbot.fleet.FleetChannel;
 public final class BotRegistry implements BotListener {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
-	private final FleetChannel channel;
-
-	/** The relays; their bots are run there, the orders go through it. */
-	private final RelayHub relays;
+	private final FleetSocketHandler channel;
 
 	/** The names for the bots: the mod picks them, the fleets are only told. */
 	private final NameList names;
@@ -34,10 +31,7 @@ public final class BotRegistry implements BotListener {
 	/** The bots spawned and not yet gone. */
 	private final Set<String> bots = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
-	/** The fleet running each bot spawned and not yet gone: 0 the mod's own, else a relay's rid. */
-	private final Map<String, Integer> fleetOf = new ConcurrentHashMap<String, Integer>();
-
-	/** The server each bot spawned and not yet gone joins: where another fleet sends it if its relay fails to start. */
+	/** The server each bot spawned and not yet gone joins: as the fleet keys its columns. */
 	private final Map<String, InetSocketAddress> serverOf = new ConcurrentHashMap<String, InetSocketAddress>();
 
 	/** The bots in the world (BOT_SPAWNED) and not yet gone. */
@@ -48,6 +42,9 @@ public final class BotRegistry implements BotListener {
 
 	/** What each bot's wsr primitive shows, from its VIS frames. */
 	private final Map<String, BotVis> visuals = new ConcurrentHashMap<String, BotVis>();
+
+	/** The band primitives each bot runs and holds, the running one first, from its BANDS frames. */
+	private final Map<String, int[][]> bands = new ConcurrentHashMap<String, int[][]>();
 
 	/** What each bot is doing, from its STATE frames. */
 	private final Map<String, BotStatus> statuses = new ConcurrentHashMap<String, BotStatus>();
@@ -101,6 +98,21 @@ public final class BotRegistry implements BotListener {
 		chestListeners.add(listener);
 	}
 
+	/** Hears each column as a bot has it in its own world; called on the channel's thread. */
+	public interface ColumnListener {
+		void onColumnIn(String bot, ChunkKey key);
+	}
+
+	private final List<ColumnListener> columnListeners = new CopyOnWriteArrayList<ColumnListener>();
+
+	public void addColumnListener(ColumnListener listener) {
+		columnListeners.add(listener);
+	}
+
+	public void removeColumnListener(ColumnListener listener) {
+		columnListeners.remove(listener);
+	}
+
 	private final List<StateListener> stateListeners = new CopyOnWriteArrayList<StateListener>();
 	private final List<ActionListener> actionListeners = new CopyOnWriteArrayList<ActionListener>();
 	private final List<WindowListener> windowListeners = new CopyOnWriteArrayList<WindowListener>();
@@ -131,7 +143,7 @@ public final class BotRegistry implements BotListener {
 	/** The blocks each bot may place: sent to it as it spawns and again each change. */
 	private final PlaceBlocks placeBlocks;
 
-	public BotRegistry(FleetChannel channel, RelayHub relays, NameList names, BotProfileStore profiles, PlaceBlocks placeBlocks) {
+	public BotRegistry(FleetSocketHandler channel, NameList names, BotProfileStore profiles, PlaceBlocks placeBlocks) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("BotRegistry is a singleton: one was already created");
 		}
@@ -139,10 +151,8 @@ public final class BotRegistry implements BotListener {
 		this.channel = channel;
 		this.names = names;
 		this.profiles = profiles;
-		this.relays = relays;
 		this.placeBlocks = placeBlocks;
 		channel.setBotListener(this);
-		relays.setBots(this);
 		placeBlocks.setListener(() -> {
 			for (String bot : spawned) {
 				sendAllowedPlace(bot);
@@ -154,19 +164,13 @@ public final class BotRegistry implements BotListener {
 		return placeBlocks;
 	}
 
-	/** The blocks the bot may place, on the fleet running it (see FleetProtocol#ALLOWED_PLACE). */
+	/** The blocks the bot may place, on the fleet (see FleetSocketHandler). */
 	private void sendAllowedPlace(String bot) {
-		final Integer rid = fleetOf.get(bot);
-
-		if (rid == null) {
+		if (!bots.contains(bot)) {
 			throw new IllegalStateException("no bot named " + bot + " to send the blocks it may place to");
 		}
 
-		if (rid == 0) {
-			channel.allowedPlace(bot, placeBlocks.allowed(bot));
-		} else {
-			relays.allowedPlace(rid, bot, placeBlocks.allowed(bot));
-		}
+		channel.allowedPlace(bot, placeBlocks.allowed(bot));
 	}
 
 	public Set<String> getBots() {
@@ -197,7 +201,7 @@ public final class BotRegistry implements BotListener {
 		return windows.get(bot);
 	}
 
-	/** A primitive for the bot as JSON, on the fleet running it (see FleetProtocol#primitive). */
+	/** A primitive for the bot as JSON, on the fleet (see FleetSocketHandler). */
 	public void action(String bot, String json) {
 		send(bot, json, false);
 	}
@@ -208,9 +212,7 @@ public final class BotRegistry implements BotListener {
 	}
 
 	private void send(String bot, String json, boolean internal) {
-		final Integer rid = fleetOf.get(bot);
-
-		if (rid == null) {
+		if (!bots.contains(bot)) {
 			throw new IllegalStateException("no bot named " + bot + " to order " + json);
 		}
 
@@ -220,18 +222,10 @@ public final class BotRegistry implements BotListener {
 
 		// One from the UI does not chain: what the bot runs or holds goes first.
 		if (!internal) {
-			if (rid == 0) {
-				channel.clearQ(bot);
-			} else {
-				relays.clearQ(rid, bot);
-			}
+			channel.clearQ(bot);
 		}
 
-		if (rid == 0) {
-			channel.action(bot, json);
-		} else {
-			relays.action(rid, bot, json);
-		}
+		channel.action(bot, json);
 
 		for (ActionListener listener : actionListeners) {
 			listener.onAction(bot, json, internal);
@@ -263,54 +257,22 @@ public final class BotRegistry implements BotListener {
 		inventoryListeners.remove(listener);
 	}
 
-	/** How many bots the fleet runs (0 the mod's own, else a relay's rid), those still connecting too. */
-	public int countOn(int rid) {
-		int count = 0;
-
-		for (int fleet : fleetOf.values()) {
-			if (fleet == rid) {
-				count++;
-			}
-		}
-
-		return count;
-	}
-
-	/** Where the bot runs: 0 the mod's own fleet, else a relay's rid; null for no such bot. */
-	public Integer getFleet(String bot) {
-		return fleetOf.get(bot);
-	}
-
-	/** A click on the bot's inventory window, on the fleet running it (see FleetProtocol#WINDOW_CLICK). */
+	/** A click on the bot's inventory window, on the fleet (see FleetSocketHandler). */
 	public void windowClick(String bot, int slot, int button, int mode) {
-		final Integer rid = fleetOf.get(bot);
-
-		if (rid == null) {
+		if (!bots.contains(bot)) {
 			throw new IllegalStateException("no bot named " + bot + " to click slot " + slot + " of");
 		}
 
-		final int id = clicksSent.merge(bot, 1, Integer::sum);
-
-		if (rid == 0) {
-			channel.windowClick(bot, slot, button, mode, id);
-		} else {
-			relays.windowClick(rid, bot, slot, button, mode, id);
-		}
+		channel.windowClick(bot, slot, button, mode, clicksSent.merge(bot, 1, Integer::sum));
 	}
 
-	/** The villager trade the bot's open window shows, on the fleet running it (see FleetProtocol#TRADE_SELECT). */
+	/** The villager trade the bot's open window shows, on the fleet (see FleetSocketHandler). */
 	public void tradeSelect(String bot, int trade) {
-		final Integer rid = fleetOf.get(bot);
-
-		if (rid == null) {
+		if (!bots.contains(bot)) {
 			throw new IllegalStateException("no bot named " + bot + " to pick trade " + trade + " for");
 		}
 
-		if (rid == 0) {
-			channel.tradeSelect(bot, trade);
-		} else {
-			relays.tradeSelect(rid, bot, trade);
-		}
+		channel.tradeSelect(bot, trade);
 	}
 
 	/**
@@ -331,10 +293,13 @@ public final class BotRegistry implements BotListener {
 		return Collections.unmodifiableMap(visuals);
 	}
 
+	/** The band primitives each bot runs and holds, by bot: {min x, y, z, max x, y, z} each, the running one first. */
+	public Map<String, int[][]> getBands() {
+		return Collections.unmodifiableMap(bands);
+	}
+
 	/**
-	 * Starts a bot that joins host:port in the background, named by the name list, on the fleet
-	 * (the mod's own or a relay, a starting one too) with the fewest bots; returns the name.
-	 * Synchronized with a relay failing or closing, so its rid is never picked as it goes.
+	 * Starts a bot that joins host:port in the background, named by the name list; returns the name.
 	 */
 	public synchronized String create(String host, int port) {
 		final String name = names.take();
@@ -345,12 +310,11 @@ public final class BotRegistry implements BotListener {
 			}
 
 			serverOf.put(name, InetSocketAddress.createUnresolved(host, port));
-			spawnOn(leastLoadedFleet(), name);
+			channel.spawn(name, host, port);
 			final BotProfile profile = profiles.get(name);
 			profiles.recordJoin(name, host + ":" + port, profile.getDefaultCrackedPassword());
 		} catch (RuntimeException e) {
 			if (bots.remove(name)) {
-				fleetOf.remove(name);
 				serverOf.remove(name);
 				names.give(name);
 			}
@@ -361,68 +325,19 @@ public final class BotRegistry implements BotListener {
 		return name;
 	}
 
-	private void spawnOn(int rid, String name) {
-		final InetSocketAddress server = serverOf.get(name);
-		fleetOf.put(name, rid);
-
-		if (rid == 0) {
-			channel.spawn(name, server.getHostString(), server.getPort());
-		} else {
-			relays.spawn(rid, name, server.getHostString(), server.getPort());
-		}
-	}
-
-	/** The rid of the fleet running the fewest bots, the lowest on a tie: 0 is the mod's own. */
-	private int leastLoadedFleet() {
-		final Map<Integer, Integer> counts = new java.util.TreeMap<Integer, Integer>();
-		counts.put(0, 0);
-
-		for (int rid : relays.rids()) {
-			counts.put(rid, 0);
-		}
-
-		for (int rid : fleetOf.values()) {
-			if (counts.containsKey(rid)) {
-				counts.put(rid, counts.get(rid) + 1);
-			}
-		}
-
-		int best = 0;
-
-		for (Map.Entry<Integer, Integer> entry : counts.entrySet()) {
-			if (entry.getValue() < counts.get(best)) {
-				best = entry.getKey();
-			}
-		}
-
-		return best;
-	}
-
-	/** The bot walks to stand at x, y, z, on the fleet running it. */
+	/** The bot walks to stand at x, y, z, on the fleet. */
 	public void gotoSpot(String bot, int x, int y, int z) {
-		final Integer rid = fleetOf.get(bot);
-
-		if (rid == null) {
+		if (!bots.contains(bot)) {
 			throw new IllegalStateException("no bot named " + bot + " to send to " + x + "," + y + "," + z);
 		}
 
-		if (rid == 0) {
-			channel.gotoSpot(bot, x, y, z);
-		} else {
-			relays.gotoSpot(rid, bot, x, y, z);
-		}
+		channel.gotoSpot(bot, x, y, z);
 	}
 
 	/** Each bot leaves; the fleet unloads each chunk once no bot holds it. The fleets stay up. */
 	public synchronized void stopAll() {
 		for (String bot : bots) {
-			final int rid = fleetOf.get(bot);
-
-			if (rid == 0) {
-				channel.quit(bot);
-			} else {
-				relays.quit(rid, bot);
-			}
+			channel.quit(bot);
 		}
 
 		clear();
@@ -485,6 +400,13 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
+	public void onColumnIn(String bot, ChunkKey key) {
+		for (ColumnListener listener : columnListeners) {
+			listener.onColumnIn(bot, key);
+		}
+	}
+
+	@Override
 	public void onChestLid(String bot, int x, int y, int z, int viewers) {
 		for (LidListener listener : lidListeners) {
 			listener.onChestLid(bot, x, y, z, viewers);
@@ -506,74 +428,46 @@ public final class BotRegistry implements BotListener {
 	}
 
 	@Override
+	public void onBands(String bot, int[][] boxes) {
+		if (boxes.length == 0) {
+			bands.remove(bot);
+		} else {
+			bands.put(bot, boxes);
+		}
+	}
+
+	@Override
 	public void onGone(String bot) {
 		if (bots.remove(bot)) {
 			names.give(bot);
 		}
 
-		fleetOf.remove(bot);
 		serverOf.remove(bot);
 
 		spawned.remove(bot);
 		paths.remove(bot);
 		visuals.remove(bot);
+		bands.remove(bot);
 		inventories.remove(bot);
 		clicksSent.remove(bot);
 		statuses.remove(bot);
 		windows.remove(bot);
 	}
 
-	/** The mod's own fleet is gone: its bots with it. */
+	/** The fleet is gone: its bots with it. */
 	@Override
 	public void onClosed() {
-		clearFleet(0);
-	}
-
-	/** A relay failed before its WELCOME (the hub holding this registry's lock): its bots never got there and go to the fleet with the fewest. */
-	void onRelayFailed(int rid) {
-		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
-			if (entry.getValue() == rid) {
-				spawnOn(leastLoadedFleet(), entry.getKey());
-			}
-		}
-	}
-
-	/** A relay is gone: its bots with it. */
-	void onRelayClosed(int rid) {
-		clearFleet(rid);
-	}
-
-	private void clearFleet(int rid) {
-		for (Map.Entry<String, Integer> entry : fleetOf.entrySet()) {
-			if (entry.getValue() != rid) {
-				continue;
-			}
-
-			final String bot = entry.getKey();
-			fleetOf.remove(bot);
-			serverOf.remove(bot);
-			spawned.remove(bot);
-			paths.remove(bot);
-			visuals.remove(bot);
-			inventories.remove(bot);
-			clicksSent.remove(bot);
-			statuses.remove(bot);
-			windows.remove(bot);
-
-			if (bots.remove(bot)) {
-				names.give(bot);
-			}
-		}
+		clear();
 	}
 
 	private void clear() {
 		names.giveAll();
 		bots.clear();
-		fleetOf.clear();
 		serverOf.clear();
 		spawned.clear();
 		paths.clear();
 		visuals.clear();
+		bands.clear();
 		inventories.clear();
 		clicksSent.clear();
 		statuses.clear();

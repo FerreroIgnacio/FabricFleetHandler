@@ -9,7 +9,7 @@ package net.mapmcbot.bot;
  * Immutable: a new one comes with each change.
  */
 public final class BotVis {
-	/** The faces by the index the fleet sends (actions.js FACES): bottom, top, east, west, south, north. */
+	/** The faces by the index the fleet sends (lib/util.js FACES): bottom, top, east, west, south, north. */
 	public static final int[][] FACES = {{0, -1, 0}, {0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
 
 	public final boolean place;

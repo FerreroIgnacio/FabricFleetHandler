@@ -28,7 +28,7 @@ const VOLUME = 4096
 // Section palettes up to this many bits; past it the data holds global state ids.
 const MAX_BITS_PER_BLOCK = 8
 
-// Slot layout, little-endian, mirrored by net.mapmcbot.fleet.FleetProtocol: a header (unused, the
+// Slot layout, little-endian, mirrored by net.mapmcbot.fleet.FleetSocketHandler: a header (unused, the
 // column's SharedArrayBuffer holds it), the state id of every block (u16, index y << 8 | z << 4 | x),
 // biomes (u8, z << 4 | x). A section the column lacks is zeros (air), as the mod reads it.
 const STATES = 16
@@ -135,17 +135,23 @@ function columnClass (registry) {
   const Biome = require('prismarine-biome')(registry)
   const maxBitsPerBlock = neededBits(Object.values(registry.blocks).reduce((high, block) => Math.max(high, block.maxStateId), 0))
 
-  // State id -> a Block built once, copied for each getBlock: Block's constructor walks the block's
-  // variations and properties, on every one of the many blocks physics and the path searches read.
+  // State id -> a Block built once, each getBlock's inheriting from it: Block's constructor walks the
+  // block's variations and properties, and a copy of all its fields costs as much again, on every one
+  // of the many blocks physics, the path searches and the aims read. What a block's user may change is
+  // its own (getProperties merges computedStates into _properties; position, light, entity set on it).
   const templates = new Map()
+  // Biome id -> its Biome, built once: read only.
+  const biomes = new Map()
   function blockOf (stateId, biome) {
     let template = templates.get(stateId)
     if (!template) templates.set(stateId, (template = new Block(stateId >> 4, 0, stateId & 15)))
-    const block = Object.assign(Object.create(Block.prototype), template)
-    // Its own: getProperties merges computedStates into _properties.
+    let ofBiome = biomes.get(biome)
+    if (!ofBiome) biomes.set(biome, (ofBiome = Biome(biome)))
+    const block = Object.create(template)
     block._properties = { ...template._properties }
     block.computedStates = {}
-    block.biome = Biome(biome)
+    block.position = null
+    block.biome = ofBiome
     return block
   }
 

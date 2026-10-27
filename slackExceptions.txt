@@ -1,5 +1,7 @@
 Excepciones a la regla "todo preciso" (reglas del repo), autorizadas una por una.
 
-1. SLACK de LookGoal (goto con look): el alcance se toma SLACK (√½, lo más lejos que quedan los ojos del medio del bloque de los pies, de costado) menos, porque el bot puede terminar en cualquier punto del bloque y el interact apunta desde ahí. (actions.js, SLACK y LookGoal)
+1. SLACK de LookGoal (goto con look): el alcance se toma SLACK (√½, lo más lejos que quedan los ojos del medio del bloque de los pies, de costado) menos, porque el bot puede terminar en cualquier punto del bloque y el interact apunta desde ahí. (prims/goto.js, SLACK y LookGoal)
 
-2. DIG_SLACK de las wsrpa: el tiempo de picado que se planea en el camino (digTicks) se toma un 40% más largo, porque los tiempos de minecraft-data a veces salen más optimistas que los del server. (actions.js, DIG_SLACK y digTicks)
+2. DIG_SLACK de las wsrpa: el tiempo de picado que se planea en el camino (digTicks) se toma un 40% más largo, porque los tiempos de minecraft-data a veces salen más optimistas que los del server. (lib/hold.js, DIG_SLACK y digTicks)
+
+3. BAND_GROW del render de las prims band: la caja se dibuja 0.01 más grande que sus bloques para que entre bandas pegadas se vean los dos bordes. Solo visual. (AreaRenderer, BAND_GROW)

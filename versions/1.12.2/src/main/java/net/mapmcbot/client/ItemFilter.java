@@ -23,7 +23,7 @@ import net.minecraft.nbt.NbtString;
 /**
  * Which items an order means, told from a reference item picked off a slot: each of its fields (its
  * name, its metadata, each tag of its NBT) counts or not, and with exact on its NBT has to be the
- * reference's but at the tags that do not count. As the fleet's itemMatcher (actions.js) takes it.
+ * reference's but at the tags that do not count. As the fleet's itemMatcher (lib/items.js) takes it.
  */
 final class ItemFilter {
 	/** A tag of the reference's NBT: where it is (keys joined by dots), what to call it, its value as shown. */
@@ -126,7 +126,7 @@ final class ItemFilter {
 		return "custom";
 	}
 
-	/** As the fleet's itemMatcher takes it (actions.js). */
+	/** As the fleet's itemMatcher takes it (lib/items.js). */
 	JsonObject toJson() {
 		final JsonObject spec = new JsonObject();
 

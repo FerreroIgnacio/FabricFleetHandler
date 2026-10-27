@@ -1,0 +1,42 @@
+Test de bandas (prim `band`, área qtest3): conclusiones
+=======================================================
+
+Setup
+- Banda 2X x 2Z x 4Y: secciones de 2 en x, 2 de ancho en z, 4 de alto (y 68..71), 8 slices (LENGTH = 8 en BandTest).
+- BandTest.java (src/debug) lee el mundo del server (no el del cliente: por render distance daba strips "picadas en 0.0 s") y corre next() en el thread del server.
+- AutoStart parte los /fill a lo largo de z (FILL_LIMIT = 32768, límite de /fill).
+- Perfiles: versions/1.12.2/run/mapmcbot/bot_profiles.tsv con v1..v30. Al recortar bots borrar también las líneas J, si no: "no bot profile named vN".
+- Look a 1.05 * look.HUMAN_SPEED (LOOK_SPEED en bot/lib/util.js) para resultados realistas.
+- Cómo correrlo y leer fleet.log: archive/quarrify/quarrifyTest.txt (Quarrify archivado; AutoStart corre el band test con qtest3 en run/mapmcbot/debug/qtest). Líneas útiles: "ticks a block", "band ticks:" (por código de bloque), "band halt:", "band swept: N of M".
+
+Estilos (BAND_STYLES en bot/prims/band.js)
+- Quedaron los 4 más rápidos del benchmark: filas-espejo, serpiente-vuelta, filas-vuelta, serpiente-abajo-vuelta.
+- Cada bot tiene su estilo preferido: hash del nombre mod 4 (bandStyleOf). Un `order` explícito en la acción lo pisa.
+- Con barrido las diferencias entre estilos son chicas: 1.55-1.56 tres de ellos, serpiente-vuelta 1.62.
+
+De dónde salen los ticks
+- reach y sight siempre en 0: todo tick extra es giro de cabeza (modelo humano de look.js).
+- Bloque justo detrás del anterior: ~1.1 ticks. Diagonales: 2.9-3.9.
+- A 1.05x humano cualquier giro nuevo cuesta ~6+ ticks: eso eran los "halts" (pica varios, se frena unos ms, sigue). No eran lag: 0 ticks tardíos de física.
+- Probado y descartado: forzar un way nuevo por target (head.stop() en takeNext) -> 4.46 ticks/bloque y 1890 halts; re-aim "en camino" -> falsos positivos, peor.
+- Lo que sí funciona: re-aim al punto exacto (aim.ray) cuando la cabeza terminó y erró; tomar el aim una sola vez por target (redibujar el miss cada tick daba stutter).
+
+Barrido (sweep en breakBand)
+- Cada tick, si el rayo no da en el target, se tira bot.world.raycast; si el primer bloque que cruza es de la banda, sólido, instantáneo, no mandado y en alcance, se pica ahí mismo y se sigue al target. Una dig por tick como máximo.
+- Resultado con 30 bots: 2.36 -> 1.57 ticks/bloque, halts 655 -> 100, 36% de los bloques picados de pasada.
+- Por bot: 1.42 (v8) a 1.83 (v19). Halts repartidos, ningún bot pasa de 7.
+
+CPU (30 bots)
+- sharedChunks.blockOf con Object.create(template) + Biome cacheado: de 46.5% del CPU ocupado a 0.9%.
+- Node bajó de 9.3 a 3.6 cores; máquina de 82% a 45% (con barrido ~52% picando: MC 3.7 cores, bots 4.0).
+- Antes de optimizar: ~0.13-0.26 cores por bot.
+
+Bug abierto: dig sin confirmar
+- Error: "expected X of the band gone within 5000 ms of its dig, found minecraft:air" (vino en v22 y en v27, intermitente; 3 corridas seguidas sin repetirse).
+- No es la banda: el aire es la predicción local. Lo de v27: spawn 15:17:42, kick "disconnect.timeout" 15:17:57 = keepalive sin respuesta 15 s desde el spawn, con la física andando. Se cortó la conexión de ese bot (entrada o salida, no se sabe).
+- Confirmar por chunkColumnLoad no lo arregló (no era eso).
+- Diagnóstico dejado en el mensaje del deadline (wireOf en breakBand): paquetes entrados desde que empezó la banda, el último y hace cuánto, bytes leídos/escritos y pendientes de salida del socket. Cuando vuelva a pasar eso dice de qué lado se trabó.
+
+Otros pendientes
+- El cliente a veces se congela al final de la corrida (sospecha: el profiler de profrun.sh). Se mata con pkill -9 -f '[d]evlaunchinjector'.
+- Quarrify usa band (Quarrify.bandRun) en las bandas de 2 de ancho y capa de 4 donde se puede: hasta 8 slices desde el start del pac, sin escalera ni bloques dejados, todo instantáneo, 3 slices mínimo y el camino hasta el primer stand caminable; si no, break_pac como antes.

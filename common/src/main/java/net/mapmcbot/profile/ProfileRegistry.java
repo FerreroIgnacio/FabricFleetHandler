@@ -22,8 +22,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
-import net.mapmcbot.bot.RelayHub;
-import net.mapmcbot.fleet.FleetChannel;
+import net.mapmcbot.fleet.FleetSocketHandler;
 
 /**
  * CPU and memory of the mod (Java) and of the fleet (node), whole, per thread and per bot: a
@@ -34,14 +33,13 @@ import net.mapmcbot.fleet.FleetChannel;
  * asks for one (the screen opening, its refresh, the player leaving the world), and when the fleet
  * takes one on an event of its own (a bot in a world or gone):
  * the fleet's part comes from the fleet, the mod's is read as it arrives. With no fleet running,
- * the mod's part alone. Each relay answers every request with its own, logged with its rows scoped
- * "relay<rid>." before the fleet's own scopes.
+ * the mod's part alone.
  *
  * Thread-safe: the channel thread feeds it, anyone may read it.
  *
  * SINGLETON: one per game; a second registry throws.
  */
-public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileSink {
+public final class ProfileRegistry implements ProfileListener {
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
 	/** Reports kept for the screen. */
@@ -66,11 +64,7 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 
 	private static final java.time.format.DateTimeFormatter TIME = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss");
 
-	private final FleetChannel channel;
-	private final RelayHub relays;
-	/** Each relay's newest profile and the one its rates are worked out against (its own reports, apart from the mod's). */
-	private final java.util.Map<Integer, ProfileReport> relayLatest = new java.util.TreeMap<Integer, ProfileReport>();
-	private final java.util.Map<Integer, ProfileReport> relayBase = new java.util.HashMap<Integer, ProfileReport>();
+	private final FleetSocketHandler channel;
 	/** Per bot that claimed them: {chunks, block entities, bytes of their NBT} held by the chunk registry. */
 	private final Supplier<Map<String, long[]>> chunksByBot;
 	/** Reopened on each rotation (see MAX_LOG). */
@@ -90,7 +84,7 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 	/** The request whose profile has not arrived, 0 for none. */
 	private volatile int waitingFor;
 
-	public ProfileRegistry(FleetChannel channel, RelayHub relays, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
+	public ProfileRegistry(FleetSocketHandler channel, File logFile, Supplier<Map<String, long[]>> chunksByBot) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("ProfileRegistry is a singleton: one was already created");
 		}
@@ -112,7 +106,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		threads.setThreadAllocatedMemoryEnabled(true);
 
 		this.channel = channel;
-		this.relays = relays;
 		this.chunksByBot = chunksByBot;
 		this.logFile = logFile;
 
@@ -123,7 +116,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		openLog();
 
 		channel.setProfileListener(this);
-		relays.setProfileSink(this);
 
 		// Not an executor's: one would keep what the request throws to itself. Thrown here, it ends the
 		// thread with its trace, and the profiles with it.
@@ -162,9 +154,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 	public void request(String reason) {
 		final int id;
 
-		// The relays answer on their own, each into its own report.
-		relays.requestProfile(reason);
-
 		synchronized (this) {
 			if (!channel.isRunning()) {
 				record(reason, new ArrayList<ProfileReport.Row>());
@@ -183,11 +172,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		return history.isEmpty() ? null : history.getLast();
 	}
 
-	/** The newest profile of the relay `rid`, null before its first or once it is gone. Its rows are scoped as the mod's own fleet's ("node"...). */
-	public synchronized ProfileReport getRelayLatest(int rid) {
-		return relayLatest.get(rid);
-	}
-
 	/** The profiles so far, oldest first. */
 	public synchronized List<ProfileReport> getHistory() {
 		return new ArrayList<ProfileReport>(history);
@@ -200,29 +184,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		if (id != 0 && id == waitingFor) {
 			waitingFor = 0;
 		}
-	}
-
-	@Override
-	public synchronized void onRelayProfile(int rid, String reason, String text) {
-		final long now = System.currentTimeMillis();
-		final ProfileReport latest = relayLatest.get(rid);
-		ProfileReport base = relayBase.get(rid);
-
-		// As for the mod's: rates against the newest report at least MIN_INTERVAL older.
-		if (latest != null && now - latest.getTime() >= MIN_INTERVAL) {
-			base = latest;
-			relayBase.put(rid, base);
-		}
-
-		final ProfileReport report = new ProfileReport(now, reason, ProfileReport.parse(text), base);
-		relayLatest.put(rid, report);
-		writeRelay(rid, report);
-	}
-
-	@Override
-	public synchronized void onRelayGone(int rid) {
-		relayLatest.remove(rid);
-		relayBase.remove(rid);
 	}
 
 	/** The profiles come once a second (see PROFILE_EVERY), not by frames. */
@@ -251,7 +212,7 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 		write(report);
 	}
 
-	/** The mod's own rows: the JVM whole, each of its threads, and each bot's frames (see FleetChannel#channelRows). */
+	/** The mod's own rows: the JVM whole, each of its threads, and each bot's frames (see FleetSocketHandler#channelRows). */
 	private List<ProfileReport.Row> javaRows() {
 		final List<ProfileReport.Row> rows = new ArrayList<ProfileReport.Row>();
 		final MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
@@ -356,22 +317,6 @@ public final class ProfileRegistry implements ProfileListener, RelayHub.ProfileS
 			}
 
 			rows(time, "", report);
-			finish();
-		} catch (IOException e) {
-			throw new UncheckedIOException("could not write " + logFile, e);
-		}
-	}
-
-	/** A relay's report in the log as the mod's: its summary line, then its scopes, "relay<rid>." before each. */
-	private void writeRelay(int rid, ProfileReport report) {
-		final String time = time(report);
-		final String prefix = "relay" + rid + ".";
-
-		try {
-			line("# " + time + " " + prefix + " " + oneLine(report.getReason()) + ": " + String.format(Locale.ROOT, "node cpu %s, rss %s, bots %d%s",
-					cpu(report, "node", "cpu.user", "cpu.system"), megabytes(report.value("node", "mem.rss")), (int) report.value("node", "bots"),
-					report.hasRates() ? String.format(Locale.ROOT, " | over %.1f s", report.getInterval() / 1000.0) : ""));
-			rows(time, prefix, report);
 			finish();
 		} catch (IOException e) {
 			throw new UncheckedIOException("could not write " + logFile, e);

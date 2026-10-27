@@ -34,7 +34,7 @@ import net.minecraft.client.MinecraftClient;
  * so. Such a chest is not checked and stays dirty until a bot opens it with no other in it, every
  * frame of the others in by then (each fleet's close comes after its own changes).
  *
- * Where the chests are comes from every fleet, the mod's and the relays' alike (CHEST, COLUMN_GONE):
+ * Where the chests are comes from the fleet (CHEST, COLUMN_GONE):
  * an index of the chests in the columns they hold, by column. Only chests inside an area are kept.
  */
 final class ChestTracker implements BotRegistry.ActionListener, BotRegistry.WindowListener, BotRegistry.StateListener, BotRegistry.LidListener, BotRegistry.ChestListener {

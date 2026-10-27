@@ -270,7 +270,7 @@ final class BotCommands {
 					wait.addProperty("slot", number(parts[0], "SLOT"));
 					wait.addProperty("min", number(parts[1], "MIN"));
 
-					// As the fleet's itemMatcher takes it (actions.js): by name, or exact, nothing of the NBT ignored.
+					// As the fleet's itemMatcher takes it (lib/items.js): by name, or exact, nothing of the NBT ignored.
 					if (!match.equals("any")) {
 						final JsonObject filter = new JsonObject();
 						filter.addProperty("name", parts[3]);

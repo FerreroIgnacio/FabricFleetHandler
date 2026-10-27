@@ -1,10 +1,8 @@
 package net.mapmcbot.client;
 
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import net.mapmcbot.area.Area;
@@ -26,7 +24,7 @@ import org.lwjgl.opengl.GL11;
  * Each area as a coloured box in the world, plus the block a click would pick while picking, and
  * the path each walking bot is on with its target, and the chests of each grab going on: the one
  * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour; and
- * the blocks each quarrify chooses from, green; and the blocks clicked in chat messages, red; and
+ * the blocks clicked in chat messages, red; and
  * what each bot's wsr primitive shows (see BotVis), in its colour, red once failed.
  *
  * Drawn at the end of entity rendering, where the camera transform is set with the camera at the
@@ -42,6 +40,10 @@ public final class AreaRenderer {
 	private static final float NUMBER_SCALE = 1.0F / 16;
 	private static final int EDGE_ALPHA = 0xFF;
 	private static final int FILL_ALPHA = 0x20;
+	/** A band primitive's fill, the running one's (see drawBands); each held after it fainter. */
+	private static final int BAND_ALPHA = 0x50;
+	/** How far a band primitive's box sticks out of its blocks, against EXPANSION's pulling in: next to another, both edges show. */
+	private static final double BAND_GROW = 0.05;
 	/** The face aimed at and the dig's fill, over the box's own. */
 	private static final int FACE_ALPHA = 0x60;
 	/** The region the aim's miss picks from (see drawRegion). */
@@ -50,7 +52,7 @@ public final class AreaRenderer {
 	private static final int FAILED = 0xFF0000;
 	/** Half the side of the box marking a point (an aim, the feet). */
 	private static final double POINT = 0.05;
-	/** The eyes over the feet, standing and crouched, as 1.12 has them (see actions.js SNEAK_EYE_HEIGHT). */
+	/** The eyes over the feet, standing and crouched, as 1.12 has them (see lib/aim.js SNEAK_EYE_HEIGHT). */
 	private static final double EYE_HEIGHT = 1.62;
 	private static final double SNEAK_EYE_HEIGHT = 1.54;
 	/** The stages of a block's cracks, as the server sends them: 0 to 9. */
@@ -59,18 +61,18 @@ public final class AreaRenderer {
 	private static final double LABEL_WIDTH = 0.9;
 
 	/**
-	 * What is drawn, cycled with its key: 1 everything, 2 no quarrify depths, 3 no quarrify eligible,
-	 * 4 nothing but the block a pick would pick; then each bot in turn, by name (see bot), and back to 1.
+	 * What is drawn, cycled with its key: 1 everything, 2 nothing but the block a pick would pick; then
+	 * each bot in turn, by name (see bot), and back to 1.
 	 */
 	private static int mode = 1;
-	/** In a bot's mode, the bot: of the bots' paths, grabs and wsr primitives, its own; no areas, no quarrify's. */
+	/** In a bot's mode, the bot: of the bots' paths, grabs and wsr primitives, its own; no areas. */
 	private static String bot;
 
 	private AreaRenderer() {
 	}
 
 	public static void nextMode() {
-		if (bot == null && mode < 4) {
+		if (bot == null && mode < 2) {
 			mode++;
 			return;
 		}
@@ -91,7 +93,7 @@ public final class AreaRenderer {
 		mode = 1;
 	}
 
-	/** The bot of the mode, null in 1 to 4; one removed from the session leaves the mode at 1. */
+	/** The bot of the mode, null in 1 and 2; one removed from the session leaves the mode at 1. */
 	public static String selected() {
 		final BotRegistry bots = MapMcBotClient.botsOrNull();
 
@@ -109,7 +111,7 @@ public final class AreaRenderer {
 			return;
 		}
 
-		final boolean all = mode != 4;
+		final boolean all = mode != 2;
 		final String selected = selected();
 		final AreaStore store = all && selected == null ? MapMcBotClient.areas() : null;
 		final BlockPos target = AreaPick.isActive() ? AreaPick.target(client) : TargetPick.isActive() ? TargetPick.target(client) : null;
@@ -117,15 +119,13 @@ public final class AreaRenderer {
 		final BotRegistry bots = MapMcBotClient.botsOrNull();
 		final Map<String, int[]> paths = bots == null || !all ? Collections.<String, int[]>emptyMap() : bots.getPaths();
 		final Map<String, BotVis> visuals = bots == null || !all ? Collections.<String, BotVis>emptyMap() : bots.getVisuals();
+		final Map<String, int[][]> botBands = bots == null || !all ? Collections.<String, int[][]>emptyMap() : bots.getBands();
 		final Grab grab = MapMcBotClient.grabOrNull();
 		final List<Grab.Highlight> chests = grab == null || !all ? Collections.<Grab.Highlight>emptyList() : grab.highlights();
 
 		final List<BlockPos> highlighted = all ? BlockLinks.highlighted() : Collections.<BlockPos>emptyList();
-		final Quarrify quarrify = MapMcBotClient.quarrifyOrNull();
-		final List<int[]> eligible = quarrify == null || mode >= 3 || selected != null ? Collections.<int[]>emptyList() : quarrify.eligible();
-		final List<int[]> depths = quarrify == null || mode == 2 || mode == 4 || selected != null ? Collections.<int[]>emptyList() : quarrify.depths();
 
-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && visuals.isEmpty() && chests.isEmpty() && highlighted.isEmpty() && eligible.isEmpty() && depths.isEmpty()) {
+		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && visuals.isEmpty() && botBands.isEmpty() && chests.isEmpty() && highlighted.isEmpty()) {
 			return;
 		}
 
@@ -168,8 +168,7 @@ public final class AreaRenderer {
 			drawBox(entityTarget.minX, entityTarget.minY, entityTarget.minZ, entityTarget.maxX, entityTarget.maxY, entityTarget.maxZ, 0xFFFFFF, camX, camY, camZ);
 		}
 
-		// TODO(world): a bot may be on another server or dimension than this client's (a relay's, or a local
-		// fleet's), and its path is drawn here all the same. Needs the bot's world with its PATH, and only the paths of this world drawn.
+		// TODO(world): a bot may be on another server or dimension than this client's, and its path is drawn here all the same. Needs the bot's world with its PATH, and only the paths of this world drawn.
 		for (Map.Entry<String, int[]> entry : paths.entrySet()) {
 			if (selected != null && !entry.getKey().equals(selected)) {
 				continue;
@@ -179,6 +178,14 @@ public final class AreaRenderer {
 			final int rgb = MapMcBotClient.colorOf(entry.getKey()).getRgb();
 			drawBox(path[0], path[1], path[2], path[0] + 1, path[1] + 1, path[2] + 1, rgb, camX, camY, camZ);
 			drawPath(path, rgb, camX, camY, camZ);
+		}
+
+		for (Map.Entry<String, int[][]> entry : botBands.entrySet()) {
+			if (selected != null && !entry.getKey().equals(selected)) {
+				continue;
+			}
+
+			drawBands(entry.getValue(), MapMcBotClient.colorOf(entry.getKey()).getRgb(), camX, camY, camZ);
 		}
 
 		for (Map.Entry<String, BotVis> entry : visuals.entrySet()) {
@@ -215,22 +222,6 @@ public final class AreaRenderer {
 			}
 		}
 
-		// The blocks of the active layer each quarrify chooses from (see Quarrify.pick), as one shape.
-		if (!eligible.isEmpty()) {
-			drawCells(eligible, 0x00FF00, camX, camY, camZ);
-		}
-
-		// Each block of the active layer's depth (see Quarrify.depth), on its top and sides.
-		if (!depths.isEmpty()) {
-			GlStateManager.enableTexture();
-
-			for (int[] block : depths) {
-				drawNumber(client, block, camX, camY, camZ);
-			}
-
-			GlStateManager.disableTexture();
-		}
-
 		// The blocks clicked in chat (see BlockLinks), over everything.
 		GlStateManager.disableDepthTest();
 
@@ -249,13 +240,8 @@ public final class AreaRenderer {
 		GlStateManager.popMatrix();
 	}
 
-	/** The block's number {x, y, z, number} written on its top and its 4 sides, just off them. */
-	private static void drawNumber(MinecraftClient client, int[] block, double camX, double camY, double camZ) {
-		drawLabel(client, block, new String[] {String.valueOf(block[3])}, 0xFFFFFF, camX, camY, camZ);
-	}
-
 	/**
-	 * The lines written on the block's top and its 4 sides, just off them, as its depth is: NUMBER_SCALE
+	 * The lines written on the block's top and its 4 sides, just off them: NUMBER_SCALE
 	 * tall, smaller when the widest is wider than LABEL_WIDTH of the side.
 	 */
 	private static void drawLabel(MinecraftClient client, int[] block, String[] lines, int rgb, double camX, double camY, double camZ) {
@@ -287,6 +273,27 @@ public final class AreaRenderer {
 
 			GlStateManager.popMatrix();
 		}
+	}
+
+	/**
+	 * A bot's band primitives (see BotRegistry#getBands), each its own box in rgb with its own edges, a
+	 * hair out of its blocks (two side by side keep the line between them): the running one first, each
+	 * held after it darker and fainter.
+	 */
+	private static void drawBands(int[][] boxes, int rgb, double camX, double camY, double camZ) {
+		for (int i = 0; i < boxes.length; i++) {
+			final int[] b = boxes[i];
+			final int shade = shade(rgb, boxes.length - i, boxes.length);
+			// Given so that, EXPANSION taken off, it ends BAND_GROW out of the blocks.
+			final double g = BAND_GROW + EXPANSION;
+			drawFill(b[0] - g, b[1] - g, b[2] - g, b[3] + 1 + g, b[4] + 1 + g, b[5] + 1 + g, shade, BAND_ALPHA * (boxes.length - i) / boxes.length, camX, camY, camZ);
+			drawOutline(b[0] - g, b[1] - g, b[2] - g, b[3] + 1 + g, b[4] + 1 + g, b[5] + 1 + g, shade, camX, camY, camZ);
+		}
+	}
+
+	/** rgb scaled by part of whole: the farther a held band, the darker. */
+	private static int shade(int rgb, int part, int whole) {
+		return ((rgb >> 16 & 0xFF) * part / whole) << 16 | ((rgb >> 8 & 0xFF) * part / whole) << 8 | (rgb & 0xFF) * part / whole;
 	}
 
 	/**
@@ -366,82 +373,6 @@ public final class AreaRenderer {
 		}
 
 		return -1;
-	}
-
-	/**
-	 * The blocks as the shape they make together, in the world (depth tested): of each, the faces not
-	 * against another of them, just off the block, and their edges but where the face goes on flat
-	 * into the next one's.
-	 */
-	private static void drawCells(List<int[]> blocks, int rgb, double camX, double camY, double camZ) {
-		final Set<Long> cells = new HashSet<Long>();
-
-		for (int[] block : blocks) {
-			cells.add(cell(block[0], block[1], block[2]));
-		}
-
-		final int r = (rgb >> 16) & 0xFF;
-		final int g = (rgb >> 8) & 0xFF;
-		final int b = rgb & 0xFF;
-		final Tessellator tessellator = Tessellator.getInstance();
-		final BufferBuilder buffer = tessellator.getBuffer();
-
-		for (int pass = 0; pass < 2; pass++) {
-			buffer.begin(pass == 0 ? GL11.GL_QUADS : GL11.GL_LINES, VertexFormats.POSITION_COLOR);
-
-			for (int[] block : blocks) {
-				for (int[] face : BotVis.FACES) {
-					if (cells.contains(cell(block[0] + face[0], block[1] + face[1], block[2] + face[2]))) {
-						continue;
-					}
-
-					// The face's axis k, the other two u and v; its plane just off the block.
-					final int k = face[0] != 0 ? 0 : face[1] != 0 ? 1 : 2;
-					final int u = (k + 1) % 3;
-					final int v = (k + 2) % 3;
-					final double plane = block[k] + (face[k] > 0 ? 1 : 0) - face[k] * EXPANSION;
-					final double[][] corners = new double[4][3];
-
-					for (int c = 0; c < 4; c++) {
-						corners[c][k] = plane;
-						corners[c][u] = block[u] + (c == 1 || c == 2 ? 1 : 0);
-						corners[c][v] = block[v] + (c >= 2 ? 1 : 0);
-					}
-
-					if (pass == 0) {
-						for (double[] corner : corners) {
-							buffer.vertex(corner[0] - camX, corner[1] - camY, corner[2] - camZ).color(r, g, b, FILL_ALPHA).next();
-						}
-
-						continue;
-					}
-
-					// Edge c from corner c to c + 1, toward the neighbour on it: -v, +u, +v, -u.
-					for (int c = 0; c < 4; c++) {
-						final int[] step = new int[3];
-						step[c == 1 || c == 3 ? u : v] = c == 0 || c == 3 ? -1 : 1;
-						final int nx = block[0] + step[0];
-						final int ny = block[1] + step[1];
-						final int nz = block[2] + step[2];
-
-						if (cells.contains(cell(nx, ny, nz)) && !cells.contains(cell(nx + face[0], ny + face[1], nz + face[2]))) {
-							continue;
-						}
-
-						final double[] from = corners[c];
-						final double[] to = corners[(c + 1) % 4];
-						line(buffer, from[0] - camX, from[1] - camY, from[2] - camZ, to[0] - camX, to[1] - camY, to[2] - camZ, r, g, b);
-					}
-				}
-			}
-
-			tessellator.draw();
-		}
-	}
-
-	/** The block as a key, packed as BlockPos packs it. */
-	private static long cell(int x, int y, int z) {
-		return ((long) x & 0x3FFFFFF) << 38 | ((long) y & 0xFFF) << 26 | ((long) z & 0x3FFFFFF);
 	}
 
 	/** A couple of tones darker: readable on its own colour's box. */

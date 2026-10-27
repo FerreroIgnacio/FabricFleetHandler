@@ -1,4 +1,4 @@
-// The binary frames between the fleet and the mod, mirrored by net.mapmcbot.fleet.FleetProtocol:
+// The binary frames between the fleet and the mod, mirrored by net.mapmcbot.fleet.FleetSocketHandler and its messages (net.mapmcbot.fleet.message):
 // u32 length, u8 type, payload; big-endian; strings are a u16 byte length and UTF-8. Chunk messages
 // start with the header: bot, server (host:port), dimension, chunk x, chunk z. The columns' blocks
 // never go through here: the mod reads them off their slot of columns.bin (see sharedChunks.js).
@@ -15,26 +15,22 @@ const TYPES = {
   STATE_NAMES: 9,
   LOAD: 10,
   PROFILE: 11,
-  CRASH: 12,
-  WELCOME: 13,
-  UPDATING: 14,
-  UPDATE_FAILED: 15,
   INVENTORY: 24,
   STATE: 26,
   WINDOW: 27,
   CHEST_LID: 30,
   CHEST: 31,
   COLUMN_GONE: 32,
-  LOG: 33,
   VIS: 54,
   CLEAR_Q: 55,
+  BANDS: 58,
+  COLUMN_IN: 59,
   // mod -> fleet
   RELEASE: 16,
   LOADED: 20,
   SPAWN: 17,
   QUIT: 18,
   PROFILE_REQUEST: 21,
-  HELLO: 22,
   WINDOW_CLICK: 25,
   TRADE_SELECT: 29,
   ALLOWED_PLACE: 49,
@@ -58,7 +54,9 @@ const TYPES = {
   BREAK_WSRP: 50,
   PLACE_WSRP: 51,
   BREAK_WSRPA: 52,
-  PLACE_WSRPA: 53
+  PLACE_WSRPA: 53,
+  BREAK_PAC: 56,
+  BAND: 57
 }
 
 // The primitive each of its types is, as actions.js names it.
@@ -68,7 +66,8 @@ const PRIMITIVES = new Map([
   [TYPES.WAIT_SLOT, 'wait_slot'], [TYPES.HOTBAR, 'hotbar'], [TYPES.SELECT_TRADE, 'select_trade'],
   [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop'],
   [TYPES.BREAK_WSR, 'break_wsr'], [TYPES.PLACE_WSR, 'place_wsr'], [TYPES.BREAK_WSRP, 'break_wsrp'],
-  [TYPES.PLACE_WSRP, 'place_wsrp'], [TYPES.BREAK_WSRPA, 'break_wsrpa'], [TYPES.PLACE_WSRPA, 'place_wsrpa']
+  [TYPES.PLACE_WSRP, 'place_wsrp'], [TYPES.BREAK_WSRPA, 'break_wsrpa'], [TYPES.PLACE_WSRPA, 'place_wsrpa'],
+  [TYPES.BREAK_PAC, 'break_pac'], [TYPES.BAND, 'band']
 ])
 
 class Writer {
@@ -172,7 +171,7 @@ class Reader {
     return Array.from({ length: count }, () => this.i32())
   }
 
-  // An item match as actions.js itemMatcher takes it: u8 name present, u8 metadata present, u8 NBT
+  // An item match as lib/items.js itemMatcher takes it: u8 name present, u8 metadata present, u8 NBT
   // mode (0 none, 1 match, 2 ignore); then the name, i32 metadata, and with a mode the reference's NBT
   // bytes, i32 path count and each path.
   matcher () {
@@ -327,7 +326,23 @@ function path (bot, target, nodes) {
   return w.frame()
 }
 
-// What a wsr primitive shows (see actions.js show), null to clear it: { kind (break | place), target,
+// The boxes of the band primitives the bot runs and holds, the running one first (see lib/lifecycle.js
+// showBands): each [min, max]; none to clear them.
+function bands (bot, boxes) {
+  const w = new Writer(TYPES.BANDS)
+  w.str(bot)
+  w.i32(boxes.length)
+  for (const box of boxes) {
+    for (const b of box) {
+      w.i32(b.x)
+      w.i32(b.y)
+      w.i32(b.z)
+    }
+  }
+  return w.frame()
+}
+
+// What a wsr primitive shows (see lib/lifecycle.js show), null to clear it: { kind (break | place), target,
 // phase, failure ('' for none), aim: { eyes, point, ray (the point it misses off), box ([min, max] on the face: as far as it misses each side), block, face (FACES' index), missed }, spot: { block,
 // feet, crouch }, end, partial, walk: [block], run: [block], takeover }; aim, spot (its feet), end,
 // partial and takeover null when not there.
@@ -414,9 +429,10 @@ function item (w, it) {
 
 // What the bot is doing: kind 0 idle, 1 doing `primitive`, 2 error in `primitive` with `message`
 // (what was expected and what was found), and where it stands then: u8 present, its feet's block
-// (i32 x, y, z) and its feet as they are (f64 x, y, z), none before it is in the world. The bot stays
-// in an error until its next primitive.
-function state (bot, kind, primitive, message, feet) {
+// (i32 x, y, z), its feet as they are (f64 x, y, z) and where its head looks (f64 yaw, pitch: rad, as
+// mineflayer has them), none before it is in the world. The bot stays in an error until its next primitive.
+function state (bot, kind, primitive, message, entity) {
+  const feet = entity?.position
   const w = new Writer(TYPES.STATE)
   w.str(bot)
   w.u8(kind)
@@ -430,6 +446,8 @@ function state (bot, kind, primitive, message, feet) {
     w.f64(feet.x)
     w.f64(feet.y)
     w.f64(feet.z)
+    w.f64(entity.yaw)
+    w.f64(entity.pitch)
   }
   return w.frame()
 }
@@ -447,7 +465,7 @@ function chestLid (bot, pos, viewers) {
 
 // A block with an inventory (a chest, trapped chest, hopper, dispenser, dropper, furnace, brewing stand
 // or shulker box: its type, "minecraft:chest"...) is at pos (world) in the column, or
-// none is any more (type empty). Not a column frame: relays send it too, the mod keeps the chests.
+// none is any more (type empty). The mod keeps the chests.
 function chest (bot, key, pos, type) {
   const w = new Writer(TYPES.CHEST)
   w.header(bot, key)
@@ -458,10 +476,16 @@ function chest (bot, key, pos, type) {
   return w.frame()
 }
 
-// The fleet let the column go: what the mod knows of its chests may go stale from here on. Not a
-// column frame: relays send it too.
+// The fleet let the column go: what the mod knows of its chests may go stale from here on.
 function columnGone (bot, key) {
   const w = new Writer(TYPES.COLUMN_GONE)
+  w.header(bot, key)
+  return w.frame()
+}
+
+// The bot has the column in its own world (its chunkColumnLoad): its blocks read from here on.
+function columnIn (bot, key) {
+  const w = new Writer(TYPES.COLUMN_IN)
   w.header(bot, key)
   return w.frame()
 }
@@ -492,47 +516,6 @@ function windowState (bot, window) {
   return w.frame()
 }
 
-// The fleet crashed: its error, for the mod to keep. Only a relay sends it (the mod has its own fleet's output). No bot: an empty name.
-function crash (text) {
-  const w = new Writer(TYPES.CRASH)
-  w.str('')
-  w.bytes(Buffer.from(text, 'utf8'))
-  return w.frame()
-}
-
-// What a relay wrote to its output, for the mod to keep (a chunk of lines). Only a relay sends it. No bot: an empty name.
-function log (text) {
-  const w = new Writer(TYPES.LOG)
-  w.str('')
-  w.bytes(Buffer.from(text, 'utf8'))
-  return w.frame()
-}
-
-// A relay's answer to the mod's HELLO: it runs the mod's scripts. No bot: an empty name.
-function welcome () {
-  const w = new Writer(TYPES.WELCOME)
-  w.str('')
-  return w.frame()
-}
-
-// A relay running other scripts than the mod's is pulling them and restarting; WELCOME or
-// UPDATE_FAILED follow. `text` says from what to what. No bot: an empty name.
-function updating (text) {
-  const w = new Writer(TYPES.UPDATING)
-  w.str('')
-  w.bytes(Buffer.from(text, 'utf8'))
-  return w.frame()
-}
-
-// The relay could not get to the mod's scripts (`text` why): it stays up on its own and closes this
-// connection. No bot: an empty name.
-function updateFailed (text) {
-  const w = new Writer(TYPES.UPDATE_FAILED)
-  w.str('')
-  w.bytes(Buffer.from(text, 'utf8'))
-  return w.frame()
-}
-
 // The fleet's profile (see profiler.js): `id` the PROFILE_REQUEST's, 0 when the fleet took it on an
 // event of its own, `reason` what it was taken for, `text` its rows. No bot: an empty name.
 function profile (id, reason, text) {
@@ -542,22 +525,6 @@ function profile (id, reason, text) {
   w.str(reason)
   w.bytes(Buffer.from(text, 'utf8'))
   return w.frame()
-}
-
-// The frames that carry columns of the mod's world: a relay's world is its own, none of them go to the mod.
-const CHUNK_TYPES = new Set([TYPES.CLAIM, TYPES.READY, TYPES.CHANGED, TYPES.BLOCK_ENTITY_UPDATE, TYPES.UNLOAD, TYPES.STATE_NAMES, TYPES.LOAD])
-
-// `buffer` holds whole frames, one after the other (length included); those about columns left out.
-// Null when none is left.
-function withoutChunkFrames (buffer) {
-  const kept = []
-  for (let offset = 0; offset < buffer.length;) {
-    const end = offset + 4 + buffer.readUInt32BE(offset)
-    if (end > buffer.length) throw new Error('truncated frame')
-    if (!CHUNK_TYPES.has(buffer[offset + 4])) kept.push(buffer.subarray(offset, end))
-    offset = end
-  }
-  return kept.length === 0 ? null : Buffer.concat(kept)
 }
 
 // A mod -> fleet frame (without its length) as an object.
@@ -602,10 +569,6 @@ function decode (frame) {
       message = { type, bot, blocks: Array.from({ length: count }, () => r.str()) }
       break
     }
-    case TYPES.HELLO:
-      // version: the commit the mod was built at.
-      message = { type, bot: r.str(), version: r.str() }
-      break
     default:
       if (!PRIMITIVES.has(type)) throw new Error(`unknown message type ${type} from the mod`)
       // A primitive for the bot: action as actions.js takes it.
@@ -663,6 +626,27 @@ function primitive (r, type) {
       a.target = r.pos()
       a.radius = r.i32()
       if (type !== TYPES.BREAK_WSR) a.end = r.pos()
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    case TYPES.BREAK_PAC: {
+      // i32 count and each block's i32 x, y, z in the order it breaks them, i32 x, y, z it ends in, u8 stand
+      // present and its f64 x, z and line across, deadline, turn speed.
+      const count = r.i32()
+      if (count < 1) throw new Error(`bad target count ${count}`)
+      a.targets = Array.from({ length: count }, () => r.pos())
+      a.end = r.pos()
+      if (r.u8()) a.stand = { x: r.f64(), z: r.f64(), line: r.f64() }
+      r.deadline(a)
+      r.turnSpeed(a)
+      break
+    }
+    case TYPES.BAND:
+      // i32 x, y, z of the corner it starts from, i32 x, y, z of the other, u8 order present and its
+      // string, deadline, turn speed.
+      a.from = r.pos()
+      a.to = r.pos()
+      if (r.u8()) a.order = r.str()
       r.deadline(a)
       r.turnSpeed(a)
       break
@@ -741,4 +725,4 @@ function frames (onFrame) {
   }
 }
 
-module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, vis, inventory, state, chestLid, chest, columnGone, windowState, profile, crash, log, welcome, updating, updateFailed, withoutChunkFrames, decode, frames }
+module.exports = { TYPES, PRIMITIVES, claim, ready, changed, load, stateNames,blockEntityUpdate, unload, botGone, botSpawned, path, vis, bands, inventory, state, chestLid, chest, columnGone, columnIn, windowState, profile, decode, frames }

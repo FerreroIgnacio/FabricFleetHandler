@@ -12,7 +12,7 @@ public final class BotStatus {
 		IDLE, DOING, ERROR
 	}
 
-	public static final BotStatus IDLE = new BotStatus(Kind.IDLE, "", "", null, null);
+	public static final BotStatus IDLE = new BotStatus(Kind.IDLE, "", "", null, null, null);
 
 	private final Kind kind;
 	private final String primitive;
@@ -21,13 +21,16 @@ public final class BotStatus {
 	private final int[] feet;
 	/** Its feet as they were, {x, y, z}, anywhere in that block; null with feet. */
 	private final double[] position;
+	/** Where its head looked, {yaw, pitch} (rad, as mineflayer has them: yaw 0 toward -z); null with feet. */
+	private final double[] look;
 
-	public BotStatus(Kind kind, String primitive, String message, int[] feet, double[] position) {
+	public BotStatus(Kind kind, String primitive, String message, int[] feet, double[] position, double[] look) {
 		this.kind = kind;
 		this.primitive = primitive;
 		this.message = message;
 		this.feet = feet;
 		this.position = position;
+		this.look = look;
 	}
 
 	public Kind getKind() {
@@ -58,6 +61,15 @@ public final class BotStatus {
 		}
 
 		return position.clone();
+	}
+
+	/** Where its head looked as the state changed, {yaw, pitch}. */
+	public double[] getLook() {
+		if (look == null) {
+			throw new IllegalStateException("expected where the bot looks with its state " + this + ", found it not told");
+		}
+
+		return look.clone();
 	}
 
 	/** Why the primitive failed; empty unless in error. */

@@ -60,7 +60,7 @@ public final class BotInventory {
 		return held;
 	}
 
-	/** The id of the last click on it the bot did (see FleetProtocol#WINDOW_CLICK), 0 before any. */
+	/** The id of the last click on it the bot did (see FleetSocketHandler), 0 before any. */
 	public int getLastClick() {
 		return lastClick;
 	}

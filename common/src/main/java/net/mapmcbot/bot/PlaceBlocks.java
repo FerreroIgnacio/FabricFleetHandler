@@ -22,7 +22,7 @@ import java.util.Set;
  * The blocks each bot may place (place, place_wsr take one off its inventory into its hand), as items
  * keyed name@metadata ("minecraft:wool@14"), out of the catalog: every block the game has. For now one
  * list for every bot; it is asked for by bot all the same, and sent to each as its own (see
- * FleetProtocol#ALLOWED_PLACE). A whitelist: the file keeps the ones allowed, one key a line,
+ * FleetSocketHandler). A whitelist: the file keeps the ones allowed, one key a line,
  * written as they change; with no file yet, every block.
  */
 public final class PlaceBlocks {

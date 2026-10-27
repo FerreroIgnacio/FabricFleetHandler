@@ -15,7 +15,7 @@ public interface ChunkListener {
 
 	/**
 	 * A chunk no bot holds, wanted by the fleet's path searches: its snapshot goes into the free
-	 * `slot`, answered with FleetChannel#loaded either way.
+	 * `slot`, answered with FleetSocketHandler#loaded either way.
 	 */
 	void onLoadSnapshot(ChunkKey key, int slot);
 
@@ -30,7 +30,7 @@ public interface ChunkListener {
 
 	void onBlockEntityRemove(String bot, ChunkKey key, int x, int y, int z);
 
-	/** The slot is the listener's until it releases it (FleetChannel#release). */
+	/** The slot is the listener's until it releases it (FleetSocketHandler#release). */
 	void onUnload(String bot, ChunkKey key);
 
 	/** Every bot is gone at once. */

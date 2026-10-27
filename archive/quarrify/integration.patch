@@ -1,0 +1,556 @@
+--- a/bandTest.txt
++++ b/bandTest.txt
+@@ -7,7 +7,7 @@
+ - AutoStart parte los /fill a lo largo de z (FILL_LIMIT = 32768, límite de /fill).
+ - Perfiles: versions/1.12.2/run/mapmcbot/bot_profiles.tsv con v1..v30. Al recortar bots borrar también las líneas J, si no: "no bot profile named vN".
+ - Look a 1.05 * look.HUMAN_SPEED (LOOK_SPEED en actions.js) para resultados realistas.
+-- Cómo correrlo y leer fleet.log: archive/quarrify/quarrifyTest.txt (Quarrify archivado; AutoStart corre el band test con qtest3 en run/mapmcbot/debug/qtest). Líneas útiles: "ticks a block", "band ticks:" (por código de bloque), "band halt:", "band swept: N of M".
++- Cómo correrlo y leer fleet.log: quarrifyTest.txt. Líneas útiles: "ticks a block", "band ticks:" (por código de bloque), "band halt:", "band swept: N of M".
+ 
+ Estilos (BAND_STYLES en actions.js)
+ - Quedaron los 4 más rápidos del benchmark: filas-espejo, serpiente-vuelta, filas-vuelta, serpiente-abajo-vuelta.
+--- a/noiseTolerance.txt
++++ b/noiseTolerance.txt
+@@ -25,6 +25,9 @@
+ 
+ Ya tolerantes:
+ - STATE: manda también la posición real de los pies (f64), BotStatus.getPosition.
++- Quarrify.pick y Quarrify.stand: ojos y cercanía desde plan.position, la posición real. Planeando
++  adelante (Quarrify.ahead) los pies van en el end de la última prim mandada: el alcance de stand
++  (reaches) toma la peor esquina del bloque; el medio del bloque solo ordena (cost, el desempate de stand).
+ - LookGoal.isEnd: desde el medio del nodo pero con alcance REACH_BLOCK - SLACK (peor caso, √½).
+ - SightGoal.isEnd: posesIn sobre todo el bloque.
+ - withSearch: el pose final sale de posesIn desde la posición real (bot.entity.position).
+--- a/common/src/main/java/net/mapmcbot/job/JobRunner.java
++++ b/common/src/main/java/net/mapmcbot/job/JobRunner.java
+@@ -17,7 +17,7 @@
+  * bot's own reports drive it. A looping job that goes a whole lap with every step over as it was started
+  * (a deposit with nothing to leave) has nothing left to do: it ends there instead of starting over.
+  *
+- * A step the fleet does not run (a plan: grab, deposit, index) is the mod's: the Resolver that handles it does it on
++ * A step the fleet does not run (a plan: grab, deposit, index, quarrify) is the mod's: the Resolver that handles it does it on
+  * the bot with primitives of its own, and says when it is done or failed.
+  *
+  * A primitive ordered from outside to a bot running the job takes it over: the job ends there.
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotOverlay.java
+@@ -18,6 +18,7 @@
+ public final class BotOverlay {
+ 	private static final int MARGIN = 4;
+ 	private static final int CARD_WIDTH = 150;
++	private static final int EXECUTOR_WIDTH = 230;
+ 	private static final int CARD_PADDING = 3;
+ 	private static final int CARD_BACKGROUND = 0xA0101216;
+ 	private static final int DIM = 0xFF8A919C;
+@@ -29,6 +30,49 @@
+ 	private BotOverlay() {
+ 	}
+ 
++	/**
++	 * The executor's window under the bots: each bot with a quarrify plan and what the executor is doing for
++	 * it before it dispatches its next primitive; for the selected one, under it, the causes it turned down
++	 * candidates for when it saw no way in.
++	 */
++	private static void executor(MinecraftClient client, Window window, String selected, int top) {
++		final List<String[]> rows = MapMcBotClient.quarrify().executor();
++
++		if (rows.isEmpty()) {
++			return;
++		}
++
++		final int line = client.textRenderer.fontHeight + 2;
++		final int left = window.getWidth() - MARGIN - EXECUTOR_WIDTH;
++		final int bottom = window.getHeight() - MARGIN;
++		int total = line;
++
++		for (String[] row : rows) {
++			total += line + (row[0].equals(selected) && row[2] != null ? row[2].split(", ").length * line : 0);
++		}
++
++		DrawableHelper.fill(left - CARD_PADDING, top - CARD_PADDING, left + EXECUTOR_WIDTH + CARD_PADDING, Math.min(bottom, top + total + CARD_PADDING), CARD_BACKGROUND);
++		client.textRenderer.drawWithShadow("Executor", left, top, 0xFFFFFF);
++		int y = top + line;
++
++		for (String[] row : rows) {
++			final String[] causes = row[0].equals(selected) && row[2] != null ? row[2].split(", ") : new String[0];
++
++			if (y + line * (1 + causes.length) > bottom) {
++				break;
++			}
++
++			DrawableHelper.fill(left - CARD_PADDING, y, left - 1, y + line - 1, 0xFF000000 | MapMcBotClient.colorOf(row[0]).getRgb());
++			client.textRenderer.drawWithShadow(client.textRenderer.trimToWidth(row[0] + " " + row[1], EXECUTOR_WIDTH), left, y, row[0].equals(selected) ? 0xFFFFFF : DIM);
++			y += line;
++
++			for (String cause : causes) {
++				client.textRenderer.drawWithShadow(client.textRenderer.trimToWidth(cause, EXECUTOR_WIDTH - 8), left + 8, y, DIM);
++				y += line;
++			}
++		}
++	}
++
+ 	public static void render() {
+ 		final BotRegistry bots = MapMcBotClient.botsOrNull();
+ 
+@@ -57,6 +101,8 @@
+ 			y += client.textRenderer.fontHeight + 2;
+ 		}
+ 
++		executor(client, window, selected, y + MARGIN);
++
+ 		final ProfileRegistry profile = MapMcBotClient.profile();
+ 		final ProfileReport main = profile.getLatest();
+ 		int cardY = MARGIN;
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/AreaRenderer.java
+@@ -24,6 +24,7 @@
+  * Each area as a coloured box in the world, plus the block a click would pick while picking, and
+  * the path each walking bot is on with its target, and the chests of each grab going on: the one
+  * its bot is going to as a box, the ones it may look in after as an outline, in the bot's colour; and
++ * the bands of each quarrify's active layer, white, the bot's colour filled when one is on it; and
+  * the blocks clicked in chat messages, red; and
+  * what each bot's wsr primitive shows (see BotVis), in its colour, red once failed.
+  *
+@@ -65,7 +66,7 @@
+ 	 * each bot in turn, by name (see bot), and back to 1.
+ 	 */
+ 	private static int mode = 1;
+-	/** In a bot's mode, the bot: of the bots' paths, grabs and wsr primitives, its own; no areas. */
++	/** In a bot's mode, the bot: of the bots' paths, grabs and wsr primitives, its own; no areas, no quarrify's. */
+ 	private static String bot;
+ 
+ 	private AreaRenderer() {
+@@ -124,8 +125,10 @@
+ 		final List<Grab.Highlight> chests = grab == null || !all ? Collections.<Grab.Highlight>emptyList() : grab.highlights();
+ 
+ 		final List<BlockPos> highlighted = all ? BlockLinks.highlighted() : Collections.<BlockPos>emptyList();
++		final Quarrify quarrify = MapMcBotClient.quarrifyOrNull();
++		final List<Quarrify.Band> bands = quarrify == null || !all || selected != null ? Collections.<Quarrify.Band>emptyList() : quarrify.bands();
+ 
+-		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && visuals.isEmpty() && botBands.isEmpty() && chests.isEmpty() && highlighted.isEmpty()) {
++		if ((store == null || store.getAreas().isEmpty()) && target == null && entityTarget == null && paths.isEmpty() && visuals.isEmpty() && botBands.isEmpty() && chests.isEmpty() && highlighted.isEmpty() && bands.isEmpty()) {
+ 			return;
+ 		}
+ 
+@@ -223,6 +226,23 @@
+ 			}
+ 		}
+ 
++		// The bands of each quarrify's active layer (see Quarrify.band): their lines, with the bots on
++		// each written over its middle; what is dug of them is each bot's band primitives (see drawBands).
++		for (Quarrify.Band band : bands) {
++			final int[] b = band.box;
++
++			if (band.bots.isEmpty()) {
++				drawOutline(b[0], b[1], b[2], b[3] + 1, b[4] + 1, b[5] + 1, 0xFFFFFF, camX, camY, camZ);
++				continue;
++			}
++
++			final int rgb = band.bots.size() == 1 ? MapMcBotClient.colorOf(band.bots.get(0)).getRgb() : 0xFFFFFF;
++
++			GlStateManager.enableTexture();
++			drawLabel(client, new int[] {(b[0] + b[3]) / 2, b[4] + 1, (b[2] + b[5]) / 2}, band.bots.toArray(new String[0]), dark(rgb), camX, camY, camZ);
++			GlStateManager.disableTexture();
++		}
++
+ 		// The blocks clicked in chat (see BlockLinks), over everything.
+ 		GlStateManager.disableDepthTest();
+ 
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/MapMcBotClient.java
+@@ -14,6 +14,8 @@
+ import net.fabricmc.api.ClientModInitializer;
+ import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+ import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
++import com.google.gson.JsonObject;
++import net.mapmcbot.area.Area;
+ import net.mapmcbot.area.AreaStore;
+ import net.mapmcbot.area.ChestStore;
+ import net.mapmcbot.bot.BotManager;
+@@ -68,6 +70,7 @@
+ 	private static ChestStore chests;
+ 	private static String chestsWorldId;
+ 	private static Grab grab;
++	private static Quarrify quarrify;
+ 	private static BotRegistry bots;
+ 	private static JobRunner job;
+ 	private static BotProfileStore botProfiles;
+@@ -185,7 +188,8 @@
+ 
+ 	/**
+ 	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
+-	 * #formation sends every bot in the world to a spot around the player. False when it is not one.
++	 * #formation sends every bot in the world to a spot around the player, #quarrify AREA has every bot in
++	 * the world dig out the area. False when it is not one.
+ 	 */
+ 	public static boolean command(String line) {
+ 		if (line.equals("#relays")) {
+@@ -214,9 +218,77 @@
+ 			return true;
+ 		}
+ 
++		if (line.equals("#quarrify") || line.startsWith("#quarrify ")) {
++			quarrify(MinecraftClient.getInstance(), line.substring("#quarrify".length()).trim());
++			return true;
++		}
++
+ 		return false;
+ 	}
+ 
++	/** Every bot in the world digs out the area named (see Quarrify), as an order from outside; each one's end told in chat. */
++	private static void quarrify(MinecraftClient client, String name) {
++		Area area = null;
++
++		for (Area one : areas().getAreas()) {
++			if (one.getName().equals(name)) {
++				area = one;
++			}
++		}
++
++		if (area == null) {
++			chat(client, "quarrify_err: no area named " + name);
++			return;
++		}
++
++		final List<String> fleet = new ArrayList<String>(bots().getSpawned());
++		Collections.sort(fleet);
++
++		if (fleet.isEmpty()) {
++			chat(client, "quarrify_err: no bots in the world");
++			return;
++		}
++
++		final JsonObject a = new JsonObject();
++		a.addProperty("action", "quarrify");
++		a.addProperty("area", area.getId());
++		final String dug = area.getName();
++
++		for (String bot : fleet) {
++			job().ordered(bot, a.toString());
++			quarrify().start(bot, a.toString(), new JobRunner.Listener() {
++				@Override
++				public void done() {
++					client.submit(() -> chat(client, "quarrify: " + bot + " dug out " + dug));
++				}
++
++				@Override
++				public void failed() {
++					final String why = quarrify.status(bot);
++					// Its blocks clickable: highlighted in the world.
++					client.submit(() -> client.inGameHud.getChatHud().addMessage(BlockLinks.text("quarrify_err: " + (why == null ? bot + " taken over" : why))));
++
++					// A failure ends the client right there, its crash report written and the world saved as it
++					// left it: stopped as a quit, not by crash(), whose exit from the game loop leaves the shutdown
++					// hook waiting for ever on the integrated server's thread, gone by then.
++					if (why != null) {
++						client.submit(() -> {
++							final net.minecraft.util.crash.CrashReport report = client.addSystemDetailsToCrashReport(new net.minecraft.util.crash.CrashReport("quarrify of " + bot + " failed", new IllegalStateException(why)));
++							final java.io.File file = new java.io.File(new java.io.File(client.runDirectory, "crash-reports"), "crash-" + new java.text.SimpleDateFormat("yyyy-MM-dd_HH.mm.ss").format(new java.util.Date()) + "-client.txt");
++
++							if (!report.writeToFile(file)) {
++								throw new IllegalStateException("could not write the crash report of " + bot + "'s quarrify to " + file);
++							}
++
++							System.out.println(report.asString());
++							client.scheduleStop();
++						});
++					}
++				}
++			});
++		}
++	}
++
+ 	/**
+ 	 * The spots around the player, one per bot: the centre stands on the first solid block at or
+ 	 * below the player (mid-air too), then the nearest blocks to stand on, 8-connected and up to one
+@@ -436,6 +508,12 @@
+ 		return chests;
+ 	}
+ 
++	/** The quarrifies of the bots; created with the bots. */
++	static Quarrify quarrify() {
++		bots();
++		return quarrify;
++	}
++
+ 	/** The grabs of the bots; created with the bots. */
+ 	static Grab grab() {
+ 		bots();
+@@ -455,7 +533,9 @@
+ 			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
+ 			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
+ 			grab = new Grab(bots, new ChestTracker(bots));
++			quarrify = new Quarrify(bots, chunks);
+ 			job.addResolver(grab);
++			job.addResolver(quarrify);
+ 			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
+ 			relays.start();
+ 		}
+@@ -494,6 +574,10 @@
+ 
+ 	/** The bots, or null while none was ever started. */
+ 	/** The grabs, null before the bots are created. */
++	static Quarrify quarrifyOrNull() {
++		return quarrify;
++	}
++
+ 	static Grab grabOrNull() {
+ 		return grab;
+ 	}
+--- a/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java
++++ b/versions/1.12.2/src/main/java/net/mapmcbot/client/BotScreen.java
+@@ -611,9 +611,10 @@
+ 		stopJobButton.active = running;
+ 		stopJobButton.method_891(client, mouseX, mouseY, tickDelta);
+ 
+-		// The bot's whole state under the buttons: an error with its message; its grab's while it has one.
++		// The bot's whole state under the buttons: an error with its message; its grab's or quarrify's while it has one.
+ 		final String grabStatus = MapMcBotClient.grab().status(selected);
+-		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
++		final String quarrifyStatus = MapMcBotClient.quarrify().status(selected);
++		textRenderer.drawTrimmed(grabStatus != null ? grabStatus : quarrifyStatus != null ? quarrifyStatus : bots.getStatus(selected), x, top + ACTION_ROWS * 21 + JOB_ROW + 4, backgroundWidth, TEXT);
+ 		drawPickPanel(top + ACTION_ROWS * 21 + JOB_ROW + 16, mouseX, mouseY);
+ 		drawMatchPanel(mouseX, mouseY);
+ 		drawJobPanel(mouseX, mouseY);
+--- a/versions/1.12.2/src/debug/java/net/mapmcbot/debug/AutoStart.java
++++ b/versions/1.12.2/src/debug/java/net/mapmcbot/debug/AutoStart.java
+@@ -13,6 +13,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.Random;
+ 
+ import net.fabricmc.api.ClientModInitializer;
+ import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+@@ -34,9 +35,9 @@
+  * Singleplayer and the first world as a player would, opens it to LAN in survival as soon as it is
+  * up, then adds the bot profiles' bots on the LAN port. Once every bot has sent its first inventory, it
+  * builds the test area (see setUp), puts the bots standing on it (not in it, suffocating), clears their
+- * inventories and gives each the PICK, the SHOVEL and the BLOCKS; once each has those alone, BandTest
+- * on it. The test runs when run/mapmcbot/debug/qtest names BAND_TEST; with any other, or without it,
+- * nothing past the bots. Removing it is deleting
++ * inventories and gives each the PICK, the SHOVEL and the BLOCKS; once each has those alone, #quarrify of it
++ * (qtest3: BandTest instead). The
++ * test is the area named in run/mapmcbot/debug/qtest, qtest without it. Removing it is deleting
+  * src/debug and its block in build.gradle.
+  */
+ public class AutoStart implements ClientModInitializer {
+@@ -47,6 +48,8 @@
+ 	private static final int SINGLEPLAYER = 1;
+ 	private static final int PLAY_SELECTED = 1;
+ 
++	/** The test run without run/mapmcbot/debug/qtest: the area of that name. */
++	private static final String DEFAULT_TEST = "qtest";
+ 	/** The test of the band primitive (see BandTest): each bot digs a strip of its own, in its own style. */
+ 	private static final String BAND_TEST = "qtest3";
+ 	/** How far apart along z qtest3's strips are: 2 wide, 2 of air between them. */
+@@ -60,7 +63,40 @@
+ 	private static final String BLOCKS = "minecraft:cobblestone 64";
+ 	private static final String[] KIT = {"minecraft:diamond_pickaxe", "minecraft:diamond_shovel", "minecraft:cobblestone"};
+ 
+-	/** How far round the test its stone plate goes, and how high over it the air. */
++	/** qtest's mix (the rest stone), as {block, data}: boxes of them at random, the same each run (SEED). */
++	private static final String[][] MIX = {{"dirt", "0"}, {"gravel", "0"}, {"sand", "0"}, {"cobblestone", "0"}, {"stone", "1"}, {"stone", "3"}, {"stone", "5"}, {"coal_ore", "0"}, {"iron_ore", "0"}, {"gold_ore", "0"}, {"sandstone", "0"}, {"obsidian", "0"}, {"clay", "0"}, {"mossy_cobblestone", "0"}};
++	private static final long SEED = 1;
++	/** One box of the mix to this many blocks of qtest. */
++	private static final int MIX_EVERY = 150;
++	/** The widest a box of the mix is along each axis. */
++	private static final int MIX_SIZE = 4;
++
++	/** qtest1's liquids, from its lower corner: {block, dx1, dy1, dz1, dx2, dy2, dz2}, the rest stone. */
++	private static final Object[][] LIQUIDS = {
++		// Across a layer's bottom (layers of 4 from the top, 68).
++		{"water", 6, 9, 4, 8, 11, 6},
++		{"lava", 13, 4, 9, 14, 5, 10},
++		// At the top, open to the air over it.
++		{"water", 11, 17, 3, 11, 17, 3},
++		{"lava", 3, 15, 12, 3, 15, 12},
++		// A column of 6.
++		{"water", 16, 1, 3, 16, 6, 3},
++		// At the bottom.
++		{"lava", 8, 0, 10, 8, 0, 10}};
++
++	/** qtest2's islands, from its lower corner: {block, dx1, dy1, dz1, dx2, dy2, dz2}, the rest air. */
++	private static final Object[][] ISLANDS = {
++		// Towers of three heights, one the area's.
++		{"stone", 4, 0, 4, 9, 11, 9},
++		{"dirt", 14, 0, 4, 19, 6, 10},
++		{"stone", 5, 0, 15, 11, 9, 20},
++		// Up in the air: a slab, a block.
++		{"cobblestone", 15, 7, 15, 20, 8, 20},
++		{"stone", 12, 10, 12, 12, 10, 12},
++		// A pillar of one.
++		{"stone", 2, 0, 20, 2, 3, 20}};
++
++	/** How far round a built test (qtest1, qtest2) its stone plate goes, and how high over it the air. */
+ 	private static final int PLATE = 3;
+ 	private static final int CLEAR = 8;
+ 
+@@ -72,7 +108,7 @@
+ 	private enum Step { TITLE, PICK_WORLD, PLAY, LOADING, BOTS, JOINING, SETTING, ARMING, DONE }
+ 
+ 	private Step step = Step.TITLE;
+-	/** The area being tested, as named in run/mapmcbot/debug/qtest; null without it. */
++	/** The area being tested, as named (see DEFAULT_TEST). */
+ 	private String test;
+ 	private int wait = SETTLE_TICKS;
+ 	private int nextBot;
+@@ -88,7 +124,7 @@
+ 		final File named = new File(MinecraftClient.getInstance().runDirectory, "mapmcbot/debug/qtest");
+ 
+ 		try {
+-			test = named.isFile() ? new String(Files.readAllBytes(named.toPath()), StandardCharsets.UTF_8).trim() : null;
++			test = named.isFile() ? new String(Files.readAllBytes(named.toPath()), StandardCharsets.UTF_8).trim() : DEFAULT_TEST;
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException("debug autostart could not read " + named, e);
+ 		}
+@@ -155,7 +191,7 @@
+ 
+ 	/**
+ 	 * A bot's inventory came: once every bot has its first (it comes after its spawn), the set up; once
+-	 * each has the kit alone (the inventories after the set up, the bots idle), the band test.
++	 * each has the kit alone (the inventories after the set up, the bots idle), the quarrify.
+ 	 */
+ 	private void onInventory(MinecraftClient client, String from) {
+ 		if (step == Step.JOINING) {
+@@ -165,12 +201,6 @@
+ 				}
+ 			}
+ 
+-			if (!BAND_TEST.equals(test)) {
+-				step = Step.DONE;
+-				MapMcBotClient.bots().removeInventoryListener(inventoryListener);
+-				return;
+-			}
+-
+ 			step = Step.SETTING;
+ 			setUp(client);
+ 		} else if (step == Step.ARMING) {
+@@ -185,38 +215,80 @@
+ 			step = Step.DONE;
+ 			MapMcBotClient.bots().removeInventoryListener(inventoryListener);
+ 
+-			final Area area = area();
++			if (test.equals(BAND_TEST)) {
++				final Area area = area();
+ 
+-			for (int i = 0; i < fleet.size(); i++) {
+-				final int z = area.getMinZ() + STRIP_STEP * i;
+-				new BandTest(fleet.get(i), area.getMinX(), area.getMaxX(), area.getMinY(), area.getMaxY(), z, z + area.getMaxZ() - area.getMinZ()).start();
++				for (int i = 0; i < fleet.size(); i++) {
++					final int z = area.getMinZ() + STRIP_STEP * i;
++					new BandTest(fleet.get(i), area.getMinX(), area.getMaxX(), area.getMinY(), area.getMaxY(), z, z + area.getMaxZ() - area.getMinZ()).start();
++				}
++
++				return;
++			}
++
++			if (!MapMcBotClient.command("#quarrify " + test)) {
++				throw new IllegalStateException("debug autostart: #quarrify is not a comando");
+ 			}
+ 		}
+ 	}
+ 
+ 	/**
+ 	 * On the server thread: the test area built, the bots standing on it with their inventories cleared,
+-	 * the items lying round killed, the kit given: a stone plate PLATE round and under it, air CLEAR
+-	 * over it, a stone strip a bot, each bot in front of its own.
++	 * the items lying round killed, the kit given. qtest is filled with stone and MIX; qtest1 and qtest2
++	 * get a stone plate PLATE round and under them, air CLEAR over it, and in them stone and LIQUIDS, or
++	 * air and ISLANDS, the bots on the plate's corner (qtest2's top is in the air).
+ 	 */
+ 	private void setUp(MinecraftClient client) {
+ 		final Area area = area();
+ 		final List<String> fills = new ArrayList<String>();
+-		// Each bot's own spot, in front of its strip.
++		String spawn = null;
++		// Each bot's own spot, over spawn (qtest3: in front of its strip).
+ 		final Map<String, String> spawns = new HashMap<String, String>();
+-		// A strip a bot, the area's copied STRIP_STEP apart along z, each bot in front of its own on its middle line across.
+-		final int beyondZ = STRIP_STEP * (fleet.size() - 1);
+-		fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY() - 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMinY() - 1, area.getMaxZ() + beyondZ + PLATE, "stone"));
+-		fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY(), area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY() + CLEAR, area.getMaxZ() + beyondZ + PLATE, "air"));
+-
+-		for (int i = 0; i < fleet.size(); i++) {
+-			final int z = area.getMinZ() + STRIP_STEP * i;
+-			final int maxZ = z + area.getMaxZ() - area.getMinZ();
+-			fills.add(fill(area.getMinX(), area.getMinY(), z, area.getMaxX(), area.getMaxY(), maxZ, "stone", "0"));
+-			spawns.put(fleet.get(i), (area.getMinX() - 0.5) + " " + area.getMinY() + " " + (z + maxZ + 1) / 2.0);
++		// How far past the area along z the test goes (qtest3: the strips past the first).
++		int beyondZ = 0;
++
++		if (test.equals("qtest")) {
++			fills.add(fill(area.getMinX(), area.getMinY(), area.getMinZ(), area.getMaxX(), area.getMaxY(), area.getMaxZ(), "stone", "0"));
++			final Random random = new Random(SEED);
++
++			for (long i = area.getVolume() / MIX_EVERY; i > 0; i--) {
++				final String[] block = MIX[random.nextInt(MIX.length)];
++				final int x = area.getMinX() + random.nextInt(area.getWidth());
++				final int y = area.getMinY() + random.nextInt(area.getHeight());
++				final int z = area.getMinZ() + random.nextInt(area.getDepth());
++				fills.add(fill(x, y, z, Math.min(x + random.nextInt(MIX_SIZE), area.getMaxX()), Math.min(y + random.nextInt(MIX_SIZE), area.getMaxY()), Math.min(z + random.nextInt(MIX_SIZE), area.getMaxZ()), block[0], block[1]));
++			}
++
++			spawn = top(area);
++		} else if (test.equals("qtest1") || test.equals("qtest2")) {
++			final boolean liquids = test.equals("qtest1");
++			fills.add(fill(area.getMinX() - PLATE, area.getMinY() - 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY(), area.getMaxZ() + PLATE, "stone", "0"));
++			fills.add(fill(area.getMinX() - PLATE, area.getMaxY() + 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY() + CLEAR, area.getMaxZ() + PLATE, "air", "0"));
++			fills.add(fill(area.getMinX(), area.getMinY(), area.getMinZ(), area.getMaxX(), area.getMaxY(), area.getMaxZ(), liquids ? "stone" : "air", "0"));
++
++			for (Object[] box : liquids ? LIQUIDS : ISLANDS) {
++				fills.add(fill(area.getMinX() + (Integer) box[1], area.getMinY() + (Integer) box[2], area.getMinZ() + (Integer) box[3], area.getMinX() + (Integer) box[4], area.getMinY() + (Integer) box[5], area.getMinZ() + (Integer) box[6], (String) box[0], "0"));
++			}
++
++			spawn = liquids ? top(area) : (area.getMinX() - 1.5) + " " + (area.getMaxY() + 1) + " " + (area.getMinZ() - 1.5);
++		} else if (test.equals(BAND_TEST)) {
++			// A strip a bot, the area's copied STRIP_STEP apart along z, each bot in front of its own on its middle line across.
++			beyondZ = STRIP_STEP * (fleet.size() - 1);
++			fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY() - 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMinY() - 1, area.getMaxZ() + beyondZ + PLATE, "stone"));
++			fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY(), area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY() + CLEAR, area.getMaxZ() + beyondZ + PLATE, "air"));
++
++			for (int i = 0; i < fleet.size(); i++) {
++				final int z = area.getMinZ() + STRIP_STEP * i;
++				final int maxZ = z + area.getMaxZ() - area.getMinZ();
++				fills.add(fill(area.getMinX(), area.getMinY(), z, area.getMaxX(), area.getMaxY(), maxZ, "stone", "0"));
++				spawns.put(fleet.get(i), (area.getMinX() - 0.5) + " " + area.getMinY() + " " + (z + maxZ + 1) / 2.0);
++			}
++		} else {
++			throw new IllegalStateException("debug autostart: no test " + test + " (qtest, qtest1, qtest2, " + BAND_TEST + ")");
+ 		}
+ 
+ 		final List<String> bots = new ArrayList<String>(fleet);
++		final String spawnAt = spawn;
+ 		final MinecraftServer server = client.getServer();
+ 		final int minCx = area.getMinX() - PLATE >> 4;
+ 		final int maxCx = area.getMaxX() + PLATE >> 4;
+@@ -233,7 +305,7 @@
+ 
+ 			// clear and fill do nothing (0) on an empty inventory or blocks that are so already: not checked.
+ 			for (String bot : bots) {
+-				run(server, "tp " + bot + " " + spawns.get(bot), true);
++				run(server, "tp " + bot + " " + (spawns.containsKey(bot) ? spawns.get(bot) : spawnAt), true);
+ 				run(server, "clear " + bot, false);
+ 				// The effects the server kept from its last run (a mining fatigue among them) gone: 0 with none.
+ 				run(server, "effect " + bot + " clear", false);
+@@ -246,7 +318,7 @@
+ 				run(server, fill, false);
+ 			}
+ 
+-			// The drops of the test before, still lying round it: a bot picking one up never has the kit alone.
++			// The drops of the quarrify before, still lying round it: a bot picking one up never has the kit alone.
+ 			run(server, "kill @e[type=item]", false);
+ 
+ 			for (String bot : bots) {
+@@ -271,6 +343,11 @@
+ 		throw new IllegalStateException("debug autostart: no area named " + test);
+ 	}
+ 
++	/** The middle of the area's top, standing on it. */
++	private static String top(Area area) {
++		return (area.getMinX() + area.getMaxX() + 1) / 2.0 + " " + (area.getMaxY() + 1) + " " + (area.getMinZ() + area.getMaxZ() + 1) / 2.0;
++	}
++
+ 	/** The most blocks a fill command takes (vanilla's limit). */
+ 	private static final int FILL_LIMIT = 32768;
+ 

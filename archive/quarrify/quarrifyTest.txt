@@ -4,7 +4,7 @@ Cómo corre:
 - `./gradlew -p versions/1.12.2 runClient`, en background. AutoStart (versions/1.12.2/src/debug) hace todo solo:
   abre el mundo y LAN, conecta los bots de bot_profiles.tsv y, cuando todos mandaron su primer inventario,
   arma el área del test, los tepea arriba, les limpia el inventario, mata los items del suelo y les da el kit:
-  el pico (unbreaking 200) y 64 de cobblestone (para los primeros escalones, soportes, rellenos
+  el pico y la pala (unbreaking 200, eficiencia 10) y 64 de cobblestone (para los primeros escalones, soportes, rellenos
   y puentes, antes de picar nada), y los cura y sacia (el server guarda la vida de la corrida anterior).
   Cuando terminó ese setUp y cada uno mandó su inventario con el kit solo, larga `#quarrify <test>`.
   No hay que mandar nada a mano.
@@ -18,6 +18,13 @@ Cómo corre:
 - qtest2 (islas): x 58..81, y 57..68, z 30..53. Aire con torres de tres alturas, una losa y un bloque
   flotando y un pilar de 1 (ISLANDS): las esquinas (escaleras) en el aire. Los bots arrancan en la esquina
   de la placa, no arriba del área (que es aire).
+- qtest3 (prim band): x 58..87, y 68..71 (2 en z, 4 en y, secciones de 2 en x), z 60..61, y una copia por bot cada 4 en z (2 de aire entre tiras),
+  sobre una placa al ras del suelo. No corre #quarrify: BandTest (src/debug) le manda a cada bot una `band`
+  tras otra sobre su tira (8 slices como mucho, planteada desde lo que queda), cada bot con su estilo propio
+  (actions.js BAND_STYLES, por nombre; sale en fleet.log). Por bot: `[band test] BOT band x A..B`, al final
+  `... dug out in N s, K bands` o `... failed on band K after N s: ...` (no corta a los demás). En fleet.log
+  cada band loguea `band: ... N blocks, T ticks a block` (ideal 1).
+- Cambios solo de JS (bot/): no hace falta matar el cliente, alcanza con relanzar los bots.
 - qtest1 y qtest2 se arman sobre una placa de piedra que sobresale 3 alrededor y por debajo, con 8 de
   aire arriba: quedan al ras del suelo (y 68), sin caídas por el borde salvo adentro de qtest2 (12).
 

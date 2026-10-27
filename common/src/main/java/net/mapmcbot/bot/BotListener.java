@@ -16,6 +16,9 @@ public interface BotListener {
 	/** What its wsr primitive shows now (see BotVis), null once there is nothing to show. */
 	void onVis(String bot, BotVis vis);
 
+	/** The boxes of the band primitives it runs and holds, the running one first: {min x, y, z, max x, y, z} each; none once there are none. */
+	void onBands(String bot, int[][] boxes);
+
 	/** Its inventory window changed: the whole of it now. */
 	void onInventory(String bot, BotInventory inventory);
 
@@ -30,6 +33,9 @@ public interface BotListener {
 
 	/** The fleet let the column go. */
 	void onColumnGone(String bot, ChunkKey key);
+
+	/** The bot has the column in its own world: its blocks read from here on. */
+	void onColumnIn(String bot, ChunkKey key);
 
 	/** How many players have the chest at x, y, z open, as its lid moved. */
 	void onChestLid(String bot, int x, int y, int z, int viewers);

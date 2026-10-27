@@ -1,5 +1,6 @@
 package net.mapmcbot.chunk;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -11,8 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import net.mapmcbot.fleet.FleetChannel;
-import net.mapmcbot.fleet.FleetProtocol;
+import net.mapmcbot.fleet.FleetSocketHandler;
 
 /**
  * The chunks the bot fleet has loaded, shared by all of its bots.
@@ -33,13 +33,25 @@ import net.mapmcbot.fleet.FleetProtocol;
  * registry throws.
  */
 public final class ChunkRegistry implements ChunkListener {
+	/*
+	 * columns.bin, mirrored by bot/sharedChunks.js: the columns' blocks never go through the socket,
+	 * the fleet loads each into a slot of it, which the mod maps. A slot is COLUMN_SLOT_SIZE bytes,
+	 * little-endian: a header (unused), the state id (u16, id << 4 | meta) of every block at
+	 * COLUMN_STATES + 2 * (y << 8 | z << 4 | x), the biomes (u8, z << 4 | x) at COLUMN_BIOMES. A section
+	 * the column lacks is zeros (air).
+	 */
+	public static final int COLUMN_SLOTS = 4096;
+	public static final int COLUMN_STATES = 16;
+	public static final int COLUMN_BIOMES = COLUMN_STATES + 16 * ChunkData.SECTION_VOLUME * 2;
+	public static final int COLUMN_SLOT_SIZE = COLUMN_BIOMES + 256;
+
 	private static final AtomicBoolean CREATED = new AtomicBoolean();
 
 	private static final boolean USE_CHUNK_SNAPSHOT_OPTIMIZATION = false;
 
-	private final FleetChannel channel;
+	private final FleetSocketHandler channel;
 	private final ChunkSnapshotStore snapshots;
-	/** The fleet's columns file, little-endian (see FleetProtocol); written only into slots the fleet asks to load. */
+	/** The fleet's columns file, little-endian (see ChunkRegistry); written only into slots the fleet asks to load. */
 	private final ByteBuffer columns;
 	private final Map<ChunkKey, Entry> chunks = new HashMap<ChunkKey, Entry>();
 	/** State id -> name, from the fleet before any claim. */
@@ -47,14 +59,15 @@ public final class ChunkRegistry implements ChunkListener {
 	/** Name -> its lowest state id, to write snapshots back into slots. */
 	private final Map<String, Integer> stateIds = new HashMap<String, Integer>();
 
-	public ChunkRegistry(FleetChannel channel, ChunkSnapshotStore snapshots) {
+	/** columnsFile: the fleet's columns file (see BotManager#columns). */
+	public ChunkRegistry(FleetSocketHandler channel, File columnsFile, ChunkSnapshotStore snapshots) {
 		if (!CREATED.compareAndSet(false, true)) {
 			throw new IllegalStateException("ChunkRegistry is a singleton: one was already created");
 		}
 
 		this.channel = channel;
 		this.snapshots = snapshots;
-		this.columns = map(channel);
+		this.columns = map(columnsFile);
 		channel.setChunkListener(this);
 	}
 
@@ -163,7 +176,7 @@ public final class ChunkRegistry implements ChunkListener {
 					+ (data.getMinY() + data.getHeight() - 1) + ", a slot holds 0 to 255");
 		}
 
-		final int base = slot * FleetProtocol.COLUMN_SLOT_SIZE;
+		final int base = slot * COLUMN_SLOT_SIZE;
 
 		for (int s = 0; s < data.getSectionCount(); s++) {
 			final ChunkData.Section section = data.getSection(s);
@@ -181,14 +194,14 @@ public final class ChunkRegistry implements ChunkListener {
 			}
 
 			for (int i = 0; i < ChunkData.SECTION_VOLUME; i++) {
-				columns.putShort(base + FleetProtocol.COLUMN_STATES + 2 * (s * ChunkData.SECTION_VOLUME + i),
+				columns.putShort(base + COLUMN_STATES + 2 * (s * ChunkData.SECTION_VOLUME + i),
 						(short) ids[section.getIndex(i)]);
 			}
 		}
 
 		// Snapshots keep no biomes: plains, as the fleet fills them before a column arrives.
 		for (int i = 0; i < 256; i++) {
-			columns.put(base + FleetProtocol.COLUMN_BIOMES + i, (byte) 1);
+			columns.put(base + COLUMN_BIOMES + i, (byte) 1);
 		}
 
 		channel.loaded(key, slot, snapshot.getMcVersion());
@@ -287,21 +300,21 @@ public final class ChunkRegistry implements ChunkListener {
 			throw new IllegalArgumentException("y " + y + " is outside the column (0 to 255)");
 		}
 
-		return columns.getShort(entry.slot * FleetProtocol.COLUMN_SLOT_SIZE + FleetProtocol.COLUMN_STATES
+		return columns.getShort(entry.slot * COLUMN_SLOT_SIZE + COLUMN_STATES
 				+ 2 * (y << 8 | z << 4 | x)) & 0xFFFF;
 	}
 
-	private static ByteBuffer map(FleetChannel channel) {
-		final long size = (long) FleetProtocol.COLUMN_SLOTS * FleetProtocol.COLUMN_SLOT_SIZE;
+	private static ByteBuffer map(File columnsFile) {
+		final long size = (long) COLUMN_SLOTS * COLUMN_SLOT_SIZE;
 
-		try (FileChannel file = FileChannel.open(channel.columns().toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+		try (FileChannel file = FileChannel.open(columnsFile.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
 			if (file.size() != size) {
-				throw new IllegalStateException(channel.columns() + " is " + file.size() + " bytes, not " + size);
+				throw new IllegalStateException(columnsFile + " is " + file.size() + " bytes, not " + size);
 			}
 
 			return file.map(FileChannel.MapMode.READ_WRITE, 0, size).order(ByteOrder.LITTLE_ENDIAN);
 		} catch (IOException e) {
-			throw new UncheckedIOException("could not map " + channel.columns(), e);
+			throw new UncheckedIOException("could not map " + columnsFile, e);
 		}
 	}
 

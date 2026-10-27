@@ -8,10 +8,11 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.Random;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -33,8 +34,9 @@ import net.minecraft.world.GameMode;
  * Singleplayer and the first world as a player would, opens it to LAN in survival as soon as it is
  * up, then adds the bot profiles' bots on the LAN port. Once every bot has sent its first inventory, it
  * builds the test area (see setUp), puts the bots standing on it (not in it, suffocating), clears their
- * inventories and gives each the PICK and the BLOCKS; once each has those alone, #quarrify of it. The
- * test is the area named in run/mapmcbot/debug/qtest, qtest without it. Removing it is deleting
+ * inventories and gives each the PICK, the SHOVEL and the BLOCKS; once each has those alone, BandTest
+ * on it. The test runs when run/mapmcbot/debug/qtest names BAND_TEST; PRIM_TEST instead, PrimTest's
+ * own set up and kit, then PrimTest; with any other, or without it, nothing past the bots. Removing it is deleting
  * src/debug and its block in build.gradle.
  */
 public class AutoStart implements ClientModInitializer {
@@ -45,49 +47,22 @@ public class AutoStart implements ClientModInitializer {
 	private static final int SINGLEPLAYER = 1;
 	private static final int PLAY_SELECTED = 1;
 
-	/** The test run without run/mapmcbot/debug/qtest: the area of that name. */
-	private static final String DEFAULT_TEST = "qtest";
+	/** The test of the band primitive (see BandTest): each bot digs a strip of its own, in its own style. */
+	private static final String BAND_TEST = "qtest3";
+	/** The test of every primitive at once, one a bot (see PrimTest), in the area of that name. */
+	private static final String PRIM_TEST = "primtest";
+	/** How far apart along z qtest3's strips are: 2 wide, 2 of air between them. */
+	private static final int STRIP_STEP = 4;
 
-	/** What each bot digs it with: unbreaking (id 34) 200. */
-	private static final String PICK = "minecraft:diamond_pickaxe 1 0 {ench:[{id:34s,lvl:200s}]}";
+	/** What each bot digs it with: unbreaking (id 34) 200, efficiency (id 32) 10. */
+	static final String PICK = "minecraft:diamond_pickaxe 1 0 {ench:[{id:34s,lvl:200s},{id:32s,lvl:10s}]}";
+	/** What each bot digs dirt, gravel, sand and clay with: the PICK's enchantments. */
+	static final String SHOVEL = "minecraft:diamond_shovel 1 0 {ench:[{id:34s,lvl:200s},{id:32s,lvl:10s}]}";
 	/** What each bot places its first steps, supports, fills and bridges with, before it digs any. */
-	private static final String BLOCKS = "minecraft:cobblestone 64";
-	private static final String[] KIT = {"minecraft:diamond_pickaxe", "minecraft:cobblestone"};
+	static final String BLOCKS = "minecraft:cobblestone 64";
+	private static final String[] KIT = {"minecraft:diamond_pickaxe", "minecraft:diamond_shovel", "minecraft:cobblestone"};
 
-	/** qtest's mix (the rest stone), as {block, data}: boxes of them at random, the same each run (SEED). */
-	private static final String[][] MIX = {{"dirt", "0"}, {"gravel", "0"}, {"sand", "0"}, {"cobblestone", "0"}, {"stone", "1"}, {"stone", "3"}, {"stone", "5"}, {"coal_ore", "0"}, {"iron_ore", "0"}, {"gold_ore", "0"}, {"sandstone", "0"}, {"obsidian", "0"}, {"clay", "0"}, {"mossy_cobblestone", "0"}};
-	private static final long SEED = 1;
-	/** One box of the mix to this many blocks of qtest. */
-	private static final int MIX_EVERY = 150;
-	/** The widest a box of the mix is along each axis. */
-	private static final int MIX_SIZE = 4;
-
-	/** qtest1's liquids, from its lower corner: {block, dx1, dy1, dz1, dx2, dy2, dz2}, the rest stone. */
-	private static final Object[][] LIQUIDS = {
-		// Across a layer's bottom (layers of 4 from the top, 68).
-		{"water", 6, 9, 4, 8, 11, 6},
-		{"lava", 13, 4, 9, 14, 5, 10},
-		// At the top, open to the air over it.
-		{"water", 11, 17, 3, 11, 17, 3},
-		{"lava", 3, 15, 12, 3, 15, 12},
-		// A column of 6.
-		{"water", 16, 1, 3, 16, 6, 3},
-		// At the bottom.
-		{"lava", 8, 0, 10, 8, 0, 10}};
-
-	/** qtest2's islands, from its lower corner: {block, dx1, dy1, dz1, dx2, dy2, dz2}, the rest air. */
-	private static final Object[][] ISLANDS = {
-		// Towers of three heights, one the area's.
-		{"stone", 4, 0, 4, 9, 11, 9},
-		{"dirt", 14, 0, 4, 19, 6, 10},
-		{"stone", 5, 0, 15, 11, 9, 20},
-		// Up in the air: a slab, a block.
-		{"cobblestone", 15, 7, 15, 20, 8, 20},
-		{"stone", 12, 10, 12, 12, 10, 12},
-		// A pillar of one.
-		{"stone", 2, 0, 20, 2, 3, 20}};
-
-	/** How far round a built test (qtest1, qtest2) its stone plate goes, and how high over it the air. */
+	/** How far round the test its stone plate goes, and how high over it the air. */
 	private static final int PLATE = 3;
 	private static final int CLEAR = 8;
 
@@ -99,7 +74,7 @@ public class AutoStart implements ClientModInitializer {
 	private enum Step { TITLE, PICK_WORLD, PLAY, LOADING, BOTS, JOINING, SETTING, ARMING, DONE }
 
 	private Step step = Step.TITLE;
-	/** The area being tested, as named (see DEFAULT_TEST). */
+	/** The area being tested, as named in run/mapmcbot/debug/qtest; null without it. */
 	private String test;
 	private int wait = SETTLE_TICKS;
 	private int nextBot;
@@ -109,13 +84,16 @@ public class AutoStart implements ClientModInitializer {
 	private final BotRegistry.InventoryListener inventoryListener = (bot, inventory) -> MinecraftClient.getInstance().submit(() -> onInventory(MinecraftClient.getInstance(), bot));
 	/** The bots whose inventory came since the set up ended: one from before is its last run's, the kit maybe among it. */
 	private final Set<String> armed = new HashSet<String>();
+	/** PRIM_TEST's, null on any other; its columns heard from before the bots join. */
+	private PrimTest primTest;
+	private PrimTest.Columns primColumns;
 
 	@Override
 	public void onInitializeClient() {
 		final File named = new File(MinecraftClient.getInstance().runDirectory, "mapmcbot/debug/qtest");
 
 		try {
-			test = named.isFile() ? new String(Files.readAllBytes(named.toPath()), StandardCharsets.UTF_8).trim() : DEFAULT_TEST;
+			test = named.isFile() ? new String(Files.readAllBytes(named.toPath()), StandardCharsets.UTF_8).trim() : null;
 		} catch (IOException e) {
 			throw new UncheckedIOException("debug autostart could not read " + named, e);
 		}
@@ -163,6 +141,11 @@ public class AutoStart implements ClientModInitializer {
 						port = Integer.parseInt(opened);
 						MapMcBotClient.bots().addInventoryListener(inventoryListener);
 
+						if (PRIM_TEST.equals(test)) {
+							primColumns = new PrimTest.Columns();
+							MapMcBotClient.bots().addColumnListener(primColumns);
+						}
+
 						step = Step.BOTS;
 					}
 				}
@@ -182,7 +165,7 @@ public class AutoStart implements ClientModInitializer {
 
 	/**
 	 * A bot's inventory came: once every bot has its first (it comes after its spawn), the set up; once
-	 * each has the kit alone (the inventories after the set up, the bots idle), the quarrify.
+	 * each has the kit alone (the inventories after the set up, the bots idle), the band test.
 	 */
 	private void onInventory(MinecraftClient client, String from) {
 		if (step == Step.JOINING) {
@@ -192,13 +175,26 @@ public class AutoStart implements ClientModInitializer {
 				}
 			}
 
+			if (PRIM_TEST.equals(test)) {
+				step = Step.SETTING;
+				primTest = new PrimTest(client.getServer(), fleet, area(), primColumns);
+				primTest.setUp(() -> client.submit(() -> step = Step.ARMING));
+				return;
+			}
+
+			if (!BAND_TEST.equals(test)) {
+				step = Step.DONE;
+				MapMcBotClient.bots().removeInventoryListener(inventoryListener);
+				return;
+			}
+
 			step = Step.SETTING;
 			setUp(client);
 		} else if (step == Step.ARMING) {
 			armed.add(from);
 
 			for (String bot : fleet) {
-				if (!armed.contains(bot) || !kitAlone(MapMcBotClient.bots().getInventory(bot))) {
+				if (!armed.contains(bot) || !kitAlone(MapMcBotClient.bots().getInventory(bot), primTest != null ? primTest.kit(bot) : KIT)) {
 					return;
 				}
 			}
@@ -206,60 +202,40 @@ public class AutoStart implements ClientModInitializer {
 			step = Step.DONE;
 			MapMcBotClient.bots().removeInventoryListener(inventoryListener);
 
-			if (!MapMcBotClient.command("#quarrify " + test)) {
-				throw new IllegalStateException("debug autostart: #quarrify is not a comando");
+			if (primTest != null) {
+				primTest.start();
+				return;
+			}
+
+			final Area area = area();
+
+			for (int i = 0; i < fleet.size(); i++) {
+				final int z = area.getMinZ() + STRIP_STEP * i;
+				new BandTest(fleet.get(i), area.getMinX(), area.getMaxX(), area.getMinY(), area.getMaxY(), z, z + area.getMaxZ() - area.getMinZ()).start();
 			}
 		}
 	}
 
 	/**
 	 * On the server thread: the test area built, the bots standing on it with their inventories cleared,
-	 * the items lying round killed, the kit given. qtest is filled with stone and MIX; qtest1 and qtest2
-	 * get a stone plate PLATE round and under them, air CLEAR over it, and in them stone and LIQUIDS, or
-	 * air and ISLANDS, the bots on the plate's corner (qtest2's top is in the air).
+	 * the items lying round killed, the kit given: a stone plate PLATE round and under it, air CLEAR
+	 * over it, a stone strip a bot, each bot in front of its own.
 	 */
 	private void setUp(MinecraftClient client) {
-		Area area = null;
-
-		for (Area one : MapMcBotClient.areas().getAreas()) {
-			if (one.getName().equals(test)) {
-				area = one;
-			}
-		}
-
-		if (area == null) {
-			throw new IllegalStateException("debug autostart: no area named " + test);
-		}
-
+		final Area area = area();
 		final List<String> fills = new ArrayList<String>();
-		final String spawn;
+		// Each bot's own spot, in front of its strip.
+		final Map<String, String> spawns = new HashMap<String, String>();
+		// A strip a bot, the area's copied STRIP_STEP apart along z, each bot in front of its own on its middle line across.
+		final int beyondZ = STRIP_STEP * (fleet.size() - 1);
+		fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY() - 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMinY() - 1, area.getMaxZ() + beyondZ + PLATE, "stone"));
+		fills.addAll(fillsAlongZ(area.getMinX() - PLATE, area.getMinY(), area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY() + CLEAR, area.getMaxZ() + beyondZ + PLATE, "air"));
 
-		if (test.equals("qtest")) {
-			fills.add(fill(area.getMinX(), area.getMinY(), area.getMinZ(), area.getMaxX(), area.getMaxY(), area.getMaxZ(), "stone", "0"));
-			final Random random = new Random(SEED);
-
-			for (long i = area.getVolume() / MIX_EVERY; i > 0; i--) {
-				final String[] block = MIX[random.nextInt(MIX.length)];
-				final int x = area.getMinX() + random.nextInt(area.getWidth());
-				final int y = area.getMinY() + random.nextInt(area.getHeight());
-				final int z = area.getMinZ() + random.nextInt(area.getDepth());
-				fills.add(fill(x, y, z, Math.min(x + random.nextInt(MIX_SIZE), area.getMaxX()), Math.min(y + random.nextInt(MIX_SIZE), area.getMaxY()), Math.min(z + random.nextInt(MIX_SIZE), area.getMaxZ()), block[0], block[1]));
-			}
-
-			spawn = top(area);
-		} else if (test.equals("qtest1") || test.equals("qtest2")) {
-			final boolean liquids = test.equals("qtest1");
-			fills.add(fill(area.getMinX() - PLATE, area.getMinY() - 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY(), area.getMaxZ() + PLATE, "stone", "0"));
-			fills.add(fill(area.getMinX() - PLATE, area.getMaxY() + 1, area.getMinZ() - PLATE, area.getMaxX() + PLATE, area.getMaxY() + CLEAR, area.getMaxZ() + PLATE, "air", "0"));
-			fills.add(fill(area.getMinX(), area.getMinY(), area.getMinZ(), area.getMaxX(), area.getMaxY(), area.getMaxZ(), liquids ? "stone" : "air", "0"));
-
-			for (Object[] box : liquids ? LIQUIDS : ISLANDS) {
-				fills.add(fill(area.getMinX() + (Integer) box[1], area.getMinY() + (Integer) box[2], area.getMinZ() + (Integer) box[3], area.getMinX() + (Integer) box[4], area.getMinY() + (Integer) box[5], area.getMinZ() + (Integer) box[6], (String) box[0], "0"));
-			}
-
-			spawn = liquids ? top(area) : (area.getMinX() - 1.5) + " " + (area.getMaxY() + 1) + " " + (area.getMinZ() - 1.5);
-		} else {
-			throw new IllegalStateException("debug autostart: no test " + test + " (qtest, qtest1, qtest2)");
+		for (int i = 0; i < fleet.size(); i++) {
+			final int z = area.getMinZ() + STRIP_STEP * i;
+			final int maxZ = z + area.getMaxZ() - area.getMinZ();
+			fills.add(fill(area.getMinX(), area.getMinY(), z, area.getMaxX(), area.getMaxY(), maxZ, "stone", "0"));
+			spawns.put(fleet.get(i), (area.getMinX() - 0.5) + " " + area.getMinY() + " " + (z + maxZ + 1) / 2.0);
 		}
 
 		final List<String> bots = new ArrayList<String>(fleet);
@@ -267,7 +243,7 @@ public class AutoStart implements ClientModInitializer {
 		final int minCx = area.getMinX() - PLATE >> 4;
 		final int maxCx = area.getMaxX() + PLATE >> 4;
 		final int minCz = area.getMinZ() - PLATE >> 4;
-		final int maxCz = area.getMaxZ() + PLATE >> 4;
+		final int maxCz = area.getMaxZ() + beyondZ + PLATE >> 4;
 
 		server.submit(() -> {
 			// Its chunks loaded, a fill there not failing for them: loaded on the spot (generated if need be).
@@ -279,24 +255,25 @@ public class AutoStart implements ClientModInitializer {
 
 			// clear and fill do nothing (0) on an empty inventory or blocks that are so already: not checked.
 			for (String bot : bots) {
-				run(server, "tp " + bot + " " + spawn, true);
+				run(server, "tp " + bot + " " + spawns.get(bot), true);
 				run(server, "clear " + bot, false);
+				// The effects the server kept from its last run (a mining fatigue among them) gone: 0 with none.
+				run(server, "effect " + bot + " clear", false);
 				// Healed and fed: the server keeps a bot's health from its last run, a fall that hurt it then kills it now.
 				run(server, "effect " + bot + " minecraft:instant_health 1 10", true);
 				run(server, "effect " + bot + " minecraft:saturation 1 10", true);
-				// Mining fatigue I for the whole run: slower breaks, the aim held on the block longer.
-				run(server, "effect " + bot + " minecraft:mining_fatigue 1000000 0 true", true);
 			}
 
 			for (String fill : fills) {
 				run(server, fill, false);
 			}
 
-			// The drops of the quarrify before, still lying round it: a bot picking one up never has the kit alone.
+			// The drops of the test before, still lying round it: a bot picking one up never has the kit alone.
 			run(server, "kill @e[type=item]", false);
 
 			for (String bot : bots) {
 				run(server, "give " + bot + " " + PICK, true);
+				run(server, "give " + bot + " " + SHOVEL, true);
 				run(server, "give " + bot + " " + BLOCKS, true);
 			}
 
@@ -305,26 +282,52 @@ public class AutoStart implements ClientModInitializer {
 		});
 	}
 
-	/** The middle of the area's top, standing on it. */
-	private static String top(Area area) {
-		return (area.getMinX() + area.getMaxX() + 1) / 2.0 + " " + (area.getMaxY() + 1) + " " + (area.getMinZ() + area.getMaxZ() + 1) / 2.0;
+	/** The test's area (see test). */
+	private Area area() {
+		for (Area one : MapMcBotClient.areas().getAreas()) {
+			if (one.getName().equals(test)) {
+				return one;
+			}
+		}
+
+		throw new IllegalStateException("debug autostart: no area named " + test);
 	}
 
-	private static String fill(int x1, int y1, int z1, int x2, int y2, int z2, String block, String data) {
+	/** The most blocks a fill command takes (vanilla's limit). */
+	private static final int FILL_LIMIT = 32768;
+
+	/** A box too big for one fill, as fills of as many whole z rows as FILL_LIMIT lets each take. */
+	static List<String> fillsAlongZ(int x1, int y1, int z1, int x2, int y2, int z2, String block) {
+		final int rows = FILL_LIMIT / ((x2 - x1 + 1) * (y2 - y1 + 1));
+
+		if (rows == 0) {
+			throw new IllegalStateException("debug autostart: a z row of " + x1 + " " + y1 + " " + z1 + ".." + x2 + " " + y2 + " " + z2 + " is past the fill limit");
+		}
+
+		final List<String> out = new ArrayList<String>();
+
+		for (int z = z1; z <= z2; z += rows) {
+			out.add(fill(x1, y1, z, x2, y2, Math.min(z + rows - 1, z2), block, "0"));
+		}
+
+		return out;
+	}
+
+	static String fill(int x1, int y1, int z1, int x2, int y2, int z2, String block, String data) {
 		return "fill " + x1 + " " + y1 + " " + z1 + " " + x2 + " " + y2 + " " + z2 + " minecraft:" + block + " " + data;
 	}
 
-	private static void run(MinecraftServer server, String command, boolean checked) {
+	static void run(MinecraftServer server, String command, boolean checked) {
 		if (server.getCommandManager().execute(server, command) == 0 && checked) {
 			throw new IllegalStateException("debug autostart: /" + command + " failed");
 		}
 	}
 
-	/** Whether the inventory holds every item of the KIT and nothing else. */
-	private static boolean kitAlone(BotInventory inventory) {
+	/** Whether the inventory holds every item of the kit and nothing else. */
+	private static boolean kitAlone(BotInventory inventory, String[] names) {
 		final List<String> kit = new ArrayList<String>();
 
-		for (String name : KIT) {
+		for (String name : names) {
 			kit.add(name);
 		}
 

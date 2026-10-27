@@ -20,7 +20,25 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import net.mapmcbot.fleet.FleetProtocol;
+import net.mapmcbot.fleet.ChunkMessage;
+import net.mapmcbot.fleet.FromFleet;
+import net.mapmcbot.fleet.message.SocketMessage;
+import net.mapmcbot.fleet.FleetSocketHandler;
+import net.mapmcbot.fleet.message.AllowedPlace;
+import net.mapmcbot.fleet.message.ClearQ;
+import net.mapmcbot.fleet.message.Crash;
+import net.mapmcbot.fleet.message.Goto;
+import net.mapmcbot.fleet.message.Hello;
+import net.mapmcbot.fleet.message.Log;
+import net.mapmcbot.fleet.message.Primitives;
+import net.mapmcbot.fleet.message.ProfileRequest;
+import net.mapmcbot.fleet.message.Quit;
+import net.mapmcbot.fleet.message.Spawn;
+import net.mapmcbot.fleet.message.TradeSelect;
+import net.mapmcbot.fleet.message.UpdateFailed;
+import net.mapmcbot.fleet.message.Updating;
+import net.mapmcbot.fleet.message.WindowClick;
+import net.mapmcbot.fleet.message.Welcome;
 import net.mapmcbot.profile.ProfileListener;
 
 /**
@@ -29,7 +47,7 @@ import net.mapmcbot.profile.ProfileListener;
  * (relays.txt in the mod's folder, # for comments; the port is DEFAULT_PORT when left out). The
  * mod only knocks: a relay that is up takes the connection, one that is not is said so in the log
  * and skipped. Each relay connected gets a rid, 1, 2, ... (0 is the mod's own fleet), and talks the
- * same {@link FleetProtocol} frames as that one, except the ones about columns: a relay's world is
+ * same {@link FleetSocketHandler} frames as that one, except the ones about columns: a relay's world is
  * its own and none of it goes to the mod, so such a frame from a relay is a failure.
  *
  * The first frame to a relay is HELLO with the commit the mod was built at; it is not connected until
@@ -173,7 +191,7 @@ public final class RelayHub {
 			}
 
 			// Blocks this thread until the relay runs the mod's commit, which may take it a reset and a restart.
-			relay.write(FleetProtocol.hello(commit()));
+			relay.write(new Hello("", commit()));
 
 			if (!relay.awaitWelcome()) {
 				return;
@@ -238,7 +256,7 @@ public final class RelayHub {
 	 */
 	public void spawn(int rid, String bot, String host, int port) {
 		final Relay relay = relay(rid);
-		relay.order(() -> FleetProtocol.spawn(bot, isLoopback(host) ? relay.socket.getLocalAddress().getHostAddress() : host, port));
+		relay.order(() -> new Spawn(bot, isLoopback(host) ? relay.socket.getLocalAddress().getHostAddress() : host, port));
 	}
 
 	private static boolean isLoopback(String host) {
@@ -246,37 +264,37 @@ public final class RelayHub {
 	}
 
 	public void quit(int rid, String bot) {
-		relay(rid).send(FleetProtocol.quit(bot));
+		relay(rid).send(new Quit(bot));
 	}
 
 	public void windowClick(int rid, String bot, int slot, int button, int mode, int id) {
-		relay(rid).send(FleetProtocol.windowClick(bot, slot, button, mode, id));
+		relay(rid).send(new WindowClick(bot, slot, button, mode, id));
 	}
 
 	public void tradeSelect(int rid, String bot, int trade) {
-		relay(rid).send(FleetProtocol.tradeSelect(bot, trade));
+		relay(rid).send(new TradeSelect(bot, trade));
 	}
 
 	public void allowedPlace(int rid, String bot, List<String> blocks) {
-		relay(rid).send(FleetProtocol.allowedPlace(bot, blocks));
+		relay(rid).send(new AllowedPlace(bot, blocks));
 	}
 
 	public void clearQ(int rid, String bot) {
-		relay(rid).send(FleetProtocol.clearQ(bot));
+		relay(rid).send(new ClearQ(bot));
 	}
 
 	public void action(int rid, String bot, String json) {
-		relay(rid).send(FleetProtocol.primitive(bot, json));
+		relay(rid).send(Primitives.fromJson(bot, json));
 	}
 
 	public void gotoSpot(int rid, String bot, int x, int y, int z) {
-		relay(rid).send(FleetProtocol.gotoSpot(bot, x, y, z));
+		relay(rid).send(Goto.spot(bot, x, y, z));
 	}
 
 	/** Asks every relay connected for its profile; each answers with a PROFILE the sink hears. */
 	public void requestProfile(String reason) {
 		for (Relay relay : relays.values()) {
-			relay.sendIfWelcomed(FleetProtocol.profileRequest(0, reason));
+			relay.sendIfWelcomed(new ProfileRequest("", 0, reason));
 		}
 	}
 
@@ -292,7 +310,7 @@ public final class RelayHub {
 
 	/** A frame put together when it goes: one waiting for the WELCOME may need the connection. */
 	private interface Order {
-		byte[] frame();
+		SocketMessage message();
 	}
 
 	private final class Relay {
@@ -328,19 +346,19 @@ public final class RelayHub {
 					return;
 				}
 
-				write(order.frame());
+				write(order.message());
 			}
 		}
 
-		void send(byte[] frame) {
-			order(() -> frame);
+		void send(SocketMessage message) {
+			order(() -> message);
 		}
 
 		/** Dropped while it starts: for what only makes sense now. */
-		void sendIfWelcomed(byte[] frame) {
+		void sendIfWelcomed(SocketMessage message) {
 			synchronized (writeLock) {
 				if (waiting == null) {
-					write(frame);
+					write(message);
 				}
 			}
 		}
@@ -349,7 +367,7 @@ public final class RelayHub {
 		void welcome() {
 			synchronized (writeLock) {
 				for (Order order : waiting) {
-					write(order.frame());
+					write(order.message());
 				}
 
 				waiting = null;
@@ -373,47 +391,47 @@ public final class RelayHub {
 		 * relay up but not at the mod's commit. Anything else is no relay of this mod's, a failure.
 		 */
 		boolean awaitWelcome() throws IOException {
-			byte[] frame;
+			SocketMessage message;
 
-			while ((frame = FleetProtocol.readFrame(in)) != null && (frame[0] & 0xFF) == FleetProtocol.UPDATING) {
+			while ((message = FleetSocketHandler.readFromSocket(in)) instanceof Updating) {
 				pending.put(address, "updating");
-				System.out.println("[mapmcbot] relay " + rid + " (" + address + ") is updating: " + FleetProtocol.relayText(frame));
+				System.out.println("[mapmcbot] relay " + rid + " (" + address + ") is updating: " + ((Updating) message).text);
 			}
 
-			if (frame != null && (frame[0] & 0xFF) == FleetProtocol.WELCOME) {
+			if (message instanceof Welcome) {
 				return true;
 			}
 
 			active.remove(address);
 
-			if (frame != null && (frame[0] & 0xFF) == FleetProtocol.UPDATE_FAILED) {
+			if (message instanceof UpdateFailed) {
 				pending.put(address, "update failed");
-				keepCrash(FleetProtocol.relayText(frame));
+				keepCrash(((UpdateFailed) message).text);
 				socket.close();
 				return false;
 			}
 
 			// The relay stays up whatever went wrong: this knock is over, the next one tries again.
-			if (frame != null && (frame[0] & 0xFF) == FleetProtocol.CRASH) {
+			if (message instanceof Crash) {
 				pending.put(address, "error");
-				keepCrash(FleetProtocol.crashText(frame));
+				keepCrash(((Crash) message).text);
 				socket.close();
 				return false;
 			}
 
 			pending.put(address, "crashed");
 
-			if (frame == null) {
+			if (message == null) {
 				throw new IllegalStateException("relay " + rid + " (" + address + ") closed its connection before its WELCOME");
 			}
 
-			throw new IllegalStateException("relay " + rid + " (" + address + ") answered HELLO with type " + (frame[0] & 0xFF) + ", not WELCOME");
+			throw new IllegalStateException("relay " + rid + " (" + address + ") answered HELLO with " + FleetSocketHandler.Type.of(message.type()).name() + ", not WELCOME");
 		}
 
-		void write(byte[] frame) {
+		void write(SocketMessage message) {
 			synchronized (writeLock) {
 				try {
-					out.write(frame);
+					FleetSocketHandler.writeToSocket(message, out);
 					out.flush();
 				} catch (IOException e) {
 					throw new UncheckedIOException("could not write to relay " + rid, e);
@@ -481,24 +499,29 @@ public final class RelayHub {
 			IOException failure = null;
 
 			try {
-				byte[] frame;
+				SocketMessage message;
 
-				while ((frame = FleetProtocol.readFrame(in)) != null) {
-					if ((frame[0] & 0xFF) == FleetProtocol.CRASH) {
-						keepCrash(FleetProtocol.crashText(frame));
+				while ((message = FleetSocketHandler.readFromSocket(in)) != null) {
+
+					if (message instanceof Crash) {
+						keepCrash(((Crash) message).text);
 						continue;
 					}
 
-					if ((frame[0] & 0xFF) == FleetProtocol.LOG) {
-						keepLog(FleetProtocol.relayText(frame));
+					if (message instanceof Log) {
+						keepLog(((Log) message).text);
 						continue;
 					}
 
-					if (FleetProtocol.isChunkFrame(frame[0] & 0xFF)) {
-						throw new IllegalStateException("relay " + rid + " sent a frame about columns (type " + (frame[0] & 0xFF) + "): a relay's world is its own");
+					if (message instanceof ChunkMessage) {
+						throw new IllegalStateException("relay " + rid + " sent a frame about columns (" + FleetSocketHandler.Type.of(message.type()).name() + "): a relay's world is its own");
 					}
 
-					FleetProtocol.dispatch(frame, null, bots, listener);
+					if (!(message instanceof FromFleet)) {
+						throw new IllegalStateException("unexpected message type " + FleetSocketHandler.Type.of(message.type()).name() + " from relay " + rid);
+					}
+
+					((FromFleet) message).dispatch(null, bots, listener);
 				}
 			} catch (IOException e) {
 				failure = e;

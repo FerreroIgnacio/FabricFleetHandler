@@ -1,8 +1,8 @@
 'use strict'
 
 // The look provider: how the head turns from where it is to where it looks, a point each physics
-// tick, as a hand on a mouse turns it: its speed swelling and easing off (minimum jerk), the way bent
-// a little off the straight line, past the target on a long turn and back onto it. Deterministic: the
+// tick, as a hand on a mouse turns it: the way is a real player's turn (see TRACES), laid from where
+// the head is to where it looks and stretched to the time a turn that wide takes. Deterministic: the
 // same from and to give the same way, its variation drawn from them (see variation); NOISE adds
 // random over that. Every point is a whole number of LOOK_STEPs from where the turn starts (vanilla's
 // mouse, see bot.look) and the last is where the head lands (see landing).
@@ -13,17 +13,23 @@ const conv = require('mineflayer/lib/conversions')
 const LOOK_STEP = conv.fromNotchianPitch(0.15)
 // A physics tick, in s.
 const TICK = 0.05
-// How much random goes over the ways, from 0 (none: dev) up; 1 doubles the bend and the overshoot at most and shakes the points by up to a tenth of the turn.
+// How much random goes over the ways, from 0 (none: dev) up to 1: the share of the trace's pick drawn
+// from random instead of from the turn, and of how far the head's player is from the usual one.
 const NOISE = 1
-// How fast a turn goes on average, of the order's turn_speed: drawn in this range a turn.
-const SPEED = [0.8, 1.15]
-// How far the way bends off the straight line at its middle, of the turn: drawn in this range, to either side.
-const BEND = [0.01, 0.06]
-// A turn this long or longer, in rad, goes past the target and back: by this much of it, drawn in this range.
-const OVERSHOOT_FROM = Math.PI / 18
-const OVERSHOOT = [0.03, 0.09]
-// The way back from past the target, in ticks: drawn in this range.
-const CORRECTION_TICKS = [3, 5]
+// Real turns, off OpenAI's VPT contractor data (Minecraft at 20 Hz; the isolated turns ending on a
+// block being broken or clicked): each one's points but its first and last, the chord from where it
+// starts to where it ends laid on (1, 0) (x along it, y off it to its left, of the turn). In bins by
+// how wide (from: the narrowest turn in the bin, rad), each sorted by r: how much longer it took than
+// its player's usual for a turn that wide.
+const TRACES = require('./lookTraces.json')
+// A turn's time goes with its angle to this power (the data's, its players' speeds apart).
+const EXPONENT = TRACES.exponent
+// The usual player's turn_speed: rad/s on a turn 1 rad wide.
+const HUMAN_SPEED = 1 / TRACES.seconds
+// How much longer than the usual player each of the data's players takes to turn: a head turns as one of them.
+const PLAYERS = TRACES.players
+// The slowest trace's r.
+const SLOWEST = Math.max(...TRACES.bins.map(bin => bin.traces[bin.traces.length - 1].r))
 
 // The yaw from a to b the short way round, in rad.
 function deltaYaw (a, b) {
@@ -54,11 +60,6 @@ function variation (from, to, salt = 0) {
   }
 }
 
-const between = (range, u) => range[0] + (range[1] - range[0]) * u
-
-// Minimum jerk: the share of a move done at s of its time, its speed 0 at both ends.
-const ease = s => s * s * s * (10 - 15 * s + 6 * s * s)
-
 const clampPitch = p => Math.max(-Math.PI / 2, Math.min(Math.PI / 2, p))
 
 // How the head misses to turning from from to to (each { yaw, pitch }, rad): { share: of how far the
@@ -66,7 +67,7 @@ const clampPitch = p => Math.max(-Math.PI / 2, Math.min(Math.PI / 2, p))
 // the small ones the most: the median of three draws, the points nearer the box's middle the likelier
 // (falling to none at the box's edge). Drawn from the turn as its way is (see variation); NOISE is
 // the chance the share is drawn from random instead. The caller takes it to the block and checks it
-// still gets the click (see actions.js aimMissed).
+// still gets the click (see lib/aim.js aimMissed).
 function miss (from, to, random = Math.random) {
   const draw = variation(from, landing(from, to), 1)
   const side = 2 * Math.PI * draw()
@@ -75,41 +76,53 @@ function miss (from, to, random = Math.random) {
   return { share, side }
 }
 
-// The way from from to to (each { yaw, pitch }, rad), one { yaw, pitch } a tick, at turnSpeed (rad/s)
-// on average: empty when the head is there already. random: [0, 1) for NOISE (Math.random by default).
-function way (from, to, { turnSpeed, random = Math.random }) {
+// The ticks a turn angle (rad) wide takes at turnSpeed (rad/s on a turn 1 rad wide), by a hand hand
+// times slower than the usual player's on a trace r times slower than its player's usual.
+const ticksOf = (angle, turnSpeed, hand, r) => angle ** EXPONENT / turnSpeed * hand * r / TICK
+
+// The most ticks a way angle (rad) wide takes at turnSpeed by hand: on the slowest trace.
+function longest (angle, turnSpeed, hand) {
+  return Math.max(1, Math.ceil(ticksOf(angle, turnSpeed, hand, SLOWEST)))
+}
+
+// The way from from to to (each { yaw, pitch }, rad), one { yaw, pitch } a tick, at turnSpeed (rad/s
+// on a turn 1 rad wide, the wider the faster as the data has it, see EXPONENT) by hand (see Head):
+// empty when the head is there already. A trace of the turn's bin, drawn (the higher random, the
+// slower the trace: 1 the slowest the turn can draw), to either side, its time stretched to the
+// turn's. random: [0, 1) for NOISE (Math.random by default).
+function way (from, to, { turnSpeed, hand = 1, random = Math.random }) {
   const end = landing(from, to)
   const dy = deltaYaw(from.yaw, end.yaw)
   const dp = end.pitch - from.pitch
   const angle = Math.hypot(dy, dp)
   if (angle === 0) return []
   const draw = variation(from, end)
-  const noise = () => NOISE * random()
-  const speed = turnSpeed * between(SPEED, draw())
-  // Off the straight line by its normal, to the side drawn.
-  const bend = between(BEND, draw()) * (1 + noise()) * (draw() < 0.5 ? -1 : 1) * angle
-  const ny = -dp / angle
-  const np = dy / angle
-  const points = []
-  const along = (target, ticks, bent) => {
-    const start = points.length ? points[points.length - 1] : from
-    const sy = deltaYaw(start.yaw, target.yaw)
-    const sp = target.pitch - start.pitch
-    for (let i = 1; i <= ticks; i++) {
-      const s = i / ticks
-      const e = ease(s)
-      const arc = bent * Math.sin(Math.PI * s)
-      const shake = i < ticks ? (random() - 0.5) * 0.2 * NOISE * angle * Math.sin(Math.PI * s) : 0
-      points.push({ yaw: start.yaw + sy * e + ny * (arc + shake), pitch: clampPitch(start.pitch + sp * e + np * (arc + shake)) })
-    }
+  let bin = TRACES.bins[0]
+  for (const b of TRACES.bins) if (angle >= b.from) bin = b
+  const own = draw()
+  const pick = own + NOISE * (random() - own)
+  const trace = bin.traces[Math.min(bin.traces.length - 1, Math.floor(pick * bin.traces.length))]
+  const side = draw() < 0.5 ? -1 : 1
+  // The trace's points, from (0, 0) to (1, 0), a tick apart.
+  const xs = [0]
+  const ys = [0]
+  for (let k = 0; k < trace.p.length; k += 2) {
+    xs.push(trace.p[k])
+    ys.push(trace.p[k + 1])
   }
-  if (angle >= OVERSHOOT_FROM) {
-    const past = between(OVERSHOOT, draw()) * (1 + noise())
-    const over = { yaw: end.yaw + dy * past, pitch: clampPitch(end.pitch + dp * past) }
-    along(over, Math.max(2, Math.ceil(angle * (1 + past) / (speed * TICK))), bend)
-    along(end, Math.round(between(CORRECTION_TICKS, draw())), 0)
-  } else {
-    along(end, Math.max(1, Math.ceil(angle / (speed * TICK))), bend)
+  xs.push(1)
+  ys.push(0)
+  const n = xs.length - 1
+  const ticks = Math.max(1, Math.round(ticksOf(angle, turnSpeed, hand, trace.r)))
+  const points = []
+  for (let i = 1; i <= ticks; i++) {
+    const s = i / ticks * n
+    const k = Math.min(n - 1, Math.floor(s))
+    const f = s - k
+    const x = xs[k] + (xs[k + 1] - xs[k]) * f
+    const y = side * (ys[k] + (ys[k + 1] - ys[k]) * f)
+    // Along the turn by x of it, off it to its left (the normal (-dp, dy)) by y of it.
+    points.push({ yaw: from.yaw + dy * x - dp * y, pitch: clampPitch(from.pitch + dp * x + dy * y) })
   }
   // On the mouse's steps from from, the last on the landing itself.
   const out = points.map(p => landing(from, p))
@@ -119,21 +132,29 @@ function way (from, to, { turnSpeed, random = Math.random }) {
 
 // A head following ways: aim gives it where to look, tick turns it a point. Aimed again on the way
 // (the target moving as the bot walks), the rest of its way moves with the target, not started over;
-// from the target's landing, a new way.
+// from the target's landing, a new way. Its hand: how much longer than the usual player it takes to
+// turn, one of the data's players (see PLAYERS) drawn when it is made, as far from the usual as NOISE.
 class Head {
-  constructor (yaw, pitch, turnSpeed) {
+  constructor (yaw, pitch, turnSpeed, random = Math.random) {
     this.yaw = yaw
     this.pitch = pitch
     this.turnSpeed = turnSpeed
+    this.hand = 1 + NOISE * (PLAYERS[Math.floor(random() * PLAYERS.length)] - 1)
     this.points = []
     this.goal = null
   }
 
   clone () {
     const head = new Head(this.yaw, this.pitch, this.turnSpeed)
+    head.hand = this.hand
     head.points = this.points.slice()
     head.goal = this.goal
     return head
+  }
+
+  // The most ticks a way angle (rad) wide takes it at turnSpeed (see longest).
+  longest (angle, turnSpeed = this.turnSpeed) {
+    return longest(angle, turnSpeed, this.hand)
   }
 
   // Whether it is on its goal, nothing left to turn.
@@ -159,7 +180,7 @@ class Head {
       return
     }
     this.goal = to
-    this.points = way(here, to, { turnSpeed, random })
+    this.points = way(here, to, { turnSpeed, hand: this.hand, random })
   }
 
   // The next point of its way, where the head is then; null with none left.
@@ -177,4 +198,4 @@ class Head {
   }
 }
 
-module.exports = { LOOK_STEP, NOISE, landing, miss, way, Head }
+module.exports = { LOOK_STEP, NOISE, HUMAN_SPEED, landing, miss, way, Head }

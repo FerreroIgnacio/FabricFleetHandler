@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * The names the mod gives its bots, so no fleet (main or relay) has to pick one: the mod hands the
+ * The names the mod gives its bots, so the fleet does not have to pick one: the mod hands the
  * name over in the SPAWN and takes it back when the bot is gone. A name is in use by one bot at a time.
  *
  * Thread-safe: the game thread takes, the channel thread gives back.

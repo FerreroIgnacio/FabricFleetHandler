@@ -14,17 +14,15 @@ import java.util.stream.Collectors;
 import net.fabricmc.api.ClientModInitializer;
 import net.legacyfabric.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.legacyfabric.fabric.api.client.keybinding.v1.KeyBindingHelper;
-import com.google.gson.JsonObject;
-import net.mapmcbot.area.Area;
 import net.mapmcbot.area.AreaStore;
 import net.mapmcbot.area.ChestStore;
 import net.mapmcbot.bot.BotManager;
+import net.mapmcbot.fleet.FleetSocketHandler;
 import net.mapmcbot.bot.BotProfile;
 import net.mapmcbot.bot.BotProfileStore;
 import net.mapmcbot.bot.BotRegistry;
 import net.mapmcbot.bot.NameList;
 import net.mapmcbot.bot.PlaceBlocks;
-import net.mapmcbot.bot.RelayHub;
 import net.mapmcbot.chunk.ChunkRegistry;
 import net.mapmcbot.chunk.ChunkSnapshotStore;
 import net.mapmcbot.job.JobRunner;
@@ -70,11 +68,9 @@ public class MapMcBotClient implements ClientModInitializer {
 	private static ChestStore chests;
 	private static String chestsWorldId;
 	private static Grab grab;
-	private static Quarrify quarrify;
 	private static BotRegistry bots;
 	private static JobRunner job;
 	private static BotProfileStore botProfiles;
-	private static RelayHub relays;
 	private static ChunkRegistry chunks;
 	private static ProfileRegistry profile;
 
@@ -94,7 +90,7 @@ public class MapMcBotClient implements ClientModInitializer {
 			return;
 		}
 
-		// In a world from the start, not at the first bot: the relays need the port open to connect.
+		// In a world from the start, not at the first bot: the fleet is up before the first bot.
 		bots();
 
 		boolean openAreas = false;
@@ -187,18 +183,9 @@ public class MapMcBotClient implements ClientModInitializer {
 	}
 
 	/**
-	 * A chat line for the mod: #relays connects to the relays listed that are not connected yet,
-	 * #formation sends every bot in the world to a spot around the player, #quarrify AREA has every bot in
-	 * the world dig out the area. False when it is not one.
+	 * A chat line for the mod: #formation sends every bot in the world to a spot around the player. False when it is not one.
 	 */
 	public static boolean command(String line) {
-		if (line.equals("#relays")) {
-			// For a relay started after the game: knock on the ones listed that are not connected.
-			bots();
-			relays.connectMissing();
-			return true;
-		}
-
 		if (BotCommands.handle(MinecraftClient.getInstance(), line)) {
 			return true;
 		}
@@ -218,75 +205,7 @@ public class MapMcBotClient implements ClientModInitializer {
 			return true;
 		}
 
-		if (line.equals("#quarrify") || line.startsWith("#quarrify ")) {
-			quarrify(MinecraftClient.getInstance(), line.substring("#quarrify".length()).trim());
-			return true;
-		}
-
 		return false;
-	}
-
-	/** Every bot in the world digs out the area named (see Quarrify), as an order from outside; each one's end told in chat. */
-	private static void quarrify(MinecraftClient client, String name) {
-		Area area = null;
-
-		for (Area one : areas().getAreas()) {
-			if (one.getName().equals(name)) {
-				area = one;
-			}
-		}
-
-		if (area == null) {
-			chat(client, "quarrify_err: no area named " + name);
-			return;
-		}
-
-		final List<String> fleet = new ArrayList<String>(bots().getSpawned());
-		Collections.sort(fleet);
-
-		if (fleet.isEmpty()) {
-			chat(client, "quarrify_err: no bots in the world");
-			return;
-		}
-
-		final JsonObject a = new JsonObject();
-		a.addProperty("action", "quarrify");
-		a.addProperty("area", area.getId());
-		final String dug = area.getName();
-
-		for (String bot : fleet) {
-			job().ordered(bot, a.toString());
-			quarrify().start(bot, a.toString(), new JobRunner.Listener() {
-				@Override
-				public void done() {
-					client.submit(() -> chat(client, "quarrify: " + bot + " dug out " + dug));
-				}
-
-				@Override
-				public void failed() {
-					final String why = quarrify.status(bot);
-					// Its blocks clickable: highlighted in the world.
-					client.submit(() -> client.inGameHud.getChatHud().addMessage(BlockLinks.text("quarrify_err: " + (why == null ? bot + " taken over" : why))));
-
-					// A failure ends the client right there, its crash report written and the world saved as it
-					// left it: stopped as a quit, not by crash(), whose exit from the game loop leaves the shutdown
-					// hook waiting for ever on the integrated server's thread, gone by then.
-					if (why != null) {
-						client.submit(() -> {
-							final net.minecraft.util.crash.CrashReport report = client.addSystemDetailsToCrashReport(new net.minecraft.util.crash.CrashReport("quarrify of " + bot + " failed", new IllegalStateException(why)));
-							final java.io.File file = new java.io.File(new java.io.File(client.runDirectory, "crash-reports"), "crash-" + new java.text.SimpleDateFormat("yyyy-MM-dd_HH.mm.ss").format(new java.util.Date()) + "-client.txt");
-
-							if (!report.writeToFile(file)) {
-								throw new IllegalStateException("could not write the crash report of " + bot + "'s quarrify to " + file);
-							}
-
-							System.out.println(report.asString());
-							client.scheduleStop();
-						});
-					}
-				}
-			});
-		}
 	}
 
 	/**
@@ -508,12 +427,6 @@ public class MapMcBotClient implements ClientModInitializer {
 		return chests;
 	}
 
-	/** The quarrifies of the bots; created with the bots. */
-	static Quarrify quarrify() {
-		bots();
-		return quarrify;
-	}
-
 	/** The grabs of the bots; created with the bots. */
 	static Grab grab() {
 		bots();
@@ -523,21 +436,18 @@ public class MapMcBotClient implements ClientModInitializer {
 	public static BotRegistry bots() {
 		if (bots == null) {
 			final File directory = dataDirectory(MinecraftClient.getInstance());
-			final BotManager fleet = new BotManager(new File(directory, "bot"));
+			final BotManager botManager = new BotManager(new File(directory, "bot"));
+			final FleetSocketHandler fleet = new FleetSocketHandler(botManager);
 			fleet.setReaderFailure(e -> MinecraftClient.getInstance().submit(() -> chat(MinecraftClient.getInstance(), "[MapMcBot] the fleet reader died, its bots' state is stale until restart: " + e.getMessage())));
-			relays = new RelayHub(new File(directory, "relays.txt"));
 			botProfiles = new BotProfileStore(new File(directory, "bot_profiles.tsv"));
 			seedProfiles();
 			final PlaceBlocks placeBlocks = new PlaceBlocks(new File(directory, "place_blocks.txt"), PlaceCatalog.keys());
-			bots = new BotRegistry(fleet, relays, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles, placeBlocks);
+			bots = new BotRegistry(fleet, new NameList(botProfiles.getProfiles().stream().map(BotProfile::getName).collect(Collectors.toList())), botProfiles, placeBlocks);
 			job = new JobRunner(bots, new JobStore(new File(directory, "job.txt")));
-			chunks = new ChunkRegistry(fleet, new ChunkSnapshotStore(new File(directory, "chunks")));
+			chunks = new ChunkRegistry(fleet, botManager.columns(), new ChunkSnapshotStore(new File(directory, "chunks")));
 			grab = new Grab(bots, new ChestTracker(bots));
-			quarrify = new Quarrify(bots, chunks);
 			job.addResolver(grab);
-			job.addResolver(quarrify);
-			profile = new ProfileRegistry(fleet, relays, new File(directory, "bot/profile.log"), chunks::chunksByBot);
-			relays.start();
+			profile = new ProfileRegistry(fleet, new File(directory, "bot/profile.log"), chunks::chunksByBot);
 		}
 
 		return bots;
@@ -560,12 +470,6 @@ public class MapMcBotClient implements ClientModInitializer {
 		}
 	}
 
-	/** The relays connected; created with the bots. */
-	public static RelayHub relays() {
-		bots();
-		return relays;
-	}
-
 	/** CPU and memory of the mod and the fleet (see ProfilerScreen); created with the bots. */
 	public static ProfileRegistry profile() {
 		bots();
@@ -574,10 +478,6 @@ public class MapMcBotClient implements ClientModInitializer {
 
 	/** The bots, or null while none was ever started. */
 	/** The grabs, null before the bots are created. */
-	static Quarrify quarrifyOrNull() {
-		return quarrify;
-	}
-
 	static Grab grabOrNull() {
 		return grab;
 	}

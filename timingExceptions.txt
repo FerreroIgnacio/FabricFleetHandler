@@ -1,7 +1,7 @@
 Excepciones a la regla "todo event driven" (reglas del repo), autorizadas una por una.
 
-1. Deadline de las primitivas con condición esperada (interact, break, place, wait_slot): solo sirve para fallar; el evento que confirma el efecto lo resuelve antes. (actions.js, deadline)
+1. Deadline de las primitivas con condición esperada (interact, break, place, wait_slot): solo sirve para fallar; el evento que confirma el efecto lo resuelve antes. (lib/lifecycle.js, deadline) El deadline del break es 1.5 veces lo que tarda el dig (digMs), con mínimo de 1000 ms.
 
-2. Profile una vez por segundo: ProfileRegistry pide un profile cada 1 s (PROFILE_EVERY) al fleet local y a cada relay, salvo que el anterior no haya llegado. Antes se pedía cada 5000 frames del fleet local, y con los bots quietos no se pedía nunca (el CPU de los relays quedaba en "--"). (ProfileRegistry, hilo mapmcbot-profile-timer)
+2. Profile una vez por segundo: ProfileRegistry pide un profile cada 1 s (PROFILE_EVERY) al fleet, salvo que el anterior no haya llegado. Antes se pedía cada 5000 frames del fleet local, y con los bots quietos no se pedía nunca (el CPU de los relays quedaba en "--"). (ProfileRegistry, hilo mapmcbot-profile-timer)
 
-3. Reintento de place cada PLACE_RETRY_MS (500 ms): un place que el server rechaza (`Server refused to place ...`) vuelve a hacer el click derecho desde donde está el bot, sin buscar otro spot ni otro tramo, hasta el deadline de la prim; ahí falla. (actions.js, place)
+3. Reintento de place cada PLACE_RETRY_MS (500 ms): un place que el server rechaza (`Server refused to place ...`) vuelve a hacer el click derecho desde donde está el bot, sin buscar otro spot ni otro tramo, hasta el deadline de la prim; ahí falla. (lib/blocks.js, place)

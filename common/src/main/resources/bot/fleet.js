@@ -2,24 +2,7 @@
 // share their chunk columns (sharedChunks.js), driven by the mod over one socket (see protocol.js).
 // The columns' blocks are not sent: they live in columns.bin, mapped by the threads and, for the
 // mod's own fleet, the mod.
-//
-// A relay is this same fleet on another machine, left running: it listens, and a mod that starts
-// connects to it (see RelayHub.java). Its columns.bin is its own and the mod never sees its world
-// (no frame about columns goes to the mod). When the mod goes, its bots quit and the relay waits
-// for the next one.
-//
-// A relay runs the mod's commit: the mod's first frame is HELLO with it, answered WELCOME when it is
-// this relay's. When not, the relay tells the mod it is UPDATING, fetches and resets its checkout to
-// that commit by force, and restarts on it, the mod's connection and all (see update). When it cannot
-// get to it (not pushed, say) it says why (UPDATE_FAILED), closes that connection and stays up.
-//
-// A relay never goes down: any error of its own goes to the mod (CRASH, kept there in
-// crash-relay<N>.log) and it goes on; a pool thread that dies takes only its bots with it. What it
-// writes (its bots' lines too) goes to the mod as well once served (LOG, kept in fleet-relay<N>.log).
 // Usage: node fleet.js <mod port> <columns.bin>
-//        node fleet.js --relay <port to listen on> <columns.bin>
-const { execSync } = require('child_process')
-const fs = require('fs')
 const net = require('net')
 const os = require('os')
 const path = require('path')
@@ -28,29 +11,10 @@ const protocol = require('./protocol')
 const states = require('./states')
 const { threadProfiler, toText } = require('./profiler')
 const { HEADER, SLOTS, SIZE, loadedHeader } = require('./sharedChunks')
-const { RESTART } = require('./relaySupervisor')
 
-const relay = process.argv[2] === '--relay'
-const socketPort = Number(relay ? process.argv[3] : process.argv[2])
-const columnsFile = relay ? process.argv[4] : process.argv[3]
-if (!Number.isInteger(socketPort) || !columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin> | node fleet.js --relay <port to listen on> <columns.bin>')
-
-// The relay started by hand is its supervisor (relaySupervisor.js), which runs this file again as
-// the relay itself, handing it the mod's connections.
-if (relay && !process.env.MAPMCBOT_RELAY_CHILD) {
-  require('./relaySupervisor')(socketPort)
-  return
-}
-
-// The commit this relay's checkout is at as it starts, the one it runs: a git reset later does not change it.
-const VERSION = relay ? execSync('git rev-parse HEAD', { cwd: __dirname }).toString().trim() : null
-
-// The mod makes the columns file of its own fleet; a relay makes its own, every slot zeros.
-if (relay) {
-  const fd = fs.openSync(columnsFile, 'w')
-  fs.ftruncateSync(fd, SLOTS * SIZE)
-  fs.closeSync(fd)
-}
+const socketPort = Number(process.argv[2])
+const columnsFile = process.argv[3]
+if (!Number.isInteger(socketPort) || !columnsFile) throw new Error('usage: node fleet.js <mod port> <columns.bin>')
 
 const prof = threadProfiler('node.thread:fleet')
 
@@ -138,7 +102,6 @@ function takeSlot (key) {
 // Columns ("server|dimension|cx,cz") to have in memory off their snapshot, as cached ones. Nothing
 // asks for any yet.
 function wantSnapshots (keys) {
-  if (relay) throw new Error('a relay has no snapshots: its world is its own, the mod has none of it')
   for (const key of keys) {
     if (columns.has(key) || noSnapshot.has(key) || loading.has(key)) continue
     toLoad.add(key)
@@ -247,7 +210,7 @@ function onChunkRequest (thread, request) {
     const load = !column
     if (load) {
       const slot = takeSlot(request.acquire)
-      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: !relay, ready: false }
+      column = { header: new SharedArrayBuffer(HEADER), slot, threads: new Set(), chunk: chunkOf(request.acquire), claim: nextClaim++, version: request.version, modHolds: true, ready: false }
       columns.set(request.acquire, column)
       slotColumns.set(slot, column)
       send(protocol.claim(request.bot, column.chunk, column.claim, column.slot, request.version))
@@ -296,8 +259,7 @@ function onReport (thread, report) {
     bots.delete(report.bot)
     worldOf.delete(report.bot)
     thread.bots--
-    // A relay stays up for the next mod.
-    if (closing && bots.size === 0 && !relay) process.exit(0)
+    if (closing && bots.size === 0) process.exit(0)
     takeProfile(0, `${report.bot} gone`)
   } else {
     throw new Error('unknown report from a pool thread')
@@ -325,36 +287,10 @@ function startThread () {
   })
   thread.worker.on('message', () => { throw new Error('a pool thread wrote to the fleet off its chunk port') })
   thread.worker.on('error', err => { throw err })
-  thread.worker.on('exit', code => {
-    if (!relay) throw new Error(`pool thread exited (code ${code})`)
-    dropThread(thread, code)
-  })
+  thread.worker.on('exit', code => { throw new Error(`pool thread exited (code ${code})`) })
   port1.on('message', message => onThreadMessage(thread, message))
   threads.push(thread)
   return thread
-}
-
-// A relay's pool thread died: its bots and columns are let go, the profiles stop waiting on it, the
-// rest of the relay goes on. The error goes to the mod.
-function dropThread (thread, code) {
-  threads.splice(threads.indexOf(thread), 1)
-  const gone = []
-  for (const [name, t] of bots) {
-    if (t !== thread) continue
-    bots.delete(name)
-    worldOf.delete(name)
-    gone.push(name)
-    send(protocol.botGone(name))
-  }
-  for (const [key, column] of columns) {
-    if (!column.threads.delete(thread) || column.threads.size > 0) continue
-    changed.delete(key)
-    cached.set(key, column)
-  }
-  for (const [key, profile] of profiles) {
-    if (profile.waiting.delete(thread.worker)) finishProfile(key, profile)
-  }
-  throw new Error(`pool thread exited (code ${code}), its bots gone with it: ${gone.join(', ') || 'none'}`)
 }
 
 // Profiles being put together: key -> { id, reason, waiting: the threads yet to send their rows,
@@ -435,40 +371,13 @@ function merged (rows) {
   return [...byKey.values()]
 }
 
-// Once closing the mod is gone: what the bots still report on their way out has nowhere to go. A
-// relay is closing too while no mod is connected.
-let closing = relay
+// Once closing the mod is gone: what the bots still report on their way out has nowhere to go.
+let closing = false
 let socket = null
 
-// A relay's error goes to the mod, which keeps it (crash-relay<N>.log): its terminal is on another
-// machine. The relay goes on, it never goes down; should it end anyway, its supervisor says so and
-// starts another.
-const relayFailed = err => {
-  console.error('E', err)
-  if (!relay) process.exit(1)
-  if (socket && !socket.destroyed) socket.write(protocol.crash(err?.stack ?? String(err)))
-}
-process.on('uncaughtException', relayFailed)
-process.on('unhandledRejection', relayFailed)
-
-// A relay's world stays with it: the frames about columns are left out.
 const send = frame => {
   if (closing || !socket) return
-  const out = relay ? protocol.withoutChunkFrames(frame) : frame
-  if (out) socket.write(out)
-}
-
-// A relay's output, its pool threads' with it (piped through this process's), goes to the mod too:
-// its terminal is on another machine. Only once the mod is served, after its WELCOME, which comes first.
-let served = null
-if (relay) {
-  for (const stream of [process.stdout, process.stderr]) {
-    const write = stream.write.bind(stream)
-    stream.write = (chunk, ...rest) => {
-      if (served && served === socket) send(protocol.log(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')))
-      return write(chunk, ...rest)
-    }
-  }
+  socket.write(frame)
 }
 
 function onFrame (frame) {
@@ -515,8 +424,6 @@ function onFrame (frame) {
     case protocol.TYPES.PROFILE_REQUEST:
       takeProfile(message.id, message.reason)
       break
-    case protocol.TYPES.HELLO:
-      throw new Error('the mod sent HELLO again, past its first frame')
   }
 }
 
@@ -524,121 +431,23 @@ function onFrame (frame) {
 function close () {
   if (closing) return
   closing = true
-  if (bots.size === 0) {
-    if (!relay) process.exit(0)
-    return
-  }
+  if (bots.size === 0) process.exit(0)
   for (const [name, thread] of bots) thread.worker.postMessage({ type: 'quit', bot: name })
 }
 
-// The mod's connection: the mod's own fleet is started with it, a relay is handed it by its server.
+// The mod's connection, the fleet started with it.
 function serve (connection) {
   socket = connection
   closing = false
   connection.setNoDelay(true)
-  if (relay) send(protocol.welcome())
-  served = connection
-  connection.on('error', err => {
-    if (!relay) throw err
-    // A relay outlives the mod: a connection that fails ends that session, said loudly, and it waits for the next.
-    console.error(`E the mod's connection failed: ${err.message}`)
-  })
+  connection.on('error', err => { throw err })
   // First of all: the names of the state ids the slots hold.
   send(protocol.stateNames(states.legacyNames()))
   connection.on('data', protocol.frames(onFrame))
   connection.on('close', close)
 }
 
-// A relay waits on the mod's HELLO: the same commit is served, another has it update.
-function hello (connection, id) {
-  // Taken until the mod is served or gone: another mod is refused meanwhile.
-  closing = false
-  socket = connection
-  const onClose = () => { closing = true }
-  const onError = err => console.error(`E the mod's connection failed before its HELLO: ${err.message}`)
-  const onData = protocol.frames(frame => {
-    const message = protocol.decode(frame)
-    if (message.type !== protocol.TYPES.HELLO) throw new Error(`the mod's first frame is type ${message.type}, not HELLO`)
-    // The mod sends nothing more until its WELCOME: whatever comes next is the served relay's to read.
-    connection.pause()
-    connection.off('data', onData)
-    connection.off('error', onError)
-    connection.off('close', onClose)
-    if (message.version === VERSION) {
-      connection.resume()
-      serve(connection)
-    } else {
-      update(connection, id, message.version)
-    }
-  })
-  connection.on('close', onClose)
-  connection.on('error', onError)
-  connection.on('data', onData)
-}
-
-// The mod runs another commit than this relay: its checkout is reset to it by force, whatever it had
-// (npm ci too when package-lock.json changed), and this relay ends for its supervisor to start a new
-// one on it, handed the same connection and the mod's commit to check once more.
-function update (connection, id, version) {
-  if (!/^[0-9a-f]{40}$/.test(version)) {
-    refuse(connection, `the mod sent ${JSON.stringify(version)} for its commit, not a commit hash`)
-    return
-  }
-  const text = `the mod runs commit ${version}, this relay ${VERSION}: git fetch, reset --hard and restart`
-  console.log(text)
-  send(protocol.updating(text))
-  const lockFile = path.join(__dirname, 'package-lock.json')
-  const lock = fs.readFileSync(lockFile)
-  try {
-    execSync('git fetch', { cwd: __dirname, stdio: 'inherit' })
-    execSync(`git reset --hard ${version}`, { cwd: __dirname, stdio: 'inherit' })
-    if (!fs.readFileSync(lockFile).equals(lock)) execSync('npm ci --no-audit --no-fund', { cwd: __dirname, stdio: 'inherit' })
-  } catch (err) {
-    refuse(connection, `the update failed: ${err.message}`)
-    return
-  }
-  // Said before it ends: the supervisor hands this connection to the next relay.
-  process.send({ type: 'restart', id, version }, () => process.exit(RESTART))
-}
-
-// The mod's commit is out of this relay's reach: the mod is told why and the relay waits for the next.
-function refuse (connection, text) {
-  console.error(`E ${text}`)
-  connection.on('error', err => console.error(`E the mod's connection failed while refused: ${err.message}`))
-  send(protocol.updateFailed(text))
-  closing = true
-  connection.end()
-}
-
-if (relay) {
-  // Each knock comes from the supervisor, which holds the port; `handoff` the mod's commit when the
-  // connection is one this relay's predecessor updated for, its HELLO already answered.
-  process.on('message', ({ type, id, handoff }, connection) => {
-    if (type !== 'connection' || !connection) throw new Error(`the supervisor sent ${JSON.stringify(type)} without a connection`)
-    connection.on('close', () => process.send({ type: 'done', id }))
-    if (handoff) {
-      socket = connection
-      closing = false
-      if (handoff !== VERSION) {
-        refuse(socket, `after its reset this relay is at commit ${VERSION}, the mod at ${handoff}`)
-      } else {
-        console.log(`updated to the mod's commit ${VERSION}`)
-        serve(socket)
-      }
-      return
-    }
-    // One mod at a time, and not while the last one's bots are still leaving.
-    if (!(closing && bots.size === 0)) {
-      console.error(`E refused ${connection.remoteAddress}: a mod is connected or its bots are still leaving`)
-      connection.destroy()
-      return
-    }
-    console.log(`mod connected from ${connection.remoteAddress}`)
-    hello(connection, id)
-  })
-} else {
-  serve(net.connect(socketPort, '127.0.0.1'))
-  // The mod's own fleet lives and dies with the mod's process.
-  process.stdin.on('end', close)
-  process.stdin.resume()
-}
+serve(net.connect(socketPort, '127.0.0.1'))
+// The fleet lives and dies with the mod's process.
+process.stdin.on('end', close)
+process.stdin.resume()

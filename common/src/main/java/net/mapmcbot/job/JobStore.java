@@ -17,7 +17,7 @@ import java.util.List;
 
 /**
  * The jobs, global to every bot, in order: each a name and its steps, each a primitive as the JSON the
- * fleet takes (see FleetProtocol#primitive). In the file a job is a line "# name" then its steps, one per
+ * fleet takes (see FleetSocketHandler). In the file a job is a line "# name" then its steps, one per
  * line; steps before any name (the file of the single job there was) are a first job of their own.
  * Written the moment anything changes. There is always at least one job.
  *
