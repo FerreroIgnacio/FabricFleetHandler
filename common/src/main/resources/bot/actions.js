@@ -45,7 +45,7 @@ module.exports = function actions ({ bot, name, log, publish, walk, draw, drawBa
     place_wsrp: require('./prims/place_wsrp')(ctx),
     break_wsrpa: require('./prims/break_wsrpa')(ctx),
     place_wsrpa: require('./prims/place_wsrpa')(ctx),
-    break_pac: require('./prims/break_pac')(ctx),
+    break_pac2c: require('./prims/break_pac2c')(ctx),
     band: require('./prims/band')(ctx)
   }
 

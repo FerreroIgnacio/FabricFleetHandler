@@ -66,11 +66,11 @@ public final class Primitives {
 			case "break_wsrpa":
 				return new BreakWsrpa(bot, pos(field(a, "target").getAsJsonObject()), field(a, "radius").getAsInt(), pos(field(a, "end").getAsJsonObject()), deadline(a), turnSpeed(a));
 
-			case "break_pac": {
+			case "break_pac2c": {
 				final JsonArray targets = field(a, "targets").getAsJsonArray();
 
 				if (targets.size() == 0) {
-					throw new IllegalArgumentException("break_pac needs a target at least: " + json);
+					throw new IllegalArgumentException("break_pac2c needs a target at least: " + json);
 				}
 
 				final int[][] blocks = new int[targets.size()][];
@@ -86,7 +86,7 @@ public final class Primitives {
 					stand = new double[] {field(at, "x").getAsDouble(), field(at, "z").getAsDouble(), field(at, "line").getAsDouble()};
 				}
 
-				return new BreakPac(bot, blocks, pos(field(a, "end").getAsJsonObject()), stand, deadline(a), turnSpeed(a));
+				return new BreakPac2c(bot, blocks, pos(field(a, "end").getAsJsonObject()), stand, deadline(a), turnSpeed(a));
 			}
 
 			case "band":

@@ -10,12 +10,12 @@ import java.io.IOException;
 
 
 /** Primitive: break the blocks in order, ending standing in end. */
-public final class BreakPac extends SocketMessage {
+public final class BreakPac2c extends SocketMessage {
 	public static final int TYPE = 56;
 
 	public int[][] targets;
 	public int[] end;
-	/** {x, z, line} it stands at on end's seam (see prims/break_pac.js); null for none. */
+	/** {x, z, line} it stands at on end's seam (see prims/break_pac2c.js); null for none. */
 	public double[] stand;
 	/** In ms; null for the bot's own. */
 	public Integer deadline;
@@ -23,11 +23,11 @@ public final class BreakPac extends SocketMessage {
 	public Double turnSpeed;
 
 	/** To deserialize. */
-	public BreakPac(String bot) {
+	public BreakPac2c(String bot) {
 		super(bot);
 	}
 
-	public BreakPac(String bot, int[][] targets, int[] end, double[] stand, Integer deadline, Double turnSpeed) {
+	public BreakPac2c(String bot, int[][] targets, int[] end, double[] stand, Integer deadline, Double turnSpeed) {
 		super(bot);
 		this.targets = targets;
 		this.end = end;
@@ -60,7 +60,7 @@ public final class BreakPac extends SocketMessage {
 		targets = BLOCKS.read(in);
 
 		if (targets.length == 0) {
-			throw new IOException("break_pac of no target for " + bot);
+			throw new IOException("break_pac2c of no target for " + bot);
 		}
 
 		end = BLOCK.read(in);

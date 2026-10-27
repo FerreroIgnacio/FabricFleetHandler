@@ -319,8 +319,10 @@ final class PrimTest implements BotRegistry.StateListener {
 
 		y = yc.getAsInt();
 		z = zc.getAsInt();
-		out.add(new Case("break_pac").block(x + 6, y, z + 1, "stone").block(x + 7, y + 1, z - 1, "stone").block(x + 9, y, z + 1, "stone")
-			.step("{\"action\":\"break_pac\",\"targets\":[" + pos(x + 6, y, z + 1) + "," + pos(x + 7, y + 1, z - 1) + "," + pos(x + 9, y, z + 1) + "],\"end\":" + pos(x + 8, y, z) + "}")
+		// The bot spawned with the first one in sight and reach: break_pac2c fails unless it starts breaking at once.
+		final Case pac = new Case("break_pac2c").block(x + 6, y, z + 1, "stone").block(x + 7, y + 1, z - 1, "stone").block(x + 9, y, z + 1, "stone");
+		pac.spawn = (x + 4.5) + " " + y + " " + (z + 0.5);
+		out.add(pac.step("{\"action\":\"break_pac2c\",\"targets\":[" + pos(x + 6, y, z + 1) + "," + pos(x + 7, y + 1, z - 1) + "," + pos(x + 9, y, z + 1) + "],\"end\":" + pos(x + 8, y, z) + "}")
 			.check(all(blockIs(x + 6, y, z + 1, "air"), blockIs(x + 7, y + 1, z - 1, "air"), blockIs(x + 9, y, z + 1, "air"), at(x + 8, y, z))));
 
 		// A band 2 wide along z on the cell's middle line and the one after, the bot in front of it on their seam (see BandTest).

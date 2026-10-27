@@ -39,7 +39,7 @@ Cómo quedó
 - prims/: un archivo por prim, con el nombre de la prim en el protocolo. Devuelve la función (action, a).
   goto, interact, break, place, close_window, move, item_fill, wait_slot, hotbar, select_trade, look_at,
   drop, shift_move, stop, break_wsr, place_wsr, break_wsrp, place_wsrp, break_wsrpa, place_wsrpa,
-  break_pac, band.
+  break_pac2c, band.
 - El código se movió verbatim (generado por script desde el AST, con eslint-scope para las
   dependencias). Únicos cambios de código: ver "Qué se tocó a mano".
 
@@ -75,7 +75,7 @@ Qué se tocó a mano (lo único que no es movimiento)
 - BotManager.java: RESOURCES lista cada archivo de lib/ y prims/, y extractScripts crea la carpeta
   padre antes de escribir (Files.createDirectories).
 - Punteros "(actions.js ...)" de los .txt de referencia, de comentarios JS y de comentarios Java
-  (Band, Bands, ClearQ, BreakPac, BotVis, BotCommands, ItemSpec, ItemFilter, BandTest, AreaRenderer)
+  (Band, Bands, ClearQ, BreakPac2c, BotVis, BotCommands, ItemSpec, ItemFilter, BandTest, AreaRenderer)
   actualizados al archivo nuevo de cada símbolo.
 
 Peligros (leer antes de tocar)
@@ -96,8 +96,8 @@ Peligros (leer antes de tocar)
 6. Listeners del bot puestos al crear: death (lifecycle), physicsTick y spawn (head), spawn_entity
    (blocks), transaction y set_slot (window). Cambió el orden de registro entre eventos distintos
    (death antes que el resto), que no importa; el orden dentro de un mismo evento no cambió.
-7. Siguen grandes: prims/band.js (~435), prims/break_pac.js (~305), lib/aim.js (~360). Partir
-   breakBand/breakPac por fases es un paso aparte, no se hizo.
+7. Siguen grandes: prims/band.js (~435), prims/break_pac2c.js (~305), lib/aim.js (~360). Partir
+   breakBand/breakPac2c por fases es un paso aparte, no se hizo.
 8. Comentarios "(see X)" dentro del código movido nombran funciones que pueden estar en otro archivo
    ahora; buscar el nombre con grep.
 9. withSearchAsync usa withSearch (se cae a la wsr desde end) y withSearchFromEnd también: un cambio
@@ -105,7 +105,7 @@ Peligros (leer antes de tocar)
 
 Cómo se verificó
 - standard (npx cache) sobre actions.js, lib/ y prims/: mismos avisos que el actions.js viejo (solo
-  `along` sin usar en break_pac y `heldAt` prefer-const en band, que ya estaban); sin no-undef.
+  `along` sin usar en break_pac2c y `heldAt` prefer-const en band, que ya estaban); sin no-undef.
 - Cada línea del archivo viejo está en algún archivo nuevo; las diferencias son solo lo de arriba.
 - Chequeo del orden de PARTS: cada nombre que una parte saca de ctx lo exporta una anterior o es param.
 - Smoke test con un bot falso: construye, la API es la misma, run('stop') pasa por begin/fail, run de

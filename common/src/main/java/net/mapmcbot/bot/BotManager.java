@@ -42,7 +42,7 @@ public final class BotManager {
 	private static final String[] RESOURCES = {"fleet.js", "poolThread.js", "sharedChunks.js", "bot.js", "actions.js", "look.js", "lookTraces.json", "profiler.js", "protocol.js", "states.js", "columnSerializer.js", "package.json", "package-lock.json",
 		"lib/util.js", "lib/lifecycle.js", "lib/path.js", "lib/aim.js", "lib/head.js", "lib/window.js", "lib/items.js", "lib/hold.js", "lib/pose.js", "lib/steer.js", "lib/walk.js", "lib/blocks.js", "lib/withSearch.js", "lib/withSearchFromEnd.js", "lib/withSearchAsync.js",
 		"prims/goto.js", "prims/interact.js", "prims/break.js", "prims/place.js", "prims/close_window.js", "prims/move.js", "prims/item_fill.js", "prims/wait_slot.js", "prims/hotbar.js", "prims/select_trade.js", "prims/look_at.js", "prims/drop.js", "prims/shift_move.js", "prims/stop.js",
-		"prims/break_wsr.js", "prims/place_wsr.js", "prims/break_wsrp.js", "prims/place_wsrp.js", "prims/break_wsrpa.js", "prims/place_wsrpa.js", "prims/break_pac.js", "prims/band.js"};
+		"prims/break_wsr.js", "prims/place_wsr.js", "prims/break_wsrp.js", "prims/place_wsrp.js", "prims/break_wsrpa.js", "prims/place_wsrpa.js", "prims/break_pac2c.js", "prims/band.js"};
 
 	private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase().contains("win");
 

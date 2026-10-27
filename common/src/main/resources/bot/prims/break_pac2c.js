@@ -3,14 +3,15 @@ const { goals } = require('mineflayer-pathfinder')
 const { REACH_BLOCK, FACES, CONTROLS, full, at, required } = require('../lib/util')
 
 module.exports = ctx => {
-  const { bot, log, walk, aimsAt, breakBlock, checkTarget, done, eyeHeight, eyes, fail, followable, guard, inMove, inReach, keepHead, keysWithin, listen, lookTo, movesTo, seesFrom, show, steer, stood, walkTo, drawn } = ctx
+  const { bot, log, aimsAt, breakBlock, checkTarget, done, eyeHeight, eyes, fail, followable, guard, inMove, inReach, keepHead, keysWithin, listen, lookTo, movesTo, seesFrom, show, steer, stood, walkTo, drawn } = ctx
 
-  // break_pac: breaks the blocks of targets one after another in that order, walking to the block end
-  // as goto and breaking on the way, no search: on the pathfinder's path there (every move, see
-  // movesTo), on the ground in a block of it with the next one in sight and its break followable on
-  // the moves after it (see followable), the pathfinder lets go and it follows them by keys (see
-  // steer) as it breaks, then the next one from where it got to the same way; with none, the
-  // pathfinder takes it on to end. The ones left at end are broken from there, standing. Failed at
+  // break_pac2c (position async collection, continuous): breaks the blocks of targets one after another
+  // in that order, always breaking or turning to break one: on the pathfinder's path to end (every move,
+  // see movesTo), on the ground in a block of it with the next one in sight and its break followable on
+  // the moves after it (see followable), it follows them by keys (see steer) as it breaks, then the next
+  // one from where it got to the same way. The ones left at end are broken from there, standing; all
+  // gone, the pathfinder takes it on to end. Failed when it can't start on the next one at once (at the
+  // start, after a break, out of sight as it turned, off its moves), and at
   // once when one is not a block or out of reach from end wherever in it the feet end (the eyes
   // standing over any of its corners, the farthest a distance to a box gets over the block; whatever
   // is in the way), and when one left at end is out of sight from there. Each break's deadline is
@@ -20,7 +21,7 @@ module.exports = ctx => {
   // line across (see keysWithin) as it breaks them. Done with them all gone and the bot at end,
   // or with stand next to it across (on the line of the last one). a is { targets: [{x, y, z}], end,
   // stand: {x, z}, deadline, turn_speed }.
-  async function breakPac (action, a) {
+  async function breakPac2c (action, a) {
     const targets = required(a.targets, 'targets').map(t => new Vec3(t.x, t.y, t.z))
     const end = new Vec3(required(a.end, 'end').x, a.end.y, a.end.z)
     const stand = a.stand ? new Vec3(a.stand.x, end.y, a.stand.z) : null
@@ -101,37 +102,20 @@ module.exports = ctx => {
       }
     }
     const endGoal = () => stand ? new EndGoal(end.x, end.y, end.z) : new goals.GoalBlock(end.x, end.y, end.z)
-    let moves = await movesTo(action, new goals.GoalBlock(end.x, end.y, end.z))
+    const moves = await movesTo(action, new goals.GoalBlock(end.x, end.y, end.z))
     if (moves === undefined) return
     action.cleanups.push(() => { if (!bot._client.ended) bot.clearControlStates() })
     // The one of targets breaking or to break next.
     let next = 0
-    // The goal walked to end by, a new one after a fall; walked: walkTo has it, walk() takes it on again.
-    let goal = endGoal()
-    let walked = false
+    // The goal walked to end by, once all are gone.
+    const goal = endGoal()
     let arrived = false
     let breaking = false
     // The moves followed while it breaks (see steer); fell off them: waiting to land to start again from there.
     let following = null
-    let fallen = false
-    let landedAt = null
     // In end's block, or with stand the one next to it across (see ends).
     const atEnd = () => ends().some(b => b.equals(bot.entity.position.floored()))
     listen(action, bot, 'physicsTick', () => {
-      if (fallen) {
-        if (!bot.entity.onGround) return
-        fallen = false
-        // Off its moves twice onto the same spot, again from there would be the same for ever: failed.
-        const here = stood()
-        if (landedAt === here) {
-          fail(action, `expected to follow its moves to ${at(end)}, fell off them onto ${here} twice`)
-          return
-        }
-        landedAt = here
-        log(`${action.primitive}: landed at ${here} off its moves: again from here`)
-        guard(action, again())
-        return
-      }
       if (following) {
         // On the line of the one it breaks now, the seam (see lineOf); past its moves
         // (see waypoint), it stays where it took over moved across to it.
@@ -141,19 +125,9 @@ module.exports = ctx => {
           if (inBand()) following.stand[across] = line
         }
         if (steer('break', targets[next], following)) return
-        // Its floor gone under it (dug, by another bot or by its own break): the break let go, it lands first.
-        log(`${action.primitive}: off the ground at ${bot.entity.position.toString()} following its moves: letting go until it lands`)
-        show(action, { phase: 'falling', aim: null, takeover: null })
-        for (const cleanup of action.cleanups.splice(following.mark)) cleanup()
-        action.then = null
-        following = null
-        breaking = false
-        fallen = true
-        bot.clearControlStates()
-        return
+        // Its floor gone under it (dug, by another bot or by its own break): no longer breaking.
+        fail(action, `expected to follow its moves breaking ${at(targets[next])}, found it off the ground at ${bot.entity.position.toString()}`)
       }
-      // Not in end's block: arrived, the pathfinder's goal_reached breaks the rest from there (see arrive).
-      if (next < targets.length && !breaking && !arrived && walked && bot.pathfinder.goal === goal && !atEnd()) takeOver()
     })
     // Takes over from the pathfinder when on the ground in a block of its moves with the next one in
     // sight and its break followable from there; whether it did.
@@ -199,21 +173,16 @@ module.exports = ctx => {
           breakNext(action.cleanups.length)
           return
         }
-        // On the way: the next one taken over at once from where it is, else on to end.
-        if (next < targets.length && takeOver()) return
+        // On the way: the next one taken over at once from where it is, else failed; all gone, on to end.
+        if (next < targets.length) {
+          if (!takeOver()) fail(action, `expected to start breaking ${at(targets[next])} at once from ${stood()}, found it out of sight or its break not followable`)
+          return
+        }
         bot.clearControlStates()
         toEnd()
       }
-      // Out of sight from where it walked on to as it turned: let go, on to end, and again from there.
-      const lost = () => {
-        for (const cleanup of action.cleanups.splice(mark)) cleanup()
-        show(action, { phase: 'walking', aim: null, takeover: null })
-        action.then = null
-        breaking = false
-        following = null
-        bot.clearControlStates()
-        toEnd()
-      }
+      // Out of sight from where it walked on to as it turned: no longer breaking.
+      const lost = () => fail(action, `expected ${at(pos)} in sight as it turned to it, lost it at ${stood()}`)
       guard(action, breakBlock(action, { ...a, target: pos, lost: arrived ? undefined : lost }))
     }
     // Standing at end: of the ones left in sight from the eyes, the one the head turns the least to
@@ -238,11 +207,6 @@ module.exports = ctx => {
       if (best > next) [targets[next], targets[best]] = [targets[best], targets[next]]
     }
     function toEnd () {
-      if (walked) {
-        walk(goal)
-        return
-      }
-      walked = true
       walkTo(action, goal, at(end), arrive, atEnd)
     }
     function arrive () {
@@ -275,15 +239,6 @@ module.exports = ctx => {
       log(`${action.primitive}: at ${at(end)} with ${targets.length - next} left: breaking them from here`)
       breakNext(action.cleanups.length)
     }
-    // Landed off its moves: a path to end from here, walked anew.
-    async function again () {
-      const found = await movesTo(action, new goals.GoalBlock(end.x, end.y, end.z))
-      if (found === undefined) return
-      moves = found
-      goal = endGoal()
-      walked = false
-      toEnd()
-    }
     // With stand, the pathfinder's path to end walked on the seam: each node in a column of the band
     // with the one next to it across open and floored (see paired) moved across onto the seam, up to
     // the first that breaks or places. The pathfinder walks to the nodes as they are, its checks its own.
@@ -296,10 +251,13 @@ module.exports = ctx => {
         }
       })
     }
-    show(action, { phase: 'walking' })
-    if (!atEnd() && takeOver()) return
-    toEnd()
+    // Breaking from the start: at end, from there; else the first one taken over at once, or failed.
+    if (atEnd()) {
+      arrive()
+      return
+    }
+    if (!takeOver()) fail(action, `expected to start breaking ${at(targets[0])} at once from ${stood()}, found it out of sight or its break not followable`)
   }
 
-  return drawn(breakPac, 'break')
+  return drawn(breakPac2c, 'break')
 }

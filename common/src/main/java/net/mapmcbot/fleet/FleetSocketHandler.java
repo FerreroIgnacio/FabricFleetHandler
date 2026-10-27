@@ -107,7 +107,7 @@ public final class FleetSocketHandler {
 		PLACE_WSRPA(PlaceWsrpa.TYPE, PlaceWsrpa::new),
 		VIS(Vis.TYPE, Vis::new),
 		CLEAR_Q(ClearQ.TYPE, ClearQ::new),
-		BREAK_PAC(BreakPac.TYPE, BreakPac::new),
+		BREAK_PAC2C(BreakPac2c.TYPE, BreakPac2c::new),
 		BAND(Band.TYPE, Band::new),
 		BANDS(Bands.TYPE, Bands::new);
 

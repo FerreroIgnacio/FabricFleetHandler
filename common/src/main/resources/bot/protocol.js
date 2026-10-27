@@ -55,7 +55,7 @@ const TYPES = {
   PLACE_WSRP: 51,
   BREAK_WSRPA: 52,
   PLACE_WSRPA: 53,
-  BREAK_PAC: 56,
+  BREAK_PAC2C: 56,
   BAND: 57
 }
 
@@ -67,7 +67,7 @@ const PRIMITIVES = new Map([
   [TYPES.LOOK_AT, 'look_at'], [TYPES.DROP, 'drop'], [TYPES.SHIFT_MOVE, 'shift_move'], [TYPES.STOP, 'stop'],
   [TYPES.BREAK_WSR, 'break_wsr'], [TYPES.PLACE_WSR, 'place_wsr'], [TYPES.BREAK_WSRP, 'break_wsrp'],
   [TYPES.PLACE_WSRP, 'place_wsrp'], [TYPES.BREAK_WSRPA, 'break_wsrpa'], [TYPES.PLACE_WSRPA, 'place_wsrpa'],
-  [TYPES.BREAK_PAC, 'break_pac'], [TYPES.BAND, 'band']
+  [TYPES.BREAK_PAC2C, 'break_pac2c'], [TYPES.BAND, 'band']
 ])
 
 class Writer {
@@ -629,7 +629,7 @@ function primitive (r, type) {
       r.deadline(a)
       r.turnSpeed(a)
       break
-    case TYPES.BREAK_PAC: {
+    case TYPES.BREAK_PAC2C: {
       // i32 count and each block's i32 x, y, z in the order it breaks them, i32 x, y, z it ends in, u8 stand
       // present and its f64 x, z and line across, deadline, turn speed.
       const count = r.i32()

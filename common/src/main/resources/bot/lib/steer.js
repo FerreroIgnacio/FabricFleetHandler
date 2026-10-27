@@ -71,7 +71,7 @@ module.exports = ctx => {
     return best
   }
 
-  // Whether feet are in the move's block, or in any of its cells when it has them (see breakPac's onLine).
+  // Whether feet are in the move's block, or in any of its cells when it has them (see breakPac2c's onLine).
   function inMove (m, feet) {
     const f = feet.floored()
     return (m.cells || [m.block]).some(b => b.equals(f))
